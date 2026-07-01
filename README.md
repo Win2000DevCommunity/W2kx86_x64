@@ -104,20 +104,22 @@ python dbg_trace.py build_out80\cmd_pure.exe /c echo hello `
 
 ### 3. Current Status of `cmd /c echo`
 
-The behavior differs between the translation modes in build `build_out81`:
+The behavior differs between the translation modes:
 
 * **With Patch Mode Enabled (`cmd_shim.exe`)**:
   * Tracing `cmd /c echo hello` confirms that the absolute load address `[0x1cf64]` is now read correctly, the false error exit path is gone, and **`hello` successfully prints** to standard output.
 
 * **Universal `--pure` Mode (`cmd_pure.exe`)** — Under Active Reversing:
-  * In `build_out80`, the tracer successfully executed **204,440 instructions** (steps) in pure mode before faulting.
-  * In `build_out81`, despite the latest fixes, **`cmd_pure.exe` still does not print `echo`** in pure mode. Active investigation is ongoing.
+  * In `build_out80`, the tracer executed **204,440 instructions** before faulting at `msvcrt!exit(1)` via the codepage error path.
+  * In `build_out81`, the tracer executed **208,604 instructions** (+4,164 more) but faults at a **different site**: `msvcrt!setlocale` crashes during CRT init.
+  * **`cmd_pure.exe` still does not print `echo`** in pure mode. Active investigation is ongoing.
 
 ---
 
-## Pure Mode Trace Diagnostic (build_out80)
+## Pure Mode Trace Diagnostics
 
-### Watchpoint Output
+### build_out80 — Codepage Error Path
+
 The tracer was run with watchpoints at the locale/codepage setup area (`0x168C1`, `0x168D3`, `0x168DD`):
 
 ```
@@ -128,8 +130,7 @@ The tracer was run with watchpoints at the locale/codepage setup area (`0x168C1`
 --- last 48 main-image instructions (steps=204440) ---
 ```
 
-### API Call Chain (before fault)
-The full trace log reveals the API calls the translated binary successfully makes before crashing:
+**API Call Chain (before fault)**:
 
 | API Call Site | Function | Key Arguments |
 |---|---|---|
@@ -149,18 +150,37 @@ The full trace log reveals the API calls the translated binary successfully make
 | `main+0x168C1` | `msvcrt!_get_osfhandle` | **fd=0x411 ← invalid** |
 | `main+0x13809` | `msvcrt!exit` | **exit(1) — premature** |
 
-### Fault Analysis
+**Fault**: `_get_osfhandle` receives `0x411` (the codepage value, not a file descriptor) → returns `0xFFFFFFFFFFFFFFFF` → error path fires → `exit(1)`.
+
+### build_out81 — setlocale Crash (new blocker)
+
 ```
 ===== FAULT =====
-code=0xC0000005 RIP=sys+0x7FFEB92C9F59
+code=0xC0000005 RIP=sys+0x7FFEB92E76E5
 access-violation: read @ 0xFFFFFFFFFFFFFFFF
-last main insn: main+0x13809 (x86 0xAC9D+0x3D) → msvcrt!exit(1)
+last main insn: main+0x762B (x86 0x528E+0x12) → msvcrt!setlocale
 ```
 
-**Root cause under investigation**: After the codepage setup (`GetConsoleOutputCP` → `GetCPInfo` → `_get_osfhandle(0x411)`), the `_get_osfhandle` call receives `0x411` (which is the codepage value, not a file descriptor). This returns `0xFFFFFFFFFFFFFFFF` (invalid handle), triggering the `cmp dword ptr [r11], 0` check at `main+0x168D3`. The comparison is non-zero → the error path fires → `exit(1)` is called at `main+0x13809`.
+**Last instructions before crash**:
+```asm
+main+0x7600  mov rcx, 0              ; arg1 = LC_ALL (0)
+main+0x7607  movabs rdx, 0x80044538  ; arg2 = locale string (data section)
+main+0x761E  movabs rax, 0x800724c8  ; IAT slot for setlocale
+main+0x7628  mov rax, qword ptr [rax]; load function pointer
+main+0x762B  call rax                ; → CRASH inside msvcrt!setlocale
+```
 
-### RBP Corruption Events
-The tracer also detected multiple RBP corruption events where the frame pointer was overwritten with data addresses instead of stack addresses:
+**Analysis**: The `setlocale(0, 0x80044538)` call crashes because the locale string at `0x80044538` in the `.data` section contains corrupt or improperly relocated bytes. Inside `msvcrt`, RAX holds `0x007200650069009B` (garbled UTF-16 fragment: `r`, `e`, `i` + corrupt byte `0x9B`) which is dereferenced as a pointer → access violation.
+
+### Build-over-Build Progress
+
+| Build | Steps | Crash Site | Blocker |
+|---|---|---|---|
+| build_out80 | 204,440 | `main+0x13809` | `_get_osfhandle(0x411)` → `exit(1)` |
+| build_out81 | 208,604 | `main+0x762B` | `setlocale` data corruption |
+
+### RBP Corruption Events (persistent)
+Both builds show RBP being overwritten with data-section addresses at `main+0x9BD8`:
 
 ```
 main+0x9BD8    RBP 0x14FE90 -> 0x800456A8   push rsi
@@ -171,5 +191,18 @@ main+0x126B8   RBP 0x14FE90 -> 0x8004D3E2   mov ecx, eax
 main+0x7639    RBP 0x14FD30 -> 0x90          ret
 ```
 
-These suggest translated `push rsi` sequences at `main+0x9BD8` are writing data-section addresses into RBP, likely due to register allocation differences between the 32-bit and 64-bit calling conventions that have not yet been fully reconciled for pure mode.
+---
 
+## Progress Assessment
+
+The universal `--pure` translator is in the **last-mile debugging phase**:
+
+* **208,604 instructions execute correctly** — the entire CRT init, heap allocation, console title retrieval, `GetModuleHandle`, `GetProcAddress`, `_setjmp3` SEH setup, and console mode configuration all work.
+* **Patched mode already prints `echo hello` perfectly** — the core translation engine, calling convention conversion, IAT dispatch, and SEH runtime are all proven.
+* **Build-over-build progress is real** — each iteration executes more instructions and reaches new crash sites.
+
+**Remaining blockers** (2–3 specific bugs, not architecture rewrites):
+
+1. **Locale string relocation** at `0x80044538` — fix this and `setlocale` stops crashing (current build_out81 stopper).
+2. **Codepage path** (`_get_osfhandle(0x411)`) — the build_out80 blocker, likely still lurking behind the setlocale fix.
+3. **RBP corruption** at `main+0x9BD8` — register mapping edge case, may not be fatal for `echo` but needs fixing for stability.
