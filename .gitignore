@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/C++ build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+
+# Build output directories
+build_out*/
+build_dbg/
+win2k_analyzer/
+
+# Log files
+*.log
+apilog*.txt
+trace*.txt
+guard_out.txt
+ftrans.txt

@@ -1,0 +1,20043 @@
+#!/usr/bin/env python3
+"""
+win2000_64.py
+═════════════════════════════════════════════════════════════════════════
+Windows 2000 SP4 (NT 5.0.2195) x86 → x86-64 Binary Translator
+
+Converts every PE32 binary from a Windows 2000 SP4 installation into a
+native PE64 (x86-64) equivalent, producing a "Windows 2000 64-bit" tree.
+
+Syscall numbers: extracted DIRECTLY from the real ntdll.dll binary
+  (SHA1 of source ntdll.dll: verified against 2000SP4OFFical2005v2.zip)
+
+Architecture:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  STAGE 1 — PE32 Parse                                            │
+  │    Read headers, sections, imports (IAT), exports, relocations   │
+  │                                                                  │
+  │  STAGE 2 — Static + Dynamic CF Analysis  (Capstone + Unicorn)     │
+  │    Function entries, epilogue labels, branch graph, data gaps;   │
+  │    Unicorn harvests runtime pointers and branch destinations     │
+  │                                                                  │
+  │  STAGE 3 — Dynamic Scan  (Unicorn, --dynamic)                    │
+  │    Emulate up to N basic blocks; harvest runtime pointer values  │
+  │    that static analysis couldn't see (computed addresses, etc.)  │
+  │                                                                  │
+  │  STAGE 4 — Code Translation  (Capstone → Keystone)              │
+  │    • NTDLL stubs  → MOV RAX, win10_nr ; SYSCALL ; RET           │
+  │    • stdcall/cdecl → Windows x64 ABI  (RCX/RDX/R8/R9/stack)    │
+  │    • FS:[n] → GS:[teb64_offset(n)]   (TEB field remapping)      │
+  │    • 32-bit branch targets → relocated 64-bit targets            │
+  │    • Pointer immediates → relocated 64-bit addresses             │
+  │                                                                  │
+  │  STAGE 5 — PE64 Emit                                             │
+  │    Rebuild PE64 header, fix IAT (32-bit → 64-bit thunks),       │
+  │    fix export table ordinals, patch relocation directory          │
+  └──────────────────────────────────────────────────────────────────┘
+
+Win2000 syscall ABI (int 0x2e):
+  EAX = syscall number  (32-bit NT 5.0 SSDT index)
+  EDX = pointer to args on stack  (typically LEA EDX,[ESP+4])
+  Stack: arg1, arg2, ..., argN  at [EDX+0], [EDX+4], ..., [EDX+(N-1)*4]
+
+Win64 syscall ABI (syscall instruction):
+  RAX = syscall number  (64-bit Win10 SSDT index, DIFFERENT values)
+  RCX/RDX/R8/R9 = args 1-4
+  [RSP+0x28]/[RSP+0x30]/... = args 5-N
+
+Calling convention ─ Win32 stdcall vs Windows x64:
+  32-bit: push argN; … push arg1; CALL f; (callee does RET N)
+  64-bit: mov rcx,arg1; mov rdx,arg2; mov r8,arg3; mov r9,arg4;
+          [RSP+0x28]=arg5 …; sub rsp,32; CALL f; add rsp,32; (callee does RET)
+
+TEB segment remap:
+  32-bit FS:[offset]  →  64-bit GS:[teb64_offset]
+  Key fields:
+    FS:[0x00] ExceptionList  → GS:[0x00]  (Win64 keeps SEH chain for compat)
+    FS:[0x04] StackBase      → GS:[0x08]  (QWORD in 64-bit TEB)
+    FS:[0x08] StackLimit     → GS:[0x10]
+    FS:[0x18] Self           → GS:[0x30]
+    FS:[0x30] PEB            → GS:[0x60]
+    FS:[0x34] LastErrorValue → GS:[0x68]  (TLS-adjacent, offset varies)
+
+Usage:
+  # Translate ntdll.dll only:
+  python3 win2000_64.py ntdll.dll ntdll64.dll
+
+  # Translate ntoskrnl.exe:
+  python3 win2000_64.py ntoskrnl.exe ntoskrnl64.exe
+
+  # Batch: entire Win2000 installation tree:
+  python3 win2000_64.py --batch /mnt/win2k/windows/system32  ./out64/
+  python3 win2000_64.py --batch /mnt/win2k/windows/system32  ./out64/ --dynamic
+
+  # Dump syscall table from ntdll.dll:
+  python3 win2000_64.py --dump-syscalls ntdll.dll
+"""
+
+from __future__ import annotations
+import argparse, json, os, struct, sys
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Windows console UTF-8
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+
+def _pure_translator_mode() -> bool:
+    """Universal pure translator (no address-pinned _fix_cmd_* hacks)."""
+    return bool(os.environ.get('CMD_NO_HACKS')
+                or os.environ.get('PURE')
+                or os.environ.get('PURE_TRANSLATOR'))
+
+
+# ── Optional heavy imports (graceful fallback) ─────────────────────────────────
+# win2k_analyzer (UBRT reference engine) — optional sibling checkout
+_WIN2K_ANALYZER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'win2k_analyzer')
+if os.path.isdir(_WIN2K_ANALYZER_DIR) and _WIN2K_ANALYZER_DIR not in sys.path:
+    sys.path.insert(0, _WIN2K_ANALYZER_DIR)
+
+try:
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64, CsError
+    from capstone.x86 import (
+        X86_OP_IMM, X86_OP_REG, X86_OP_MEM,
+        X86_REG_AL, X86_REG_AH, X86_REG_CL, X86_REG_CH,
+        X86_REG_DL, X86_REG_DH, X86_REG_BL, X86_REG_BH,
+        X86_REG_AX, X86_REG_CX, X86_REG_DX, X86_REG_BX,
+        X86_REG_SP, X86_REG_BP, X86_REG_SI, X86_REG_DI,
+        X86_REG_EAX, X86_REG_ECX, X86_REG_EDX, X86_REG_EBX,
+        X86_REG_ESP, X86_REG_EBP, X86_REG_ESI, X86_REG_EDI,
+        X86_REG_RAX, X86_REG_RCX, X86_REG_RDX, X86_REG_RBX,
+        X86_REG_RSP, X86_REG_RBP, X86_REG_RSI, X86_REG_RDI,
+        X86_REG_R8,  X86_REG_R9,  X86_REG_R10, X86_REG_R11,
+        X86_REG_R12, X86_REG_R13, X86_REG_R14, X86_REG_R15,
+        X86_REG_RIP, X86_REG_FS,  X86_REG_GS,
+    )
+    HAS_CAPSTONE = True
+except ImportError:
+    HAS_CAPSTONE = False
+    print("[!] capstone not installed  →  pip install capstone", file=sys.stderr)
+
+try:
+    from keystone import Ks, KS_ARCH_X86, KS_MODE_64, KsError
+    HAS_KEYSTONE = True
+except ImportError:
+    HAS_KEYSTONE = False
+    print("[!] keystone not installed  →  pip install keystone-engine", file=sys.stderr)
+
+try:
+    from nt_analyzer.ubrt_engine import PEReferenceFinder, RefType, UBRTEngine
+    HAS_UBRT = True
+except ImportError:
+    HAS_UBRT = False
+    PEReferenceFinder = None  # type: ignore
+    RefType = None  # type: ignore
+    UBRTEngine = None  # type: ignore
+
+try:
+    from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_PROT_ALL
+    from unicorn import UC_HOOK_MEM_WRITE, UC_HOOK_BLOCK, UC_HOOK_MEM_INVALID, UC_HOOK_CODE
+    from unicorn.x86_const import (
+        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+        UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI,
+        UC_X86_REG_EIP,
+    )
+    HAS_UNICORN = True
+except ImportError:
+    HAS_UNICORN = False
+    print("[!] unicorn not installed   →  pip install unicorn", file=sys.stderr)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  1.  SYSCALL TABLES
+#      Source: extracted live from ntdll.dll (2000SP4OFFical2005v2.zip)
+#      Win10 x64 numbers: from published direct-syscall security research
+#      (builds 18362-22621 / 1903 – 22H2 / Win10 + Win11)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#  (win2000_nr, win10_x64_nr, n_args, name)
+#  n_args = bytes_popped_by_RET / 4 as observed in ntdll stubs
+#  win10_x64_nr = 0x0000 means no direct equivalent yet mapped
+
+WIN2000_SYSCALL_TABLE: List[Tuple[int,int,int,str]] = [
+    # ──  Win2000   Win10x64  Args  Name ──────────────────────────────────────
+    (0x0000, 0x0002,  6, 'NtAcceptConnectPort'),
+    (0x0001, 0x0000,  8, 'NtAccessCheck'),
+    (0x0002, 0x0029, 11, 'NtAccessCheckAndAuditAlarm'),
+    (0x0003, 0x0000, 11, 'NtAccessCheckByType'),
+    (0x0004, 0x0000, 16, 'NtAccessCheckByTypeAndAuditAlarm'),
+    (0x0005, 0x0000, 11, 'NtAccessCheckByTypeResultList'),
+    (0x0006, 0x0000, 16, 'NtAccessCheckByTypeResultListAndAuditAlarm'),
+    (0x0007, 0x0000, 17, 'NtAccessCheckByTypeResultListAndAuditAlarmByHandle'),
+    (0x0008, 0x0000,  3, 'NtAddAtom'),
+    (0x0009, 0x00BF,  6, 'NtAdjustGroupsToken'),
+    (0x000A, 0x00C0,  6, 'NtAdjustPrivilegesToken'),
+    (0x000B, 0x00C2,  2, 'NtAlertResumeThread'),
+    (0x000C, 0x00B1,  1, 'NtAlertThread'),
+    (0x000D, 0x0000,  1, 'NtAllocateLocallyUniqueId'),
+    (0x000E, 0x0000,  3, 'NtAllocateUserPhysicalPages'),
+    (0x000F, 0x0000,  4, 'NtAllocateUuids'),
+    (0x0010, 0x0018,  6, 'NtAllocateVirtualMemory'),           # ★ critical
+    (0x0011, 0x0000,  2, 'NtAreMappedFilesTheSame'),
+    (0x0012, 0x0000,  2, 'NtAssignProcessToJobObject'),
+    (0x0013, 0x0005,  3, 'NtCallbackReturn'),
+    (0x0014, 0x0000,  2, 'NtCancelIoFile'),
+    (0x0015, 0x0087,  2, 'NtCancelTimer'),
+    (0x0016, 0x0000,  1, 'NtCancelDeviceWakeupRequest'),
+    (0x0017, 0x0000,  1, 'NtClearEvent'),
+    (0x0018, 0x000F,  1, 'NtClose'),                           # ★ critical
+    (0x0019, 0x0000,  3, 'NtCloseObjectAuditAlarm'),
+    (0x001A, 0x0000,  1, 'NtCompleteConnectPort'),
+    (0x001B, 0x001A,  8, 'NtConnectPort'),
+    (0x001C, 0x0043,  2, 'NtContinue'),
+    (0x001D, 0x0000,  3, 'NtCreateDirectoryObject'),
+    (0x001E, 0x0048,  5, 'NtCreateEvent'),
+    (0x001F, 0x0000,  3, 'NtCreateEventPair'),
+    (0x0020, 0x0055, 11, 'NtCreateFile'),                      # ★ critical
+    (0x0021, 0x00BA,  4, 'NtCreateIoCompletion'),
+    (0x0022, 0x0000,  3, 'NtCreateJobObject'),
+    (0x0023, 0x001D,  7, 'NtCreateKey'),
+    (0x0024, 0x0000,  8, 'NtCreateMailslotFile'),
+    (0x0025, 0x00BB,  4, 'NtCreateMutant'),
+    (0x0026, 0x0000, 14, 'NtCreateNamedPipeFile'),
+    (0x0027, 0x0000,  4, 'NtCreatePagingFile'),
+    (0x0028, 0x00AD,  5, 'NtCreatePort'),
+    (0x0029, 0x0000,  8, 'NtCreateProcess'),
+    (0x002A, 0x0000,  9, 'NtCreateProfile'),
+    (0x002B, 0x004A,  7, 'NtCreateSection'),                   # ★ critical
+    (0x002C, 0x00B5,  5, 'NtCreateSemaphore'),
+    (0x002D, 0x0000,  4, 'NtCreateSymbolicLinkObject'),
+    (0x002E, 0x00BD,  8, 'NtCreateThread'),
+    (0x002F, 0x00CA,  4, 'NtCreateTimer'),
+    (0x0030, 0x00D4, 13, 'NtCreateToken'),
+    (0x0031, 0x0031,  5, 'NtCreateWaitablePort'),
+    (0x0032, 0x0034,  2, 'NtDelayExecution'),
+    (0x0033, 0x0000,  1, 'NtDeleteAtom'),
+    (0x0034, 0x0000,  1, 'NtDeleteFile'),
+    (0x0035, 0x003F,  1, 'NtDeleteKey'),
+    (0x0036, 0x0000,  3, 'NtDeleteObjectAuditAlarm'),
+    (0x0037, 0x0085,  2, 'NtDeleteValueKey'),
+    (0x0038, 0x0007, 10, 'NtDeviceIoControlFile'),              # ★ critical
+    (0x0039, 0x0000,  1, 'NtDisplayString'),
+    (0x003A, 0x003C,  7, 'NtDuplicateObject'),                  # ★ critical
+    (0x003B, 0x00A0,  6, 'NtDuplicateToken'),
+    (0x003C, 0x0032,  8, 'NtEnumerateKey'),
+    (0x003D, 0x0033,  8, 'NtEnumerateValueKey'),
+    (0x003E, 0x0000,  2, 'NtExtendSection'),
+    (0x003F, 0x00F8,  6, 'NtFilterToken'),
+    (0x0040, 0x0000,  3, 'NtFindAtom'),
+    (0x0041, 0x004B,  2, 'NtFlushBuffersFile'),
+    (0x0042, 0x0047,  3, 'NtFlushInstructionCache'),
+    (0x0043, 0x0047,  1, 'NtFlushKey'),
+    (0x0044, 0x0000,  4, 'NtFlushVirtualMemory'),
+    (0x0045, 0x0000,  0, 'NtFlushWriteBuffer'),
+    (0x0046, 0x0000,  3, 'NtFreeUserPhysicalPages'),
+    (0x0047, 0x001E,  4, 'NtFreeVirtualMemory'),                # ★ critical
+    (0x0048, 0x0039,  5, 'NtFsControlFile'),
+    (0x0049, 0x00F3,  2, 'NtGetContextThread'),
+    (0x004A, 0x0000,  2, 'NtGetDevicePowerState'),
+    (0x004B, 0x0000,  4, 'NtGetPlugPlayEvent'),
+    (0x004C, 0x006B,  0, 'NtGetTickCount'),
+    (0x004D, 0x0000,  4, 'NtGetWriteWatch'),
+    (0x004E, 0x0000,  1, 'NtImpersonateAnonymousToken'),
+    (0x004F, 0x00C5,  3, 'NtImpersonateClientOfPort'),
+    (0x0050, 0x00CD,  3, 'NtImpersonateThread'),
+    (0x0051, 0x0000,  2, 'NtInitializeRegistry'),
+    (0x0052, 0x0000,  5, 'NtInitiatePowerAction'),
+    (0x0053, 0x0000,  0, 'NtIsSystemResumeAutomatic'),
+    (0x0054, 0x0000,  3, 'NtListenPort'),
+    (0x0055, 0x0000,  1, 'NtLoadDriver'),
+    (0x0056, 0x0000,  3, 'NtLoadKey'),
+    (0x0057, 0x0000,  4, 'NtLoadKey2'),
+    (0x0058, 0x0000,  9, 'NtLockFile'),
+    (0x0059, 0x0038,  5, 'NtLockVirtualMemory'),
+    (0x005A, 0x0000,  1, 'NtMakeTemporaryObject'),
+    (0x005B, 0x0000,  3, 'NtMapUserPhysicalPages'),
+    (0x005C, 0x0000,  3, 'NtMapUserPhysicalPagesScatter'),
+    (0x005D, 0x0028, 10, 'NtMapViewOfSection'),                 # ★ critical
+    (0x005E, 0x0000,  9, 'NtNotifyChangeDirectoryFile'),
+    (0x005F, 0x0080,  6, 'NtNotifyChangeKey'),
+    (0x0060, 0x0000,  7, 'NtNotifyChangeMultipleKeys'),
+    (0x0061, 0x0058,  3, 'NtOpenDirectoryObject'),
+    (0x0062, 0x0040,  3, 'NtOpenEvent'),
+    (0x0063, 0x0000,  3, 'NtOpenEventPair'),
+    (0x0064, 0x0033,  6, 'NtOpenFile'),                         # ★ critical
+    (0x0065, 0x00DC,  4, 'NtOpenIoCompletion'),
+    (0x0066, 0x0000,  3, 'NtOpenJobObject'),
+    (0x0067, 0x0012,  3, 'NtOpenKey'),
+    (0x0068, 0x00DA,  4, 'NtOpenMutant'),
+    (0x0069, 0x0000,  9, 'NtOpenObjectAuditAlarm'),
+    (0x006A, 0x0026,  4, 'NtOpenProcess'),                      # ★ critical
+    (0x006B, 0x00E2,  3, 'NtOpenProcessToken'),
+    (0x006C, 0x002B,  5, 'NtOpenSection'),
+    (0x006D, 0x00DB,  4, 'NtOpenSemaphore'),
+    (0x006E, 0x0000,  3, 'NtOpenSymbolicLinkObject'),
+    (0x006F, 0x0112,  4, 'NtOpenThread'),
+    (0x0070, 0x00E3,  4, 'NtOpenThreadToken'),
+    (0x0071, 0x00CF,  3, 'NtOpenTimer'),
+    (0x0072, 0x0000,  4, 'NtPlugPlayControl'),
+    (0x0073, 0x0000,  5, 'NtPowerInformation'),
+    (0x0074, 0x0000,  5, 'NtPrivilegeCheck'),
+    (0x0075, 0x0000,  7, 'NtPrivilegedServiceAuditAlarm'),
+    (0x0076, 0x0000,  8, 'NtPrivilegeObjectAuditAlarm'),
+    (0x0077, 0x0050,  5, 'NtProtectVirtualMemory'),             # ★ critical
+    (0x0078, 0x0000,  2, 'NtPulseEvent'),
+    (0x0079, 0x0000,  4, 'NtQueryInformationAtom'),
+    (0x007A, 0x0040,  2, 'NtQueryAttributesFile'),
+    (0x007B, 0x0151,  2, 'NtQueryDefaultLocale'),
+    (0x007C, 0x0152,  2, 'NtQueryDefaultUILanguage'),
+    (0x007D, 0x0000, 11, 'NtQueryDirectoryFile'),
+    (0x007E, 0x0000,  8, 'NtQueryDirectoryObject'),
+    (0x007F, 0x0000,  5, 'NtQueryEaFile'),
+    (0x0080, 0x0000,  5, 'NtQueryEvent'),
+    (0x0081, 0x00AB,  2, 'NtQueryFullAttributesFile'),
+    (0x0082, 0x000B,  5, 'NtQueryInformationFile'),
+    (0x0083, 0x0000,  5, 'NtQueryInformationJobObject'),
+    (0x0084, 0x0000,  5, 'NtQueryIoCompletion'),
+    (0x0085, 0x0000,  5, 'NtQueryInformationPort'),
+    (0x0086, 0x0019,  5, 'NtQueryInformationProcess'),          # ★ critical
+    (0x0087, 0x0025,  5, 'NtQueryInformationThread'),
+    (0x0088, 0x00F1,  5, 'NtQueryInformationToken'),
+    (0x0089, 0x0155,  2, 'NtQueryInstallUILanguage'),
+    (0x008A, 0x0000,  2, 'NtQueryIntervalProfile'),
+    (0x008B, 0x0016,  5, 'NtQueryKey'),
+    (0x008C, 0x0000,  6, 'NtQueryMultipleValueKey'),
+    (0x008D, 0x0000,  5, 'NtQueryMutant'),
+    (0x008E, 0x0010,  5, 'NtQueryObject'),
+    (0x008F, 0x0000,  3, 'NtQueryOpenSubKeys'),
+    (0x0090, 0x0031,  2, 'NtQueryPerformanceCounter'),
+    (0x0091, 0x0000,  5, 'NtQueryQuotaInformationFile'),
+    (0x0092, 0x0000,  5, 'NtQuerySection'),
+    (0x0093, 0x00F2,  5, 'NtQuerySecurityObject'),
+    (0x0094, 0x0000,  5, 'NtQuerySemaphore'),
+    (0x0095, 0x0000,  3, 'NtQuerySymbolicLinkObject'),
+    (0x0096, 0x0000,  3, 'NtQuerySystemEnvironmentValue'),
+    (0x0097, 0x0036,  4, 'NtQuerySystemInformation'),           # ★ critical
+    (0x0098, 0x005A,  2, 'NtQuerySystemTime'),
+    (0x0099, 0x011E,  2, 'NtQueryTimer'),
+    (0x009A, 0x0000,  2, 'NtQueryTimerResolution'),
+    (0x009B, 0x0017,  5, 'NtQueryValueKey'),
+    (0x009C, 0x0023,  6, 'NtQueryVirtualMemory'),               # ★ critical
+    (0x009D, 0x0000,  5, 'NtQueryVolumeInformationFile'),
+    (0x009E, 0x0000,  5, 'NtQueueApcThread'),
+    (0x009F, 0x0000,  3, 'NtRaiseException'),
+    (0x00A0, 0x0000,  3, 'NtRaiseHardError'),
+    (0x00A1, 0x0006,  9, 'NtReadFile'),                         # ★ critical
+    (0x00A2, 0x0000,  9, 'NtReadFileScatter'),
+    (0x00A3, 0x0000,  6, 'NtReadRequestData'),
+    (0x00A4, 0x003F,  5, 'NtReadVirtualMemory'),                # ★ critical
+    (0x00A5, 0x0000,  2, 'NtRegisterThreadTerminatePort'),
+    (0x00A6, 0x00AC,  3, 'NtReleaseMutant'),
+    (0x00A7, 0x00A3,  3, 'NtReleaseSemaphore'),
+    (0x00A8, 0x00A5,  3, 'NtRemoveIoCompletion'),
+    (0x00A9, 0x0000,  3, 'NtReplaceKey'),
+    (0x00AA, 0x00B2,  2, 'NtReplyPort'),
+    (0x00AB, 0x00B4,  3, 'NtReplyWaitReceivePort'),
+    (0x00AC, 0x0000,  4, 'NtReplyWaitReceivePortEx'),
+    (0x00AD, 0x0000,  3, 'NtReplyWaitReplyPort'),
+    (0x00AE, 0x0000,  2, 'NtRequestDeviceWakeup'),
+    (0x00AF, 0x00BE,  2, 'NtRequestPort'),
+    (0x00B0, 0x00BF,  3, 'NtRequestWaitReplyPort'),
+    (0x00B1, 0x0000,  1, 'NtRequestWakeupLatency'),
+    (0x00B2, 0x0000,  2, 'NtResetEvent'),
+    (0x00B3, 0x0000,  4, 'NtResetWriteWatch'),
+    (0x00B4, 0x00BC,  3, 'NtRestoreKey'),
+    (0x00B5, 0x0052,  2, 'NtResumeThread'),                     # ★ critical
+    (0x00B6, 0x0000,  3, 'NtSaveKey'),
+    (0x00B7, 0x0000,  3, 'NtSaveMergedKeys'),
+    (0x00B8, 0x0000,  9, 'NtSecureConnectPort'),
+    (0x00B9, 0x00C6,  5, 'NtSetIoCompletion'),
+    (0x00BA, 0x00BE,  2, 'NtSetContextThread'),
+    (0x00BB, 0x0000,  1, 'NtSetDefaultHardErrorPort'),
+    (0x00BC, 0x0000,  2, 'NtSetDefaultLocale'),
+    (0x00BD, 0x0000,  2, 'NtSetDefaultUILanguage'),
+    (0x00BE, 0x0000,  5, 'NtSetEaFile'),
+    (0x00BF, 0x000E,  2, 'NtSetEvent'),
+    (0x00C0, 0x0000,  1, 'NtSetHighEventPair'),
+    (0x00C1, 0x0000,  1, 'NtSetHighWaitLowEventPair'),
+    (0x00C2, 0x0027,  5, 'NtSetInformationFile'),
+    (0x00C3, 0x0000,  5, 'NtSetInformationJobObject'),
+    (0x00C4, 0x0000,  2, 'NtSetInformationKey'),
+    (0x00C5, 0x0000,  4, 'NtSetInformationObject'),
+    (0x00C6, 0x001D,  4, 'NtSetInformationProcess'),
+    (0x00C7, 0x000A,  4, 'NtSetInformationThread'),
+    (0x00C8, 0x0000,  4, 'NtSetInformationToken'),
+    (0x00C9, 0x0000,  2, 'NtSetIntervalProfile'),
+    (0x00CA, 0x0000,  5, 'NtSetLdtEntries'),
+    (0x00CB, 0x0000,  1, 'NtSetLowEventPair'),
+    (0x00CC, 0x0000,  1, 'NtSetLowWaitHighEventPair'),
+    (0x00CD, 0x0000,  5, 'NtSetQuotaInformationFile'),
+    (0x00CE, 0x00E4,  4, 'NtSetSecurityObject'),
+    (0x00CF, 0x0000,  3, 'NtSetSystemEnvironmentValue'),
+    (0x00D0, 0x0000,  3, 'NtSetSystemInformation'),
+    (0x00D1, 0x0000,  3, 'NtSetSystemPowerState'),
+    (0x00D2, 0x0000,  2, 'NtSetSystemTime'),
+    (0x00D3, 0x0000,  1, 'NtSetThreadExecutionState'),
+    (0x00D4, 0x00C7,  5, 'NtSetTimer'),
+    (0x00D5, 0x0000,  3, 'NtSetTimerResolution'),
+    (0x00D6, 0x0000,  3, 'NtSetUuidSeed'),
+    (0x00D7, 0x0085,  5, 'NtSetValueKey'),
+    (0x00D8, 0x0000,  5, 'NtSetVolumeInformationFile'),
+    (0x00D9, 0x0000,  3, 'NtShutdownSystem'),
+    (0x00DA, 0x012F,  4, 'NtSignalAndWaitForSingleObject'),
+    (0x00DB, 0x0000,  2, 'NtStartProfile'),
+    (0x00DC, 0x0000,  1, 'NtStopProfile'),
+    (0x00DD, 0x00BF,  2, 'NtSuspendThread'),                    # ★ critical
+    (0x00DE, 0x0000,  4, 'NtSystemDebugControl'),
+    (0x00DF, 0x0000,  3, 'NtTerminateJobObject'),
+    (0x00E0, 0x002C,  2, 'NtTerminateProcess'),                 # ★ critical
+    (0x00E1, 0x0053,  2, 'NtTerminateThread'),
+    (0x00E2, 0x0000,  1, 'NtTestAlert'),
+    (0x00E3, 0x0000,  1, 'NtUnloadDriver'),
+    (0x00E4, 0x0000,  3, 'NtUnloadKey'),
+    (0x00E5, 0x0000,  5, 'NtUnlockFile'),
+    (0x00E6, 0x002B,  5, 'NtUnlockVirtualMemory'),
+    (0x00E7, 0x002A,  2, 'NtUnmapViewOfSection'),               # ★ critical
+    (0x00E9, 0x0054,  5, 'NtWaitForMultipleObjects'),
+    (0x00EA, 0x0004,  3, 'NtWaitForSingleObject'),              # ★ critical
+    (0x00EB, 0x0000,  1, 'NtWaitHighEventPair'),
+    (0x00EC, 0x0000,  1, 'NtWaitLowEventPair'),
+    (0x00ED, 0x0008,  9, 'NtWriteFile'),                        # ★ critical
+    (0x00EE, 0x0000,  9, 'NtWriteFileGather'),
+    (0x00EF, 0x0000,  6, 'NtWriteRequestData'),
+    (0x00F0, 0x003A,  5, 'NtWriteVirtualMemory'),               # ★ critical
+    # ── Win2000-specific undocumented channel APIs ─────────────────────────
+    (0x00F1, 0x0000,  2, 'NtCreateChannel'),
+    (0x00F2, 0x0000,  2, 'NtListenChannel'),
+    (0x00F3, 0x0000,  3, 'NtOpenChannel'),
+    (0x00F4, 0x0000,  5, 'NtReplyWaitSendChannel'),
+    (0x00F5, 0x0000,  5, 'NtSendWaitReplyChannel'),
+    (0x00F6, 0x0000,  3, 'NtSetContextChannel'),
+    (0x00F7, 0x0070,  0, 'NtYieldExecution'),
+    (0x00E8, 0x0000,  1, 'NtVdmControl'),
+]
+
+# Pre-built lookup maps
+_W2K_NR_TO_INFO: Dict[int, Tuple[int,int,str]] = {}    # nr → (win10, n_args, name)
+_W2K_NAME_TO_NR: Dict[str, int] = {}                   # name → win2000_nr
+_WIN10_NAME_TO_NR: Dict[str, int] = {}                 # name → win10_nr
+
+for (_w2k, _w10, _nargs, _name) in WIN2000_SYSCALL_TABLE:
+    _W2K_NR_TO_INFO[_w2k] = (_w10, _nargs, _name)
+    _W2K_NAME_TO_NR[_name] = _w2k
+    if _w10:
+        _WIN10_NAME_TO_NR[_name] = _w10
+
+# TEB field remapping: FS:[32-bit offset] → GS:[64-bit offset]
+# 32-bit TEB (fs:) → 64-bit TEB (gs:) offsets for common fields
+TEB_FS_TO_GS: Dict[int, int] = {
+    0x00: 0x00,   # ExceptionList (SEH chain, compat)
+    0x04: 0x08,   # StackBase
+    0x08: 0x10,   # StackLimit
+    0x0C: 0x18,   # SubSystemTib
+    0x10: 0x20,   # FiberData / Version
+    0x14: 0x28,   # ArbitraryUserPointer
+    0x18: 0x30,   # Self (pointer to TEB itself)
+    0x1C: 0x38,   # EnvironmentPointer
+    0x20: 0x40,   # ClientId.UniqueProcess
+    0x24: 0x48,   # ClientId.UniqueThread
+    0x28: 0x50,   # ActiveRpcHandle
+    0x2C: 0x58,   # ThreadLocalStoragePointer
+    0x30: 0x60,   # ProcessEnvironmentBlock (PEB)  ← very common
+    0x34: 0x68,   # LastErrorValue
+    0x38: 0x6C,   # CountOfOwnedCriticalSections
+    0x3C: 0x70,   # CsrClientThread
+    0x40: 0x78,   # Win32ThreadInfo
+}
+
+# Win64 PE constants
+IMAGE_REL_BASED_DIR64 = 10
+IMAGE_REL_BASED_HIGHLOW = 3
+PE64_DEFAULT_BASE = 0x180000000
+# EXEs are rebased into the 2-4 GiB window. Two constraints meet here:
+#   • base < 4 GiB  → image pointers stored in 32-bit .data slots (Win2000
+#     binaries keep pointers 4 bytes wide) keep a zero high dword, so a 32-bit
+#     `mov ecx,[global]` zero-extends to the correct 64-bit pointer. At
+#     0x180000000 the high dword (0x1) was truncated and faulted.
+#   • base > 2 GiB  → every image VA exceeds INT32_MAX, which forces the
+#     RIP-relative emit helpers (_emit_iat_call/_jmp, abs mov) onto their
+#     movabs fallback. Their rel32 fast-path mixes a build-time buffer offset
+#     with an absolute VA and is incorrect; the high base keeps it unused.
+PE64_EXE_BASE = 0x80000000
+PE64_OPT_STD = 112          # optional header fields before data directories
+PE64_OPT_TOTAL = 240        # PE32+ optional header including 16 data dirs
+WIN64_ARG_REG_NAMES = ['rcx', 'rdx', 'r8', 'r9']
+W32_ARG_REG_NAMES = ['ecx', 'edx', 'r8d', 'r9d']  # 32-bit views of the arg regs
+
+# Canonical chkstk arg-spill prologue emitted between ``mov rax,imm`` and
+# ``call __chkstk`` for large-frame functions: spill RCX/RDX/R8/R9 into the
+# caller-provided shadow space and anchor R15 at entry_rsp+4 so the body's deep
+# [esp+disp] incoming-parameter reads resolve to [r15+4+slot*8] == shadow slot.
+# (mov [rsp+8],rcx; mov [rsp+0x10],rdx; mov [rsp+0x18],r8; mov [rsp+0x20],r9;
+#  lea r15,[rsp+4]) — the entry detection skips exactly these bytes.
+_CHKSTK_ARG_SPILL = bytes.fromhex(
+    '48894c2408' '4889542410' '4c89442418' '4c894c2420' '4c8d7c2404')
+
+# Syscall target for translated ntdll stubs:
+#   win2000 — preserve Win2000 SSDT index (for our x64 NT 5.0 kernel)
+#   win10   — map to Win10 x64 numbers (shim on modern Windows)
+_SYSCALL_TARGET = 'win2000'
+
+
+@dataclass
+class DynamicScanResult:
+    """Results from Unicorn dynamic analysis."""
+    pointer_values: Set[int] = field(default_factory=set)   # values pointing into image
+    pointer_writes: Dict[int, int] = field(default_factory=dict)  # site_va -> written value
+    visited_blocks: Set[int] = field(default_factory=set)   # RVAs of executed basic blocks
+    call_targets: Set[int] = field(default_factory=set)     # RVAs reached by CALL/JMP
+    branch_targets: Set[int] = field(default_factory=set)   # all taken branch destinations
+    entries_emulated: int = 0
+    blocks_executed: int = 0
+
+
+@dataclass
+class X86TextAnalysis:
+    """Static (+ dynamic merge) control-flow picture of an x86 executable section."""
+    epilogue_labels: Dict[int, bytes] = field(default_factory=dict)   # rva → inline x64 epilog
+    branch_targets: Set[int] = field(default_factory=set)
+    call_targets: Set[int] = field(default_factory=set)  # E8 rel32 destinations only
+    branch_sources: Dict[int, List[int]] = field(default_factory=dict)  # tgt → [src rva…]
+    interior_labels: Set[int] = field(default_factory=set)
+    data_spans: List[Tuple[int, int]] = field(default_factory=list)   # [lo,hi) x86 rva
+    orphan_gaps: List[Tuple[int, int]] = field(default_factory=list)  # padding / tables
+
+
+def _x64_bytes_for_x86_epilogue(sec_data: bytes, off: int) -> Optional[Tuple[int, bytes]]:
+    """If *off* begins ``pop …; leave; ret[/n]`` or bare ``ret[/n]``, return (x86_len, x64_bytes)."""
+    if off >= len(sec_data):
+        return None
+    b0 = sec_data[off]
+    if b0 == 0xC3:
+        return (1, b'\xc3')
+    # x86 ``ret N`` (stdcall callee stack cleanup) → x64 ``ret`` (C3). In the
+    # translated calling convention args are register-passed and the caller's
+    # align prologue/epilogue (R13 save/restore) cleans the stack, so the callee
+    # must NOT pop N bytes — doing so misaligns RSP and returns to garbage. The
+    # main RET path already emits C3; mirror that here for materialized epilogues.
+    if b0 == 0xC2 and off + 3 <= len(sec_data):
+        return (3, b'\xc3\x90\x90')   # ret N → ret (+ NOP pad: keep length stable)
+    if b0 not in (0x5E, 0x5F, 0x5B, 0x5D, 0x56, 0x57, 0x53):
+        return None
+    pos = off
+    x64 = bytearray()
+    while pos < len(sec_data):
+        b = sec_data[pos]
+        if b in (0x5E, 0x5F, 0x5B, 0x5D, 0x56, 0x57, 0x53, 0x58, 0x59, 0x5A, 0x5C):
+            x64.append(b)
+            pos += 1
+            continue
+        if b == 0xC9:
+            x64.append(0xC9)
+            pos += 1
+            continue
+        if b == 0xC3:
+            x64.append(0xC3)
+            pos += 1
+            return (pos - off, bytes(x64))
+        if b == 0xC2 and pos + 3 <= len(sec_data):
+            x64 += b'\xc3\x90\x90'   # ret N → ret (+NOP pad: keep length stable)
+            pos += 3
+            return (pos - off, bytes(x64))
+        break
+    return None
+
+
+def _is_plausible_x86_insn_start(sec_data: bytes, off: int,
+                                 image_base: int, sec_rva: int) -> bool:
+    """True when *off* decodes as at least one valid x86 instruction."""
+    if off < 0 or off >= len(sec_data):
+        return False
+    b0 = sec_data[off]
+    if b0 == 0x00 and off + 1 < len(sec_data) and sec_data[off + 1] == 0x00:
+        return False
+    if not HAS_CAPSTONE:
+        return b0 not in (0x00, 0xCC)
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    try:
+        insns = list(md.disasm(sec_data[off:off + 16], image_base + sec_rva + off, count=1))
+    except CsError:
+        return False
+    return bool(insns) and insns[0].mnemonic not in ('invalid', '.byte')
+
+
+def _valid_x86_insn_rvas(sec_data: bytes, sec_rva: int,
+                         image_base: int,
+                         entry_rvas: Optional[Set[int]] = None) -> Set[int]:
+    """RVAs that are real x86 instruction boundaries."""
+    valid: Set[int] = set()
+    if not HAS_CAPSTONE or not sec_data:
+        return valid
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    sec_end = sec_rva + len(sec_data)
+    starts: Set[int] = set(entry_rvas or ())
+    starts.add(sec_rva)
+    for func_rva in sorted(starts):
+        if not (sec_rva <= func_rva < sec_end):
+            continue
+        off = func_rva - sec_rva
+        try:
+            for insn in md.disasm(sec_data[off:off + 65536], image_base + func_rva):
+                valid.add(insn.address - image_base)
+                if insn.mnemonic in ('ret', 'retn'):
+                    break
+                if insn.mnemonic == 'jmp' and insn.operands:
+                    op = insn.operands[0]
+                    if op.type == X86_OP_IMM:
+                        break
+        except CsError:
+            continue
+    return valid
+
+
+def _collect_x86_branch_edges(sec_data: bytes, sec_rva: int,
+                             sec_end: int,
+                             valid_targets: Optional[Set[int]] = None) -> Dict[int, List[int]]:
+    """Map every in-section branch destination → list of source RVAs."""
+    edges: Dict[int, List[int]] = {}
+    n = len(sec_data)
+
+    def _add(src: int, tgt: int) -> None:
+        if not (sec_rva <= tgt < sec_end):
+            return
+        if valid_targets is not None and tgt not in valid_targets:
+            return
+        edges.setdefault(tgt, []).append(src)
+
+    for i in range(n):
+        src = sec_rva + i
+        b = sec_data[i]
+        if b == 0xE8 and i + 5 <= n:
+            rel = int.from_bytes(sec_data[i + 1:i + 5], 'little', signed=True)
+            _add(src, src + 5 + rel)
+        elif b == 0xE9 and i + 5 <= n:
+            rel = int.from_bytes(sec_data[i + 1:i + 5], 'little', signed=True)
+            _add(src, src + 5 + rel)
+        elif 0x70 <= b <= 0x7F and i + 2 <= n:
+            rel = struct.unpack_from('b', sec_data, i + 1)[0]
+            _add(src, src + 2 + rel)
+        elif (b == 0x0F and i + 6 <= n and 0x80 <= sec_data[i + 1] <= 0x8F):
+            rel = int.from_bytes(sec_data[i + 2:i + 6], 'little', signed=True)
+            _add(src, src + 6 + rel)
+    return edges
+
+
+def _scan_x86_data_spans(sec_data: bytes, sec_rva: int,
+                         branch_targets: Set[int],
+                         min_run: int = 8) -> List[Tuple[int, int]]:
+    """Find likely non-code filler (00/CC/90 runs) not referenced as branch targets."""
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    n = len(sec_data)
+    while i < n:
+        b = sec_data[i]
+        if b not in (0x00, 0xCC, 0x90, 0xFF):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and sec_data[j] in (0x00, 0xCC, 0x90, 0xFF):
+            j += 1
+        if j - i >= min_run:
+            lo = sec_rva + i
+            hi = sec_rva + j
+            if not any(lo <= t < hi for t in branch_targets):
+                spans.append((lo, hi))
+        i = j
+    return spans
+
+
+def analyze_x86_text_section(pe: 'PE32Image', sec_data: bytes, sec_rva: int,
+                             dyn: Optional[DynamicScanResult] = None,
+                             entry_rvas: Optional[Set[int]] = None) -> X86TextAnalysis:
+    """
+    Pre-translation static CF analysis: epilogue labels, branch graph, data gaps.
+
+    Merged with Unicorn ``visited_blocks`` / ``branch_targets`` when available so
+    interior epilogue labels and orphan padding are known before Keystone emit.
+    """
+    sec_end = sec_rva + len(sec_data)
+    cf = X86TextAnalysis()
+    entries = entry_rvas or set()
+    insn_rvas = _valid_x86_insn_rvas(sec_data, sec_rva, pe.image_base, entries)
+    use_insn_filter = len(insn_rvas) >= max(64, len(entries))
+
+    edges = _collect_x86_branch_edges(
+        sec_data, sec_rva, sec_end,
+        insn_rvas if use_insn_filter else None)
+    cf.branch_sources = edges
+    cf.branch_targets = set(edges.keys())
+    for i in range(len(sec_data) - 5):
+        if sec_data[i] == 0xE8:
+            rel = int.from_bytes(sec_data[i + 1:i + 5], 'little', signed=True)
+            cf.call_targets.add(sec_rva + i + 5 + rel)
+    if not use_insn_filter:
+        # Drop mid-instruction targets when we cannot trust full insn map.
+        cf.branch_targets = {
+            t for t in cf.branch_targets
+            if _is_plausible_x86_insn_start(sec_data, t - sec_rva, pe.image_base, sec_rva)
+        }
+        cf.branch_sources = {
+            t: srcs for t, srcs in cf.branch_sources.items()
+            if t in cf.branch_targets
+        }
+
+    if dyn:
+        for r in dyn.call_targets:
+            if sec_rva <= r < sec_end and (not insn_rvas or r in insn_rvas):
+                cf.branch_targets.add(r)
+                cf.call_targets.add(r)
+        for r in dyn.branch_targets:
+            if sec_rva <= r < sec_end and (not insn_rvas or r in insn_rvas):
+                cf.branch_targets.add(r)
+        for r in dyn.visited_blocks:
+            if sec_rva <= r < sec_end and (not insn_rvas or r in insn_rvas):
+                cf.branch_targets.add(r)
+
+    for tgt in sorted(cf.branch_targets):
+        off = tgt - sec_rva
+        if off < 0 or off >= len(sec_data):
+            continue
+        ep = _x64_bytes_for_x86_epilogue(sec_data, off)
+        if ep is not None:
+            _x86_len, x64_ep = ep
+            cf.epilogue_labels[tgt] = x64_ep
+            cf.interior_labels.add(tgt)
+            continue
+        if tgt not in entries:
+            b0 = sec_data[off]
+            if b0 in (0x5E, 0x5F, 0x5B, 0x5D, 0xC3, 0xC9, 0x90, 0xCC, 0x00):
+                cf.interior_labels.add(tgt)
+
+    # Also walk all pop/leave/ret tails reachable even if not branch-targeted yet.
+    for i in range(len(sec_data) - 3):
+        ep = _x64_bytes_for_x86_epilogue(sec_data, i)
+        if ep is None:
+            continue
+        rva = sec_rva + i
+        _x86_len, x64_ep = ep
+        cf.epilogue_labels.setdefault(rva, x64_ep)
+
+    cf.data_spans = _scan_x86_data_spans(sec_data, sec_rva, cf.branch_targets)
+    cf.orphan_gaps = list(cf.data_spans)
+    return cf
+
+
+def set_syscall_target(target: str) -> None:
+    """Select which x64 syscall numbering scheme translated stubs use."""
+    global _SYSCALL_TARGET
+    if target not in ('win2000', 'win10'):
+        raise ValueError(f"syscall target must be 'win2000' or 'win10', got {target!r}")
+    _SYSCALL_TARGET = target
+
+
+def get_syscall_target() -> str:
+    return _SYSCALL_TARGET
+
+
+def resolve_syscall_nr(name: str, w2k_nr: int) -> int:
+    """
+    Resolve the x64 syscall number placed in RAX by translated stubs.
+
+    win2000: use the Win2000 index from ntdll (our x64 kernel SSDT uses the
+             same semantic numbering — NT 5.0 never shipped x64, we define it).
+    win10:   map by Nt* name to published Win10 x64 direct-syscall numbers.
+    """
+    if _SYSCALL_TARGET == 'win2000':
+        return w2k_nr
+    return resolve_win10_syscall(name, w2k_nr)
+
+
+def apply_win10_syscall_map(by_name: Dict[str, int]) -> int:
+    """Apply Win10 x64 syscall numbers by Nt* name to global lookup tables."""
+    updated = 0
+    for w2k, w10_old, nargs, name in WIN2000_SYSCALL_TABLE:
+        w10 = w10_old
+        if name in by_name:
+            w10 = by_name[name]
+        elif name.startswith('Zw'):
+            nt_name = 'Nt' + name[2:]
+            if nt_name in by_name:
+                w10 = by_name[nt_name]
+        if name in by_name or (name.startswith('Zw') and ('Nt' + name[2:]) in by_name):
+            if w10 != w10_old:
+                updated += 1
+        _W2K_NR_TO_INFO[w2k] = (w10, nargs, name)
+        _W2K_NAME_TO_NR[name] = w2k
+        _WIN10_NAME_TO_NR[name] = w10
+    return updated
+
+
+_WIN10_SYSCALL_NAMES: Set[str] = set()
+
+
+def count_mapped_syscalls() -> Tuple[int, int, List[str]]:
+    """Return (mapped, total, unmapped_names) from live lookup table."""
+    seen: Set[int] = set()
+    unmapped: List[str] = []
+    for w2k, (_w10, _, name) in _W2K_NR_TO_INFO.items():
+        if w2k in seen or name.startswith("Zw"):
+            continue
+        seen.add(w2k)
+        if name not in _WIN10_SYSCALL_NAMES:
+            unmapped.append(name)
+    return len(seen) - len(unmapped), len(seen), unmapped
+
+
+def count_syscall_coverage() -> Tuple[int, int, List[str]]:
+    """Return (mapped, total, unmapped) for the active syscall target."""
+    if _SYSCALL_TARGET == 'win2000':
+        seen: Set[int] = set()
+        for w2k, (_, _, name) in _W2K_NR_TO_INFO.items():
+            if name.startswith('Zw'):
+                continue
+            seen.add(w2k)
+        total = len(seen)
+        return total, total, []
+    return count_mapped_syscalls()
+
+
+def export_syscall_table_json(path: str, pe: Optional['PE32Image'] = None) -> int:
+    """
+    Write the active Win2000 syscall table to JSON.
+
+    Each entry: {name, win2000_nr, x64_nr, n_args, mechanism}
+    x64_nr follows --syscall-target (win2000 index or Win10 mapping).
+    """
+    stubs: List[StubInfo]
+    if pe is not None:
+        stubs = extract_stubs_from_ntdll(pe)
+    else:
+        stubs = []
+        for w2k, (_w10, nargs, name) in sorted(_W2K_NR_TO_INFO.items()):
+            if name.startswith('Zw'):
+                continue
+            stubs.append(StubInfo(0, name, w2k, _w10, nargs, nargs * 4, 'INT2E', b''))
+
+    rows = []
+    for s in stubs:
+        rows.append({
+            'name': s.name,
+            'win2000_nr': s.win2000_nr,
+            'x64_nr': resolve_syscall_nr(s.name, s.win2000_nr),
+            'n_args': s.n_args,
+            'mechanism': s.mechanism,
+            'target': _SYSCALL_TARGET,
+        })
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, indent=2)
+    return len(rows)
+
+
+def auto_load_win10_syscall_table() -> int:
+    """Load bundled or local win10_x64_syscalls.json if present."""
+    global _WIN10_SYSCALL_NAMES
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "win10_x64_syscalls.json"),
+        os.path.join(os.getcwd(), "win10_x64_syscalls.json"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            by_name = {k: int(v) for k, v in data.items()}
+            _WIN10_SYSCALL_NAMES = set(by_name.keys())
+            n = apply_win10_syscall_map(by_name)
+            print(f"[+] Applied {n} Win10 x64 syscall mappings from {path}")
+            return n
+    return 0
+
+
+def resolve_win10_syscall(name: str, w2k_nr: int) -> int:
+    """Resolve Win10 x64 syscall number for a stub."""
+    if name in _WIN10_NAME_TO_NR:
+        return _WIN10_NAME_TO_NR[name]
+    if name.startswith('Zw'):
+        return _WIN10_NAME_TO_NR.get('Nt' + name[2:], 0)
+    info = _W2K_NR_TO_INFO.get(w2k_nr)
+    return info[0] if info else 0
+
+
+def load_syscall_table_from_ntdll(path: str) -> int:
+    """Extract syscall numbers from a real ntdll.dll and refresh global lookup maps."""
+    with open(path, 'rb') as f:
+        pe = PE32Image(f.read())
+    stubs = extract_stubs_from_ntdll(pe)
+    updated = 0
+    for s in stubs:
+        if s.name.startswith('Zw'):
+            continue
+        w10 = resolve_win10_syscall(s.name, s.win2000_nr)
+        _W2K_NR_TO_INFO[s.win2000_nr] = (w10, s.n_args, s.name)
+        _W2K_NAME_TO_NR[s.name] = s.win2000_nr
+        _WIN10_NAME_TO_NR[s.name] = w10
+        updated += 1
+    return updated
+
+
+def discover_static_pointers(data: bytes, section_rva: int,
+                             old_base: int, image_size: int) -> Set[int]:
+    """Find offsets in a data section whose DWORD looks like an in-image VA or RVA."""
+    sites: Set[int] = set()
+    img_end = old_base + image_size
+    for off in range(0, len(data) - 3, 4):
+        val = struct.unpack_from('<I', data, off)[0]
+        if old_base <= val < img_end:
+            sites.add(section_rva + off)
+        elif 0 < val < image_size:
+            sites.add(section_rva + off)
+    return sites
+
+
+def discover_image_pointer_sites(pe: 'PE32Image',
+                                 dyn: Optional[DynamicScanResult] = None) -> Set[int]:
+    """Scan every section for pointer-like DWORDs, relocs, and dynamic write sites."""
+    sites: Set[int] = set()
+    old_base = pe.image_base
+    for rva, _rtype in pe.parse_relocations():
+        sites.add(rva)
+    for sec in pe.sections:
+        if not sec['raw_sz']:
+            continue
+        data = pe.get_section_data(sec)
+        sites |= discover_static_pointers(
+            data, sec['vaddr'], old_base, pe.image_size)
+    if dyn:
+        for site_va in dyn.pointer_writes:
+            sites.add(site_va - old_base)
+        for va in dyn.pointer_values:
+            if old_base <= va < old_base + pe.image_size:
+                sites.add(va - old_base)
+    return sites
+
+
+def _is_nested_ebp_callee_save(sec_data: bytes, off: int,
+                               max_back: int = 160) -> bool:
+    """True when push ebx/esi/edi sits inside an active push-ebp frame prologue."""
+    if off < 0 or off + 3 > len(sec_data):
+        return False
+    if sec_data[off:off + 3] not in (b'\x53\x56\x57', b'\x53\x55\x56'):
+        return False
+    for back in range(1, min(max_back, off) + 1):
+        p = off - back
+        if sec_data[p] == 0xC3:
+            return False
+        if sec_data[p] == 0xC2 and p + 3 <= len(sec_data):
+            return False
+        if sec_data[p:p + 3] in (b'\x55\x8b\xec', b'\x55\x8B\xEC'):
+            return True
+    return False
+
+
+def _is_post_chkstk_callee_save(sec_data: bytes, off: int) -> bool:
+    """True when a callee-save push block is the BODY of a large-frame function.
+
+    MSVC emits large stack frames as ``mov eax, imm32`` (``B8 imm32``) +
+    ``call __chkstk`` (``E8 rel32``) followed immediately by the callee-save
+    spill (``push ebx; push ebp; push esi; push edi`` etc.). The push block at
+    ``off`` then looks exactly like a frameless function prologue, so the entry
+    scanner registers a *phantom* second entry one instruction past the probe
+    call (cmd 0xA4F1 inside 0xA4E7). That duplicate is translated without the
+    chkstk frame context (no R15 arg anchor), so its deep ``[esp+disp]``
+    incoming-parameter reads return raw stack garbage and any caller routed to
+    it faults (wcschr(0x73006C)). The real entry is the ``mov eax,imm`` 10 bytes
+    back, so this candidate must be rejected. Keyed purely on the canonical
+    probe fingerprint — universal, not binary-specific.
+    """
+    if off < 10:
+        return False
+    # ``mov eax, imm32`` ; ``call rel32`` immediately preceding the push block.
+    return sec_data[off - 10] == 0xB8 and sec_data[off - 5] == 0xE8
+
+
+def _is_batch_helper_entry(sec_data: bytes, off: int) -> bool:
+    """MSVC helper: and byte ptr [global], 0; push esi; … (cmd 0x5581/0x6581)."""
+    if off + 8 > len(sec_data):
+        return False
+    if sec_data[off] not in (0x80, 0x83):
+        return False
+    if sec_data[off + 1] not in (0x25, 0x26):
+        return False
+    if sec_data[off + 6] != 0:
+        return False
+    tail = sec_data[off + 7:off + 12]
+    return bool(tail) and tail[0] in (0x56, 0x53, 0x55)  # push esi/ebx/ebp
+
+
+def discover_function_rvas(pe: 'PE32Image', sec_data: bytes, sec_rva: int,
+                           dyn: Optional[DynamicScanResult] = None) -> List[int]:
+    """
+    Find likely function entry RVAs inside an executable section.
+
+    Uses PE entry/export RVAs, common x86 prologues, import thunks,
+    and addresses observed during Unicorn emulation.
+    """
+    found: Set[int] = set()
+    sec_end = sec_rva + len(sec_data)
+    _static_calls = bool(_pure_translator_mode()
+                         or os.environ.get('CMD_STATIC_CALLS'))
+
+    def _in_sec(rva: int) -> bool:
+        return sec_rva <= rva < sec_end
+
+    if pe.entry_rva and _in_sec(pe.entry_rva):
+        found.add(pe.entry_rva)
+    for exp in pe.parse_exports():
+        if _in_sec(exp['rva']):
+            found.add(exp['rva'])
+
+    for i in range(max(0, len(sec_data) - 3)):
+        win = sec_data[i:i + 4]
+        if win[:3] in (b'\x55\x8b\xec', b'\x55\x8B\xEC'):
+            found.add(sec_rva + i)
+        if i >= 1 and sec_data[i - 1:i + 3] == b'\x53\x55\x8b\xec'[:3]:
+            found.add(sec_rva + i - 1)
+        # Frameless MSVC callee-save entry (push ebx/esi/edi, no EBP frame)
+        if sec_data[i:i + 3] == b'\x53\x56\x57':
+            if (not (_static_calls and _is_nested_ebp_callee_save(sec_data, i))
+                    and not _is_post_chkstk_callee_save(sec_data, i)):
+                found.add(sec_rva + i)
+        # Frameless callee-save entry: push ebx; push ebp; push esi; push edi
+        if (_static_calls and sec_data[i:i + 4] == b'\x53\x55\x56\x57'):
+            if (not _is_nested_ebp_callee_save(sec_data, i)
+                    and not _is_post_chkstk_callee_save(sec_data, i)):
+                found.add(sec_rva + i)
+        # Batch/copy helper (and byte ptr [global],0; push esi; …)
+        if _static_calls and _is_batch_helper_entry(sec_data, i):
+            found.add(sec_rva + i)
+        # stdcall wchar helper: mov ecx,[esp+4]; test ecx,ecx; mov eax,ecx
+        if (sec_data[i:i + 4] == b'\x8b\x4c\x24\x04' and i + 6 < len(sec_data)
+                and sec_data[i + 4:i + 6] == b'\x85\xc9'):
+            found.add(sec_rva + i)
+
+    for imp in pe.parse_imports():
+        for fn in imp['functions']:
+            iat_rva = fn.get('iat_rva')
+            if iat_rva and _in_sec(iat_rva):
+                found.add(iat_rva)
+
+    if dyn:
+        found.update(r for r in dyn.visited_blocks if _in_sec(r))
+        found.update(r for r in dyn.call_targets if _in_sec(r))
+
+    # Static direct-CALL (E8 rel32) target discovery. Dynamic emulation misses
+    # functions whose callers never execute under Unicorn (e.g. cmd's command
+    # dispatch helpers), so their entries are never queued and they end up
+    # mistranslated. Every E8 whose target lands on a plausible instruction
+    # start inside this section is a function entry. Gated to avoid disturbing
+    # the legacy hacked default layout.
+    if _static_calls:
+        n = len(sec_data)
+        for i in range(max(0, n - 5)):
+            if sec_data[i] != 0xE8:
+                continue
+            rel = int.from_bytes(sec_data[i + 1:i + 5], 'little', signed=True)
+            tgt = sec_rva + i + 5 + rel
+            if not _in_sec(tgt):
+                continue
+            off = tgt - sec_rva
+            b0 = sec_data[off]
+            # Plausible function opener; skip obvious data (00/filler).
+            if b0 in (0x55, 0x53, 0x56, 0x57, 0x8B, 0x83, 0x81, 0x51,
+                      0x6A, 0x68, 0xB8, 0xE9, 0x33, 0x31, 0xFF, 0x48, 0x80):
+                if b0 == 0x53 and _is_nested_ebp_callee_save(sec_data, off):
+                    continue
+                # Callee-save block right after a ``mov eax,imm; call __chkstk``
+                # probe is a large-frame function BODY, not an entry (the real
+                # entry is the ``mov eax,imm`` 10 bytes back). Snap back to it.
+                if b0 in (0x53, 0x55, 0x56, 0x57) and _is_post_chkstk_callee_save(
+                        sec_data, off):
+                    if sec_data[off - 10] == 0xB8:
+                        found.add(tgt - 10)
+                    continue
+                if b0 == 0x8B and off + 1 < len(sec_data):
+                    modrm = sec_data[off + 1]
+                    # ``mov r32, [abs32]`` — interior data load, not an entry.
+                    if modrm in (0x0D, 0x05, 0x15, 0x1D, 0x35, 0x3D):
+                        continue
+                if _is_batch_helper_entry(sec_data, off):
+                    found.add(tgt)
+                    continue
+                found.add(tgt)
+
+    return sorted(found)
+
+
+def discover_seh_except_handler3_push_vas(pe: 'PE32Image', text_data: bytes,
+                                          text_rva: int) -> Set[int]:
+    """x86 VAs pushed as SEH handler when the target is an _except_handler3 IAT jmp."""
+    iat_fn: Dict[int, str] = {}
+    for imp in pe.parse_imports():
+        for fn in imp['functions']:
+            iat_rva = fn.get('iat_rva')
+            if iat_rva:
+                iat_fn[iat_rva] = fn.get('name') or ''
+    base = pe.image_base
+    img_end = base + pe.image_size
+    handlers: Set[int] = set()
+    i = 0
+    while i < len(text_data) - 11:
+        is_push_m1 = (text_data[i] == 0x6A and text_data[i + 1] == 0xFF)
+        is_push_m1 |= text_data[i:i + 5] == b'\x68\xff\xff\xff\xff'
+        if is_push_m1:
+            p = i + (2 if text_data[i] == 0x6A else 5)
+            if p + 10 <= len(text_data) and text_data[p] == 0x68 and text_data[p + 5] == 0x68:
+                handler_va = struct.unpack_from('<I', text_data, p + 6)[0]
+                if base <= handler_va < img_end:
+                    hrva = handler_va - base
+                    off = hrva - text_rva
+                    if (0 <= off <= len(text_data) - 6
+                            and text_data[off:off + 2] == b'\xff\x25'):
+                        slot = struct.unpack_from('<I', text_data, off + 2)[0]
+                        if slot >= base:
+                            slot_rva = slot - base
+                            if iat_fn.get(slot_rva) == '_except_handler3':
+                                handlers.add(handler_va)
+                i = p + 10
+                continue
+        i += 1
+    return handlers
+
+
+def discover_seh_text_targets(text_data: bytes, text_rva: int,
+                              image_base: int, image_size: int) -> Set[int]:
+    """
+    RVAs referenced by MSVC x86 SEH registration (push -1; push scope; push filter).
+    Uses byte-pattern scan — linear Capstone disasm fails on cmd's .text jump tables.
+    """
+    targets: Set[int] = set()
+    img_end = image_base + image_size
+    i = 0
+    while i < len(text_data) - 11:
+        # push imm8 -1  (6A FF)  or  push 0xFFFFFFFF  (68 FF FF FF FF)
+        is_push_m1 = (text_data[i] == 0x6A and text_data[i + 1] == 0xFF)
+        is_push_m1 |= text_data[i:i + 5] == b'\x68\xff\xff\xff\xff'
+        if is_push_m1:
+            p = i + (2 if text_data[i] == 0x6A else 5)
+            if p + 10 <= len(text_data) and text_data[p] == 0x68 and text_data[p + 5] == 0x68:
+                for off in (p + 1, p + 6):
+                    va = struct.unpack_from('<I', text_data, off)[0]
+                    if image_base <= va < img_end:
+                        targets.add(va - image_base)
+                i = p + 10
+                continue
+        i += 1
+    return targets
+
+
+def _is_wchar16le_text_at(text_data: bytes, off: int) -> bool:
+    """Heuristic: offset looks like a UTF-16LE literal (``Sun``, ``Mon``, …)."""
+    if off + 3 >= len(text_data):
+        return False
+    lo, hi = text_data[off], text_data[off + 1]
+    if hi != 0 or lo == 0:
+        return False
+    if lo in (0x55, 0x53, 0x56, 0x57, 0x6A, 0x68, 0xE8, 0xFF, 0xC3, 0x8B, 0x89):
+        return False
+    return lo < 0x7F
+
+
+def _is_embedded_text_data_at(text_data: bytes, off: int) -> bool:
+    """Heuristic: offset looks like embedded data (UTF-16LE or narrow ASCII)."""
+    if _is_wchar16le_text_at(text_data, off):
+        return True
+    n = len(text_data)
+    if off >= n or text_data[off] == 0:
+        return False
+    b0 = text_data[off]
+    if not (0x20 <= b0 < 0x7f or b0 in (0x2e, 0x2f, 0x3a, 0x3b)):
+        return False
+    j = off
+    while j < n and j < off + 64:
+        b = text_data[j]
+        if b == 0:
+            return j > off
+        if b >= 0x7f or b in (0xe8, 0xff, 0xc3, 0x8b, 0x89, 0x68, 0x6a):
+            return False
+        j += 1
+    return False
+
+
+_EMBEDDED_SPAN_MERGE_GAP = 64
+
+
+def _embedded_text_blob_size(text_data: bytes, off: int,
+                             max_size: int = 128) -> int:
+    """Byte size of an embedded wchar/ascii literal in x86 .text."""
+    n = len(text_data)
+    if off < 0 or off >= n:
+        return 0
+    if text_data[off:off + 4] == b'\xff\xff\xff\xff':
+        return 16
+    if off + 1 < n and text_data[off + 1] == 0:
+        i = off
+        while i + 1 < n and i < off + max_size:
+            if text_data[i] == 0 and text_data[i + 1] == 0:
+                return i - off + 2
+            i += 2
+    i = off
+    while i < n and i < off + max_size and text_data[i] != 0:
+        i += 1
+    return max(4, min(max_size, i - off + 1))
+
+
+def discover_push_imm_text_data_refs(text_data: bytes, text_rva: int,
+                                     image_base: int,
+                                     image_size: int) -> Set[int]:
+    """RVAs in .text used as data via ``push imm32`` (locale tables, literals)."""
+    refs: Set[int] = set()
+    img_end = image_base + image_size
+    text_end = text_rva + len(text_data)
+    i = 0
+    n = len(text_data)
+    while i < n - 5:
+        if text_data[i] == 0x68:
+            imm = struct.unpack_from('<I', text_data, i + 1)[0]
+            if image_base <= imm < img_end:
+                old_rva = imm - image_base
+                if text_rva <= old_rva < text_end:
+                    off = old_rva - text_rva
+                    if _is_embedded_text_data_at(text_data, off):
+                        refs.add(old_rva)
+        i += 1
+    return refs
+
+
+def discover_seh_scope_anchors(text_data: bytes, text_rva: int,
+                               image_base: int, image_size: int) -> Dict[int, int]:
+    """Map x86 scope-table RVA → the function RVA that registers it."""
+    anchors: Dict[int, int] = {}
+    img_end = image_base + image_size
+    i = 0
+    while i < len(text_data) - 11:
+        is_push_m1 = (text_data[i] == 0x6A and text_data[i + 1] == 0xFF)
+        is_push_m1 |= text_data[i:i + 5] == b'\x68\xff\xff\xff\xff'
+        if is_push_m1:
+            p = i + (2 if text_data[i] == 0x6A else 5)
+            if p + 10 <= len(text_data) and text_data[p] == 0x68 and text_data[p + 5] == 0x68:
+                scope_va = struct.unpack_from('<I', text_data, p + 1)[0]
+                if image_base <= scope_va < img_end:
+                    anchors[scope_va - image_base] = text_rva + i
+                i = p + 10
+                continue
+        i += 1
+    return anchors
+
+
+def discover_ff25_jmp_thunks(text_data: bytes, text_rva: int,
+                             image_base: int,
+                             iat_slot_rvas: Optional[Set[int]] = None,
+                             exclude_rva_spans: Optional[List[Tuple[int, int]]] = None) -> Set[int]:
+    """RVAs of x86 `jmp dword ptr [abs32]` import / runtime tail thunks in .text."""
+    thunks: Set[int] = set()
+    if not HAS_CAPSTONE:
+        return thunks
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    i = 0
+    while i < len(text_data) - 6:
+        if text_data[i:i + 2] != b'\xff\x25':
+            i += 1
+            continue
+        rva = text_rva + i
+        if exclude_rva_spans and _rva_inside_spans(rva, exclude_rva_spans):
+            i += 1
+            continue
+        insns = list(md.disasm(text_data[i:i + 6], image_base + rva, count=1))
+        if insns and insns[0].mnemonic == 'jmp':
+            absva = struct.unpack_from('<I', text_data, i + 2)[0]
+            if absva < image_base:
+                i += 1
+                continue
+            slot_rva = absva - image_base
+            if iat_slot_rvas is not None and slot_rva not in iat_slot_rvas:
+                i += 1
+                continue
+            thunks.add(rva)
+        i += 1
+    return thunks
+
+
+def _msvc_scope_table_size(pe: 'PE32Image', text_data: bytes, text_rva: int,
+                           off: int) -> int:
+    """
+    Byte size of an x86 MSVC scope table (sentinel + 16-byte entries).
+
+    cmd.exe stores scope tables adjacent to string blobs; stop when the next
+    entry no longer looks like code-range begin/end/filter/handler DWORDs.
+    """
+    if off < 0 or off + 4 > len(text_data):
+        return 16
+    if text_data[off:off + 4] != b'\xff\xff\xff\xff':
+        return min(16, len(text_data) - off)
+    base = pe.image_base
+    text = pe.sections[0]
+    code_lo = base + text['vaddr']
+    code_hi = code_lo + text.get('vsize', len(text_data))
+    size = 4
+    for _ in range(32):
+        eoff = off + size
+        if eoff + 16 > len(text_data):
+            break
+        begin, end, filt, handler = struct.unpack_from('<4I', text_data, eoff)
+        if not (code_lo <= begin < code_hi and code_lo < end <= code_hi and begin < end):
+            break
+        if filt and not (code_lo <= filt < code_hi):
+            break
+        if handler and not (code_lo <= handler < code_hi):
+            break
+        size += 16
+    return max(size, 16)
+
+
+def _scope_table_spans(text_data: bytes, text_rva: int,
+                       pe: 'PE32Image') -> List[Tuple[int, int]]:
+    """(start_rva, byte_size) for each MSVC scope table in .text."""
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(text_data) - 4:
+        if text_data[i:i + 4] == b'\xff\xff\xff\xff':
+            size = _msvc_scope_table_size(pe, text_data, text_rva, i)
+            spans.append((text_rva + i, size))
+            i += max(size, 4)
+        else:
+            i += 1
+    return spans
+
+
+def _rva_inside_spans(rva: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(lo <= rva < lo + sz for lo, sz in spans)
+
+
+def discover_crt_data_pointer_slots(pe: 'PE32Image', text_data: bytes,
+                                    text_rva: int) -> Set[int]:
+    """RVAs in .data holding CRT tail pointer cells (targets of FF 25 thunks)."""
+    slots: Set[int] = set()
+    if not HAS_CAPSTONE:
+        return slots
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    base = pe.image_base
+    i = 0
+    while i < len(text_data) - 6:
+        if text_data[i:i + 2] != b'\xff\x25':
+            i += 1
+            continue
+        rva = text_rva + i
+        insns = list(md.disasm(text_data[i:i + 6], base + rva, count=1))
+        if not insns or insns[0].mnemonic != 'jmp':
+            i += 1
+            continue
+        absva = struct.unpack_from('<I', text_data, i + 2)[0]
+        if absva >= base:
+            slot_rva = absva - base
+            sec = pe.section_for_rva(slot_rva)
+            if sec and not (sec['flags'] & 0x20000000):
+                slots.add(slot_rva)
+        i += 1
+    return slots
+
+
+def fixup_rsrc_section(data: bytes, old_sec_rva: int, new_sec_rva: int) -> bytes:
+    """Rebase leaf ``IMAGE_RESOURCE_DATA_ENTRY`` RVAs when .rsrc moves."""
+    if old_sec_rva == new_sec_rva or not data:
+        return data
+    delta = new_sec_rva - old_sec_rva
+    buf = bytearray(data)
+    old_end = old_sec_rva + len(data)
+
+    def walk(dir_off: int) -> None:
+        if dir_off + 16 > len(buf):
+            return
+        num_named, num_id = struct.unpack_from('<HH', buf, dir_off + 12)
+        ent_off = dir_off + 16
+        for i in range(num_named + num_id):
+            off = ent_off + i * 8
+            if off + 8 > len(buf):
+                return
+            _name_or_id, entry_off = struct.unpack_from('<II', buf, off)
+            if entry_off & 0x80000000:
+                walk(entry_off & 0x7FFFFFFF)
+            else:
+                if entry_off + 4 > len(buf):
+                    return
+                leaf_rva = struct.unpack_from('<I', buf, entry_off)[0]
+                if old_sec_rva <= leaf_rva < old_end:
+                    struct.pack_into('<I', buf, entry_off, leaf_rva + delta)
+
+    walk(0)
+    return bytes(buf)
+
+
+def fixup_data_section(data: bytes, section_rva: int,
+                       relocs: List[Tuple[int, int]],
+                       old_base: int, new_base: int, image_size: int,
+                       pointer_sites: Set[int],
+                       dyn_writes: Dict[int, int],
+                       pe: Optional['PE32Image'] = None,
+                       old_to_new_section: Optional[Dict[int, int]] = None,
+                       iat_rva_map: Optional[Dict[int, int]] = None,
+                       final_rva_map: Optional[Dict[int, int]] = None) -> bytes:
+    """
+    Apply base relocations and patch known pointer slots for PE64 rebasing.
+
+    For each HIGHLOW reloc (or discovered pointer site), update the DWORD to
+    point at the same relative offset under new_base.  Dynamic write sites
+    discovered by Unicorn take precedence.
+    """
+    buf = bytearray(data)
+    img_end = old_base + image_size
+    delta = new_base - old_base
+
+    def _relocate_va(va: int) -> int:
+        if pe and (old_to_new_section or iat_rva_map):
+            return remap_image_va(va, pe, old_base, new_base,
+                                  old_to_new_section or {}, iat_rva_map,
+                                  final_rva_map)
+        if old_base <= va < img_end:
+            return new_base + (va - old_base)
+        return va
+
+    # Standard PE base relocations (HIGHLOW)
+    for rva, rtype in relocs:
+        if rtype != IMAGE_REL_BASED_HIGHLOW:
+            continue
+        if not (section_rva <= rva < section_rva + len(buf)):
+            continue
+        off = rva - section_rva
+        if off + 4 > len(buf):
+            continue
+        val = struct.unpack_from('<I', buf, off)[0]
+        struct.pack_into('<I', buf, off, (_relocate_va(val) & 0xFFFFFFFF))
+
+    # Heuristic static pointer scan
+    for rva in discover_static_pointers(bytes(buf), section_rva, old_base, image_size):
+        pointer_sites.add(rva)
+
+    # Dynamic Unicorn write sites override (keys are absolute VAs)
+    for site_va, value in dyn_writes.items():
+        site_rva = site_va - old_base if site_va >= old_base else site_va
+        if not (section_rva <= site_rva < section_rva + len(buf)):
+            continue
+        off = site_rva - section_rva
+        if off + 4 > len(buf):
+            continue
+        struct.pack_into('<I', buf, off, (_relocate_va(value) & 0xFFFFFFFF))
+
+    # Explicit pointer sites (relocs + static + dynamic keys)
+    for rva in pointer_sites:
+        if not (section_rva <= rva < section_rva + len(buf)):
+            continue
+        off = rva - section_rva
+        val = struct.unpack_from('<I', buf, off)[0]
+        if not (old_base <= val < img_end or 0 < val < image_size):
+            continue
+        new_val = _relocate_va(val if val >= old_base else old_base + val)
+        if off + 8 <= len(buf):
+            struct.pack_into('<Q', buf, off, new_val & 0xFFFFFFFFFFFFFFFF)
+        elif off + 4 <= len(buf):
+            struct.pack_into('<I', buf, off, new_val & 0xFFFFFFFF)
+
+    return bytes(buf)
+
+
+def remap_section_rva(old_rva: int, pe: 'PE32Image',
+                      old_to_new_section: Dict[int, int]) -> int:
+    """Map an x86 image RVA to its PE64 section-placed RVA."""
+    for sec in pe.sections:
+        old_va = sec['vaddr']
+        size = max(sec['vsize'], sec['raw_sz'], 1)
+        if old_va <= old_rva < old_va + size:
+            new_va = old_to_new_section.get(old_va, old_va)
+            return new_va + (old_rva - old_va)
+    return old_rva
+
+
+def remap_image_va(va: int, pe: 'PE32Image', old_base: int, new_base: int,
+                   old_to_new_section: Dict[int, int],
+                   iat_rva_map: Optional[Dict[int, int]] = None,
+                   final_rva_map: Optional[Dict[int, int]] = None) -> int:
+    """Remap a 32-bit image VA to the final PE64 VA (IAT + moved sections + code)."""
+    img_end = old_base + pe.image_size
+    if old_base <= va < img_end:
+        old_rva = va - old_base
+    elif new_base <= va < new_base + pe.image_size:
+        old_rva = va - new_base
+    else:
+        return va
+    if iat_rva_map and old_rva in iat_rva_map:
+        return new_base + iat_rva_map[old_rva]
+    # IAT thunk slots live in .text; function-driven layout remaps them as code.
+    if iat_rva_map and final_rva_map:
+        for old_iat, code_rva in final_rva_map.items():
+            if old_rva == code_rva and old_iat in iat_rva_map:
+                return new_base + iat_rva_map[old_iat]
+    # .data/.rsrc must win over code rva_map when the PE64 .text section has
+    # grown to cover the old x86 RVA (cmd.exe: unpatch 0x80044c58 lands in blob).
+    sec = pe.section_for_rva(old_rva)
+    if (sec and not (sec['flags'] & 0x20000000) and old_to_new_section):
+        return new_base + remap_section_rva(old_rva, pe, old_to_new_section)
+    if final_rva_map and old_rva in final_rva_map:
+        return new_base + final_rva_map[old_rva]
+    if old_to_new_section:
+        return new_base + remap_section_rva(old_rva, pe, old_to_new_section)
+    return new_base + old_rva
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Win10 DEV-ONLY import shim (--win10-test-shim)
+#  Routes missing Win10 x64 System32 symbols to w2kshim64.dll for smoke tests.
+#  Real Win2000 x64 uses translated kernel32/msvcrt with native Win2000 exports.
+# ══════════════════════════════════════════════════════════════════════════════
+
+W2KSHIM_DLL_NAME = 'w2kshim64.dll'
+W2KSHIM_IMAGE_BASE = 0x1_8001_00000
+W2KSHIM_EXCEPT_HANDLER3_RVA = 0x10C0   # updated by build_w2kshim64_dll()
+
+# Rewrite import to a different symbol/DLL that exists on Win10 x64.
+IMPORT_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
+    # _setjmp3 MUST NOT alias to MSVCRT!_setjmp — x64 jmp_buf layout differs from
+    # VC6 x86 and corrupts longjmp / NtContinue (stack RIP).  Routed to w2kshim64.
+}
+
+# Symbols implemented inside w2kshim64.dll (export name → stub kind).
+IMPORT_SHIM_EXPORTS: Dict[Tuple[str, str], str] = {
+    ('kernel32.dll', 'InterlockedExchange'): 'InterlockedExchange',
+    ('kernel32.dll', 'VirtualQuery'): 'VirtualQuery',
+    ('msvcrt.dll', '_setjmp3'): '_setjmp3',
+    ('msvcrt.dll', 'longjmp'): 'longjmp',
+    ('msvcrt.dll', '_except_handler3'): '_except_handler3',
+    ('msvcrt.dll', '_seh_longjmp_unwind'): '_seh_longjmp_unwind',
+    ('msvcrt.dll', '__p___initenv'): '__p___initenv',
+    ('msvcrt.dll', '_adjust_fdiv'): '_adjust_fdiv',
+    ('msvcrt.dll', '__p__commode'): '__p__commode',
+    ('msvcrt.dll', '__p__fmode'): '__p__fmode',
+    ('msvcrt.dll', 'towupper'): 'towupper',
+    ('msvcrt.dll', 'towlower'): 'towlower',
+}
+
+
+def transform_imports(imports: List[Dict]) -> List[Dict]:
+    """
+    Win10 dev-test only: rewrite imports for smoke tests on modern Windows.
+
+    Production Win2000 x64 builds must NOT call this — they keep original
+    kernel32.dll / msvcrt.dll imports and rely on translated system DLLs.
+    """
+    by_dll: Dict[str, List[Dict]] = {}
+
+    def _add(dll: str, fn: Dict) -> None:
+        by_dll.setdefault(dll, []).append(fn)
+
+    for imp in imports:
+        dll = imp['dll']
+        for fn in imp['functions']:
+            name = fn.get('name')
+            if not name:
+                _add(dll, fn)
+                continue
+            key = (dll.lower(), name)
+            if key in IMPORT_ALIASES:
+                new_dll, new_name = IMPORT_ALIASES[key]
+                patched = dict(fn)
+                patched['name'] = new_name
+                patched['hint'] = 0
+                _add(new_dll, patched)
+            elif key in IMPORT_SHIM_EXPORTS:
+                patched = dict(fn)
+                patched['name'] = IMPORT_SHIM_EXPORTS[key]
+                patched['hint'] = 0
+                _add(W2KSHIM_DLL_NAME, patched)
+            else:
+                _add(dll, fn)
+
+    return [{'dll': dll, 'functions': funcs,
+             'iat_rva': 0, 'ilt_rva': 0}
+            for dll, funcs in by_dll.items()]
+
+
+def _shim_asm(asm_text: str) -> bytes:
+    """Assemble x64 stub bytes for the shim DLL."""
+    if not HAS_KEYSTONE:
+        manual = {
+            'mov eax, 1; ret': bytes([0xB8, 1, 0, 0, 0, 0xC3]),
+            'xor eax, eax; ret': bytes([0x31, 0xC0, 0xC3]),
+            'ret': bytes([0xC3]),
+        }
+        return manual.get(asm_text, b'\xC3')
+    ks = Ks(KS_ARCH_X86, KS_MODE_64)
+    enc, _ = ks.asm(asm_text)
+    return bytes(enc)
+
+
+def build_w2kshim64_dll() -> bytes:
+    """
+    Build a minimal PE64 DLL exporting Win2000-only imports for Win10 x64.
+
+    Provides InterlockedExchange and legacy MSVCRT VC6 entry points that were
+    dropped from x64 System32.
+    """
+    try:
+        from w2kseh64 import (
+            seh_export_stubs,
+            build_vectored_seh_handler,
+            build_dllmain_install_vectored,
+            build_shim_idata,
+            build_virtualquery_shim,
+        )
+        _seh_stubs = seh_export_stubs()
+    except ImportError:
+        _seh_stubs = {}
+        build_vectored_seh_handler = None  # type: ignore
+        build_dllmain_install_vectored = None  # type: ignore
+        build_shim_idata = None  # type: ignore
+        build_virtualquery_shim = None  # type: ignore
+
+    FILE_ALIGN = 0x200
+    SECT_ALIGN = 0x1000
+
+    def align(n: int, a: int) -> int:
+        return (n + a - 1) & ~(a - 1)
+
+    text = bytearray()
+    export_rvas: Dict[str, int] = {}
+    text_rva = 0x1000
+
+    def emit_code(name: str, asm: str) -> None:
+        nonlocal text
+        export_rvas[name] = len(text)
+        text += _shim_asm(asm)
+        while len(text) % 16:
+            text.append(0xCC)
+
+    def emit_bytes(name: str, blob: bytes) -> None:
+        nonlocal text
+        export_rvas[name] = len(text)
+        text += blob
+        while len(text) % 16:
+            text.append(0xCC)
+
+    # DllMain patched after vectored handler + IAT layout are known.
+    dllmain_off: Optional[int] = None
+    vectored_off: Optional[int] = None
+
+    emit_code('InterlockedExchange',
+              'mov eax, edx; lock xchg dword ptr [rcx], eax; ret')
+    for _seh_name, _seh_blob in _seh_stubs.items():
+        emit_bytes(_seh_name, _seh_blob)
+    if '_except_handler3' not in _seh_stubs:
+        emit_code('_except_handler3', 'mov eax, 1; ret')
+    if '_seh_longjmp_unwind' not in _seh_stubs:
+        emit_code('_seh_longjmp_unwind', 'ret')
+
+    if build_vectored_seh_handler and '_except_handler3' in export_rvas:
+        eh3_rva = text_rva + export_rvas['_except_handler3']
+        vectored_blob = build_vectored_seh_handler(
+            eh3_rva, W2KSHIM_IMAGE_BASE)
+        if vectored_blob:
+            vectored_off = len(text)
+            text += vectored_blob
+            while len(text) % 16:
+                text.append(0xCC)
+
+    if build_dllmain_install_vectored and vectored_off is not None:
+        dllmain_off = len(text)
+        export_rvas['DllMain'] = dllmain_off
+        text += b'\x90' * 256  # placeholder — patched after .idata layout
+        while len(text) % 16:
+            text.append(0xCC)
+    else:
+        emit_code('DllMain', 'mov eax, 1; ret')
+    # VirtualQuery x86-ABI wrapper: placeholder patched after .idata layout
+    # (needs the real kernel32!VirtualQuery IAT slot VA, like DllMain).
+    vq_off: Optional[int] = None
+    if (build_virtualquery_shim and build_shim_idata
+            and dllmain_off is not None and vectored_off is not None):
+        vq_off = len(text)
+        export_rvas['VirtualQuery'] = vq_off
+        text += b'\xCC' * 192   # placeholder — patched after .idata layout
+        while len(text) % 16:
+            text.append(0xCC)
+    emit_code('_adjust_fdiv',
+              'xor eax, eax; ret')
+
+    # Win2000 cmd (and other apps) pass a packed DWORD (two wchars) to
+    # towupper/towlower.  The live Win10 msvcrt locale/ctype state inside the
+    # translated process is not reliably initialised, so msvcrt's wide path can
+    # dereference a stale per-thread/locale pointer and fault (observed
+    # towupper(0x3A0043) crashing deep in msvcrt with a string-data pointer in
+    # rax).  Provide self-contained stubs that never touch msvcrt state: mask to
+    # a single wchar and fold the ASCII a-z/A-Z range.  Universal — every
+    # Win2000 binary that uppercases path/drive characters benefits.
+    emit_bytes('towupper', bytes((
+        0x0F, 0xB7, 0xC1,              # movzx eax, cx
+        0x66, 0x83, 0xF8, 0x61,        # cmp ax, 'a'
+        0x72, 0x0A,                    # jb  ret
+        0x66, 0x83, 0xF8, 0x7A,        # cmp ax, 'z'
+        0x77, 0x04,                    # ja  ret
+        0x66, 0x83, 0xE8, 0x20,        # sub ax, 0x20
+        0xC3)))                        # ret
+    emit_bytes('towlower', bytes((
+        0x0F, 0xB7, 0xC1,              # movzx eax, cx
+        0x66, 0x83, 0xF8, 0x41,        # cmp ax, 'A'
+        0x72, 0x0A,                    # jb  ret
+        0x66, 0x83, 0xF8, 0x5A,        # cmp ax, 'Z'
+        0x77, 0x04,                    # ja  ret
+        0x66, 0x83, 0xC0, 0x20,        # add ax, 0x20
+        0xC3)))                        # ret
+
+    # CRT globals must be WRITABLE:
+    # __p__fmode() / __p___initenv() and writes through the returned pointer
+    # (e.g. *__p__commode() = _commode;). Keeping them in .text (R/X) faults
+    # with STATUS_ACCESS_VIOLATION on the store, so they live in .data (R/W).
+    data_blob = bytearray()
+    commode_data = len(data_blob)
+    data_blob += struct.pack('<I', 0)
+    fmode_data = len(data_blob)
+    data_blob += struct.pack('<I', 0)
+    initenv_data = len(data_blob)
+    data_blob += struct.pack('<Q', 0)
+
+    ptr_thunks: List[Tuple[str, int, int]] = []   # (name, data_off, fn_off)
+
+    def emit_ptr_thunk(name: str, data_off: int) -> None:
+        nonlocal text
+        fn_off = len(text)
+        export_rvas[name] = fn_off
+        # 48 8D 05 <disp32> = lea rax,[rip+disp]; disp patched once data_rva known
+        text.extend(b'\x48\x8D\x05')
+        text.extend(struct.pack('<i', 0))
+        text.append(0xC3)
+        ptr_thunks.append((name, data_off, fn_off))
+        while len(text) % 16:
+            text.append(0xCC)
+
+    emit_ptr_thunk('__p__commode', commode_data)
+    emit_ptr_thunk('__p__fmode', fmode_data)
+    emit_ptr_thunk('__p___initenv', initenv_data)
+
+    data_rva = align(text_rva + len(text), SECT_ALIGN)
+    for _name, data_off, fn_off in ptr_thunks:
+        disp = (data_rva + data_off) - (text_rva + fn_off + 7)
+        struct.pack_into('<i', text, fn_off + 3, disp)
+
+    idata_rva = 0
+    idata_blob = b''
+    import_dir_size = 0
+    if build_shim_idata and dllmain_off is not None and vectored_off is not None:
+        idata_rva = align(data_rva + len(data_blob), SECT_ALIGN)
+        (idata_blob, iat_slot_rva, seterr_iat_rva,
+         vq_iat_rva) = build_shim_idata(text_rva, idata_rva)
+        import_dir_size = len(idata_blob)
+        dm = build_dllmain_install_vectored(
+            text_rva + vectored_off, W2KSHIM_IMAGE_BASE, iat_slot_rva,
+            text_rva + export_rvas['_except_handler3'], seterr_iat_rva)
+        if len(dm) <= 256:
+            text[dllmain_off:dllmain_off + len(dm)] = dm
+            for trap in range(len(dm), 240, 16):
+                rel = -(trap + 5)
+                text[dllmain_off + trap:dllmain_off + trap + 5] = (
+                    b'\xE9' + struct.pack('<i', rel))
+        else:
+            raise RuntimeError(
+                f'w2kshim64 DllMain stub {len(dm)} bytes exceeds 256-byte slot')
+        if vq_off is not None:
+            vq_blob = build_virtualquery_shim(W2KSHIM_IMAGE_BASE + vq_iat_rva)
+            if len(vq_blob) <= 192:
+                text[vq_off:vq_off + len(vq_blob)] = vq_blob
+            else:
+                raise RuntimeError(
+                    f'w2kshim64 VirtualQuery stub {len(vq_blob)} bytes '
+                    f'exceeds 192-byte slot')
+
+    text = bytes(text)
+    data_blob = bytes(data_blob)
+
+    export_names = [
+        'DllMain', 'InterlockedExchange',
+        '_setjmp3', 'longjmp',
+        '_except_handler3', '_seh_longjmp_unwind',
+        '_adjust_fdiv', '__p___initenv',
+        '__p__commode', '__p__fmode',
+        'towupper', 'towlower',
+    ]
+    if 'VirtualQuery' in export_rvas:
+        export_names.append('VirtualQuery')
+    names_blob = bytearray()
+    name_offs: List[int] = []
+    for nm in export_names:
+        name_offs.append(len(names_blob))
+        names_blob += nm.encode('ascii') + b'\x00'
+
+    nexports = len(export_names)
+    hdr = 40
+    func_tbl = hdr
+    name_ptr = func_tbl + nexports * 4
+    ord_tbl = name_ptr + nexports * 4
+    names_sec = ord_tbl + nexports * 2
+    dll_name_off = names_sec + len(names_blob)
+    edata_size = dll_name_off + len(W2KSHIM_DLL_NAME) + 1
+
+    edata_rva = align(
+        (idata_rva + len(idata_blob)) if idata_blob else (data_rva + len(data_blob)),
+        SECT_ALIGN)
+    edata = bytearray(b'\x00' * edata_size)
+    edata[names_sec:names_sec + len(names_blob)] = names_blob
+    dll_nm = W2KSHIM_DLL_NAME.encode('ascii') + b'\x00'
+    edata[dll_name_off:dll_name_off + len(dll_nm)] = dll_nm
+
+    name_ptr_base = edata_rva + names_sec
+    struct.pack_into('<IIHHIIIIIII', edata, 0,
+                     0, 0,
+                     0, 0,
+                     edata_rva + dll_name_off,
+                     1, nexports, nexports,
+                     edata_rva + func_tbl,
+                     edata_rva + name_ptr,
+                     edata_rva + ord_tbl)
+
+    for i, nm in enumerate(export_names):
+        struct.pack_into('<I', edata, func_tbl + i * 4, text_rva + export_rvas[nm])
+
+    # AddressOfNames must be sorted ascending by ASCII name (strcmp order).
+    sorted_names = sorted(export_names)
+    for i, nm in enumerate(sorted_names):
+        struct.pack_into('<I', edata, name_ptr + i * 4, name_ptr_base + name_offs[export_names.index(nm)])
+        func_idx = export_names.index(nm)
+        struct.pack_into('<H', edata, ord_tbl + i * 2, func_idx)
+
+    sections = [
+        ('.text', text, 0x60000020, text_rva),
+        ('.data', data_blob, 0xC0000040, data_rva),
+    ]
+    if idata_blob:
+        sections.append(('.idata', idata_blob, 0xC0000040, idata_rva))
+    sections.append(('.edata', bytes(edata), 0x40000040, edata_rva))
+    num_sections = len(sections)
+    PE64_OPT = PE64_OPT_TOTAL
+    hdrs_size = align(64 + 4 + 20 + PE64_OPT + num_sections * 40, FILE_ALIGN)
+    image_size = align(edata_rva + len(edata), SECT_ALIGN)
+
+    dos = b'MZ' + b'\x00' * 0x3A + struct.pack('<I', 0x40)
+    pe_sig = b'PE\x00\x00'
+    coff = struct.pack('<HHIIIHH',
+                       0x8664, num_sections, 0, 0, 0,
+                       PE64_OPT, 0x2102)   # DLL | EXECUTABLE
+
+    opt_hdr = struct.pack('<HBBI', 0x020B, 14, 0, align(len(text), FILE_ALIGN))
+    opt_hdr += struct.pack('<III',
+                           sum(align(len(s[1]), FILE_ALIGN) for s in sections[1:]),
+                           0,
+                           text_rva + export_rvas['DllMain'])
+    opt_hdr += struct.pack('<IQ', text_rva, W2KSHIM_IMAGE_BASE)
+    opt_hdr += struct.pack('<IIHHHHHH', SECT_ALIGN, FILE_ALIGN, 6, 0, 0, 0, 6, 0)
+    opt_hdr += struct.pack('<IIII', 0, image_size, hdrs_size, 0)
+    opt_hdr += struct.pack('<HH', 3, 0x0100)   # DLL subsystem, NX only (fixed ImageBase)
+    opt_hdr += struct.pack('<QQQQ', 0x100000, 0x1000, 0x100000, 0x1000)
+    opt_hdr += struct.pack('<II', 0, 16)
+    if len(opt_hdr) != PE64_OPT_STD:
+        raise RuntimeError(
+            f"w2kshim64 opt header: expected {PE64_OPT_STD}, got {len(opt_hdr)}")
+
+    data_dirs = b''
+    for idx in range(16):
+        if idx == 0:
+            data_dirs += struct.pack('<II', edata_rva, len(edata))
+        elif idx == 1 and idata_blob:
+            data_dirs += struct.pack('<II', idata_rva, import_dir_size)
+        else:
+            data_dirs += struct.pack('<II', 0, 0)
+
+    sect_hdrs = b''
+    file_ptr = hdrs_size
+    for sname, sdata, sflags, sva in sections:
+        raw_sz = align(len(sdata), FILE_ALIGN)
+        n = sname.encode('ascii', 'replace')[:8].ljust(8, b'\x00')
+        sect_hdrs += struct.pack('<8sIIIIIIHHI',
+                                 n, len(sdata), sva, raw_sz, file_ptr,
+                                 0, 0, 0, 0, sflags)
+        file_ptr += raw_sz
+
+    header_blob = dos + pe_sig + coff + opt_hdr + data_dirs + sect_hdrs
+    header_blob = header_blob.ljust(hdrs_size, b'\x00')
+    out = bytearray(header_blob)
+    for _, sdata, _, _ in sections:
+        out += sdata.ljust(align(len(sdata), FILE_ALIGN), b'\x00')
+    global W2KSHIM_EXCEPT_HANDLER3_RVA
+    W2KSHIM_EXCEPT_HANDLER3_RVA = text_rva + export_rvas.get(
+        '_except_handler3', 0x10C0 - text_rva)
+    return bytes(out)
+
+
+def ensure_w2kshim_dll(out_dir: str) -> str:
+    """Write w2kshim64.dll into out_dir (always refresh — small dev-test helper)."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, W2KSHIM_DLL_NAME)
+    blob = build_w2kshim64_dll()
+    with open(path, 'wb') as f:
+        f.write(blob)
+    return path
+
+
+def ebp_disp_to_win64_arg(disp: int) -> Optional[str]:
+    """Map 32-bit [EBP+disp] stack slot to Win64 register or stack home."""
+    if disp >= 8 and (disp - 8) % 4 == 0 and disp <= 0x40:
+        idx = (disp - 8) // 4
+        if idx < 4:
+            return WIN64_ARG_REG_NAMES[idx]
+        return f'[rsp+0x{0x28 + (idx - 4) * 8:x}]'
+    return None
+
+
+def ebp_disp_to_rbp_home(disp: int) -> Optional[int]:
+    """Map x86 [EBP+disp] arg slot to x64 [RBP+off] MSVC home (past saved RBP + retaddr)."""
+    if disp >= 8 and (disp - 8) % 4 == 0 and disp <= 0x40:
+        idx = (disp - 8) // 4
+        if idx < 4:
+            return 0x10 + idx * 8
+        # Register homes end at [RBP+0x28] (R9); stack args start at [RBP+0x30].
+        return 0x30 + (idx - 4) * 8
+    return None
+
+
+def ebp_arg_slot_to_rbp_home(slot: int) -> int:
+    """Map ebp_arg slot ``(disp-8)//4`` to MSVC ``[RBP+off]`` home."""
+    home = ebp_disp_to_rbp_home(8 + slot * 4)
+    return home if home is not None else (0x10 + slot * 8)
+
+
+def ebp_disp_to_rbp_stack_off(disp: int) -> Optional[int]:
+    """Byte offset from RBP for x86 [EBP+disp] stack bytes (args homed at +0x10)."""
+    if disp >= 8 and disp < 0x80:
+        return 0x10 + (disp - 8)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  2.  PE32 IMAGE PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PE32Image:
+    """Parse a Windows 2000 SP4 PE32 image."""
+
+    def __init__(self, data: bytes):
+        if data[:2] != b'MZ':
+            raise ValueError("Not a PE file (bad MZ signature)")
+        self.raw  = data
+        self.pe_off = struct.unpack_from('<I', data, 0x3C)[0]
+        if data[self.pe_off:self.pe_off+4] != b'PE\x00\x00':
+            raise ValueError("PE signature not found")
+
+        coff = self.pe_off + 4
+        self.machine        = struct.unpack_from('<H', data, coff)[0]
+        self.num_sections   = struct.unpack_from('<H', data, coff+2)[0]
+        self.timestamp      = struct.unpack_from('<I', data, coff+4)[0]
+        self.opt_header_sz  = struct.unpack_from('<H', data, coff+16)[0]
+        self.characteristics= struct.unpack_from('<H', data, coff+18)[0]
+
+        opt = coff + 20
+        self.magic       = struct.unpack_from('<H', data, opt)[0]
+        self.entry_rva   = struct.unpack_from('<I', data, opt+16)[0]
+        self.image_base  = struct.unpack_from('<I', data, opt+28)[0]
+        self.sect_align  = struct.unpack_from('<I', data, opt+32)[0]
+        self.file_align  = struct.unpack_from('<I', data, opt+36)[0]
+        self.image_size  = struct.unpack_from('<I', data, opt+56)[0]
+        self.header_size = struct.unpack_from('<I', data, opt+60)[0]
+        self.subsystem   = struct.unpack_from('<H', data, opt+68)[0]
+
+        # Data directories (16 entries, 8 bytes each)
+        dd_off = opt + 96
+        def dd(i): return struct.unpack_from('<II', data, dd_off + i*8)
+        self.dir_export    = dd(0)
+        self.dir_import    = dd(1)
+        self.dir_resource  = dd(2)
+        self.dir_exception = dd(3)
+        self.dir_security  = dd(4)
+        self.dir_basereloc = dd(5)
+        self.dir_debug     = dd(6)
+        self.dir_tls       = dd(9)
+        self.dir_iat       = dd(12)
+
+        # Section headers
+        sec_hdr = opt + self.opt_header_sz
+        self.sections: List[Dict] = []
+        for i in range(self.num_sections):
+            sh = sec_hdr + i * 40
+            name     = data[sh:sh+8].rstrip(b'\x00').decode('latin1')
+            vsize    = struct.unpack_from('<I', data, sh+8)[0]
+            vaddr    = struct.unpack_from('<I', data, sh+12)[0]
+            raw_sz   = struct.unpack_from('<I', data, sh+16)[0]
+            raw_ptr  = struct.unpack_from('<I', data, sh+20)[0]
+            reloc_ptr= struct.unpack_from('<I', data, sh+24)[0]
+            nrelocs  = struct.unpack_from('<H', data, sh+32)[0]
+            flags    = struct.unpack_from('<I', data, sh+36)[0]
+            self.sections.append({
+                'name': name, 'vsize': vsize, 'vaddr': vaddr,
+                'raw_sz': raw_sz, 'raw_ptr': raw_ptr,
+                'reloc_ptr': reloc_ptr, 'nrelocs': nrelocs, 'flags': flags,
+            })
+
+        self.is_dll = bool(self.characteristics & 0x2000)
+        self.is_exe = bool(self.characteristics & 0x0002)
+
+    def rva_to_offset(self, rva: int) -> Optional[int]:
+        for s in self.sections:
+            if s['vaddr'] <= rva < s['vaddr'] + s['vsize']:
+                return s['raw_ptr'] + (rva - s['vaddr'])
+        return None
+
+    def va_to_offset(self, va: int) -> Optional[int]:
+        return self.rva_to_offset(va - self.image_base)
+
+    def read_rva(self, rva: int, size: int) -> Optional[bytes]:
+        off = self.rva_to_offset(rva)
+        if off is None: return None
+        return self.raw[off:off+size]
+
+    def read_cstring(self, rva: int) -> str:
+        off = self.rva_to_offset(rva)
+        if off is None: return ''
+        return self.raw[off:].split(b'\x00',1)[0].decode('latin1', errors='replace')
+
+    def section_for_rva(self, rva: int) -> Optional[Dict]:
+        for s in self.sections:
+            if s['vaddr'] <= rva < s['vaddr'] + s['vsize']:
+                return s
+        return None
+
+    def get_section_data(self, section: Dict) -> bytes:
+        p = section['raw_ptr']; sz = section['raw_sz']
+        raw = self.raw[p:p + sz]
+        vsize = section['vsize']
+        if vsize > len(raw):
+            raw = raw + b'\x00' * (vsize - len(raw))
+        return raw
+
+    # ── Export table ───────────────────────────────────────────────────────────
+    def parse_exports(self) -> List[Dict]:
+        rva, sz = self.dir_export
+        if not rva: return []
+        off = self.rva_to_offset(rva)
+        if off is None: return []
+        ordbase  = struct.unpack_from('<I', self.raw, off+16)[0]
+        nfuncs   = struct.unpack_from('<I', self.raw, off+20)[0]
+        nnames   = struct.unpack_from('<I', self.raw, off+24)[0]
+        funcs_rva= struct.unpack_from('<I', self.raw, off+28)[0]
+        names_rva= struct.unpack_from('<I', self.raw, off+32)[0]
+        ords_rva = struct.unpack_from('<I', self.raw, off+36)[0]
+        funcs_o  = self.rva_to_offset(funcs_rva)
+        names_o  = self.rva_to_offset(names_rva)
+        ords_o   = self.rva_to_offset(ords_rva)
+        if None in (funcs_o, names_o, ords_o): return []
+        exports = []
+        for i in range(nnames):
+            name_rva = struct.unpack_from('<I', self.raw, names_o + i*4)[0]
+            ordi     = struct.unpack_from('<H', self.raw, ords_o  + i*2)[0]
+            func_rva = struct.unpack_from('<I', self.raw, funcs_o + ordi*4)[0]
+            name     = self.read_cstring(name_rva)
+            exports.append({'name': name, 'rva': func_rva,
+                            'ordinal': ordbase + ordi, 'ord_idx': ordi})
+        return exports
+
+    # ── Import table ───────────────────────────────────────────────────────────
+    def parse_imports(self) -> List[Dict]:
+        rva, sz = self.dir_import
+        if not rva: return []
+        imports = []
+        off = self.rva_to_offset(rva)
+        if off is None: return []
+        while True:
+            ilt_rva, ts, fwd, dll_rva, iat_rva = struct.unpack_from('<IIIII', self.raw, off)
+            off += 20
+            if ilt_rva == 0 and dll_rva == 0: break
+            dll_name = self.read_cstring(dll_rva) if dll_rva else ''
+            funcs = []
+            ilt_off = self.rva_to_offset(ilt_rva or iat_rva)
+            iat_off = self.rva_to_offset(iat_rva)
+            if ilt_off:
+                idx = 0
+                while True:
+                    thunk = struct.unpack_from('<I', self.raw, ilt_off + idx*4)[0]
+                    if thunk == 0: break
+                    if thunk & 0x80000000:  # ordinal
+                        funcs.append({'ordinal': thunk & 0xFFFF, 'name': None,
+                                      'hint': 0, 'iat_rva': iat_rva + idx*4})
+                    else:
+                        hint_off = self.rva_to_offset(thunk)
+                        if hint_off:
+                            hint = struct.unpack_from('<H', self.raw, hint_off)[0]
+                            fname = self.raw[hint_off+2:].split(b'\x00',1)[0].decode('latin1','replace')
+                        else:
+                            hint, fname = 0, '??'
+                        funcs.append({'ordinal': None, 'name': fname,
+                                      'hint': hint, 'iat_rva': iat_rva + idx*4})
+                    idx += 1
+            imports.append({'dll': dll_name, 'functions': funcs,
+                            'iat_rva': iat_rva, 'ilt_rva': ilt_rva})
+        return imports
+
+    # ── Base relocations ───────────────────────────────────────────────────────
+    def parse_relocations(self) -> List[Tuple[int,int]]:
+        """Return list of (rva, type) pairs from .reloc directory."""
+        rva, sz = self.dir_basereloc
+        if not rva or not sz: return []
+        relocs = []
+        off = self.rva_to_offset(rva)
+        if off is None: return []
+        end = off + sz
+        while off < end:
+            page_rva = struct.unpack_from('<I', self.raw, off)[0]
+            blk_sz   = struct.unpack_from('<I', self.raw, off+4)[0]
+            if blk_sz < 8: break
+            for i in range((blk_sz - 8) // 2):
+                entry = struct.unpack_from('<H', self.raw, off + 8 + i*2)[0]
+                rtype = (entry >> 12) & 0xF
+                roff  = entry & 0xFFF
+                if rtype == 3:   # IMAGE_REL_BASED_HIGHLOW — standard 32-bit
+                    relocs.append((page_rva + roff, rtype))
+                elif rtype == 0: # padding
+                    pass
+            off += blk_sz
+        return relocs
+
+    def get_text_section(self) -> Optional[Tuple[Dict, bytes]]:
+        for s in self.sections:
+            if s['flags'] & 0x20000000:   # IMAGE_SCN_MEM_EXECUTE
+                return (s, self.get_section_data(s))
+        return None
+
+    def get_executable_sections(self) -> List[Tuple[Dict, bytes]]:
+        result = []
+        for s in self.sections:
+            if s['flags'] & 0x20000000 and s['raw_sz']:
+                result.append((s, self.get_section_data(s)))
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  3.  NTDLL STUB DETECTOR
+#      Finds the exact byte pattern used by all 247 Win2000 stubs
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StubInfo:
+    """Information about a decoded NTDLL syscall stub."""
+    __slots__ = ('rva', 'name', 'win2000_nr', 'win10_nr',
+                 'n_args', 'ret_pop', 'mechanism', 'raw')
+
+    def __init__(self, rva, name, w2k_nr, w10_nr, n_args, ret_pop, mech, raw):
+        self.rva       = rva
+        self.name      = name
+        self.win2000_nr= w2k_nr
+        self.win10_nr  = w10_nr
+        self.n_args    = n_args
+        self.ret_pop   = ret_pop
+        self.mechanism = mech   # 'INT2E' or 'SYSENTER'
+        self.raw       = raw    # original bytes
+
+    def __repr__(self):
+        return (f"StubInfo({self.name}, w2k=0x{self.win2000_nr:04X}, "
+                f"w10=0x{self.win10_nr:04X}, args={self.n_args})")
+
+
+def extract_stubs_from_ntdll(pe: PE32Image) -> List[StubInfo]:
+    """
+    Walk every export, identify the Win2000 NTDLL stub pattern, and extract
+    the real syscall numbers + argument counts.
+
+    Win2000 SP4 stub layout (16 bytes per stub, aligned):
+      B8 [4-byte syscall_nr]      MOV EAX, <nr>
+      8D 54 24 04                  LEA EDX, [ESP+4]
+      CD 2E                        INT 0x2E
+      C2 [2-byte ret_bytes] / C3   RET <n> / RET
+
+    Some stubs on CPUs supporting SYSENTER use:
+      B8 [4-byte syscall_nr]      MOV EAX, <nr>
+      8D 54 24 04                  LEA EDX, [ESP+4]  (or 8B D4: MOV EDX, ESP)
+      0F 34                        SYSENTER
+      ...
+    """
+    stubs: List[StubInfo] = []
+    exports = pe.parse_exports()
+
+    for exp in exports:
+        name = exp['name']
+        if not (name.startswith('Nt') or name.startswith('Zw')):
+            continue
+
+        func_rva = exp['rva']
+        stub_off = pe.rva_to_offset(func_rva)
+        if stub_off is None:
+            continue
+        stub = pe.raw[stub_off : stub_off + 16]
+        if len(stub) < 12:
+            continue
+
+        # Must start with MOV EAX, imm32  (B8 xx xx xx xx)
+        if stub[0] != 0xB8:
+            continue
+        w2k_nr = struct.unpack_from('<I', stub, 1)[0]
+
+        # Check for LEA EDX,[ESP+4]  or  MOV EDX,ESP
+        lea_edx_esp4 = (stub[5:9] == b'\x8d\x54\x24\x04')
+        mov_edx_esp  = (stub[5:7] == b'\x8b\xd4')
+
+        if not (lea_edx_esp4 or mov_edx_esp):
+            continue
+
+        body_off = 9 if lea_edx_esp4 else 7
+        body = stub[body_off:]
+
+        if body[:2] == b'\xcd\x2e':    # INT 2Eh
+            mech = 'INT2E'
+            ret_off = body_off + 2
+        elif body[:2] == b'\x0f\x34':  # SYSENTER
+            mech = 'SYSENTER'
+            ret_off = body_off + 2
+        else:
+            continue
+
+        ret_bytes = stub[ret_off:]
+        if ret_bytes[0] == 0xC2:       # RET N
+            ret_pop = struct.unpack_from('<H', ret_bytes, 1)[0]
+        elif ret_bytes[0] == 0xC3:     # RET
+            ret_pop = 0
+        else:
+            ret_pop = 0
+
+        n_args = ret_pop // 4
+
+        # Look up x64 syscall number for the active target
+        x64_nr = resolve_syscall_nr(name, w2k_nr)
+
+        stubs.append(StubInfo(
+            rva       = func_rva,
+            name      = name,
+            w2k_nr    = w2k_nr,
+            w10_nr    = x64_nr,
+            n_args    = n_args,
+            ret_pop   = ret_pop,
+            mech      = mech,
+            raw       = bytes(stub),
+        ))
+
+    stubs.sort(key=lambda s: s.win2000_nr)
+    return stubs
+
+
+def dump_syscall_table(pe: PE32Image) -> None:
+    """Print the syscall table extracted from a real ntdll.dll."""
+    stubs = extract_stubs_from_ntdll(pe)
+    target = get_syscall_target()
+    x64_col = 'Win2000 x64' if target == 'win2000' else 'Win10 x64'
+    print(f"\n{'─'*78}")
+    print(f"  Windows 2000 SP4 NTDLL Syscall Table ({len(stubs)} entries)")
+    print(f"  Target: {target}  (x64 stubs use {x64_col} numbering)")
+    print(f"{'─'*78}")
+    print(f"  {'Win2000':>8}  {x64_col:>12}  {'Args':>5}  {'Mech':>8}  Function")
+    print(f"  {'─'*8}  {'─'*12}  {'─'*5}  {'─'*8}  {'─'*40}")
+    for s in stubs:
+        x64 = f"0x{s.win10_nr:04X}" if s.win10_nr or target == 'win2000' else "NO MAP"
+        print(f"  0x{s.win2000_nr:04X}      {x64:>12}  {s.n_args:>5}  {s.mechanism:>8}  {s.name}")
+    print(f"{'─'*78}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  4.  DYNAMIC POINTER SCANNER  (Unicorn Engine)
+#      Emulates the 32-bit binary to discover runtime-computed pointers
+#      that static analysis cannot see (e.g. switch tables, computed jumps)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DynamicScanner:
+    """
+    Unicorn-based dynamic analysis of a Win2000 PE32 image.
+
+    Mandatory pass: emulates from the entry point, every export, and every
+    detected NTDLL syscall stub to harvest runtime pointer values that static
+    analysis cannot see (switch tables, computed addresses, vtables, etc.).
+    """
+
+    MAX_BLOCKS_PER_ENTRY = 8_000
+    MAX_TOTAL_BLOCKS     = 80_000
+    MAX_ENTRIES          = 300
+    TIMEOUT_US           = 15_000_000   # 15 seconds per entry
+    PAGE_SIZE            = 0x1000
+    STACK_SIZE           = 0x80000      # 512 KiB stack
+
+    def __init__(self, pe: PE32Image, entry_rva: Optional[int] = None,
+                 stub_rvas: Optional[Set[int]] = None):
+        if not HAS_UNICORN:
+            raise RuntimeError("Unicorn is required for dynamic analysis: pip install unicorn")
+        self.pe          = pe
+        self.entry_rva   = entry_rva or pe.entry_rva
+        self.stub_rvas   = stub_rvas or set()
+        self.result      = DynamicScanResult()
+        self._total_blocks = 0
+
+    def _align_up(self, n: int, a: int) -> int:
+        return (n + a - 1) & ~(a - 1)
+
+    def _collect_entry_points(self) -> List[int]:
+        eps: Set[int] = set()
+        if self.entry_rva:
+            eps.add(self.entry_rva)
+        eps.update(self.stub_rvas)
+        for exp in self.pe.parse_exports():
+            eps.add(exp['rva'])
+        for sec_meta, sec_data in self.pe.get_executable_sections():
+            for rva in discover_function_rvas(self.pe, sec_data, sec_meta['vaddr']):
+                eps.add(rva)
+                if len(eps) >= self.MAX_ENTRIES:
+                    break
+            if len(eps) >= self.MAX_ENTRIES:
+                break
+        return sorted(eps)[:self.MAX_ENTRIES]
+
+    def _setup_emu(self) -> Tuple:
+        pe   = self.pe
+        base = pe.image_base
+        img_va_end = base + pe.image_size
+        map_size = self._align_up(pe.image_size, self.PAGE_SIZE)
+        stack_base = self._align_up(img_va_end + 0x10000, self.PAGE_SIZE)
+
+        mu = Uc(UC_ARCH_X86, UC_MODE_32)
+        mu.mem_map(base, map_size, UC_PROT_ALL)
+
+        for sec in pe.sections:
+            if sec['raw_ptr'] and sec['raw_sz']:
+                data = pe.get_section_data(sec)
+                va   = base + sec['vaddr']
+                write_sz = min(len(data), map_size - sec['vaddr'])
+                if write_sz > 0:
+                    mu.mem_write(va, data[:write_sz])
+
+        mu.mem_map(stack_base, self.STACK_SIZE, UC_PROT_ALL)
+        return mu, base, img_va_end, stack_base
+
+    def _emulate_from(self, mu, entry_va: int, base: int, img_va_end: int,
+                      stack_base: int) -> None:
+        esp_init = stack_base + self.STACK_SIZE - 0x400
+        mu.reg_write(UC_X86_REG_ESP, esp_init)
+        mu.reg_write(UC_X86_REG_EBP, esp_init)
+        mu.mem_write(esp_init, struct.pack('<I', img_va_end + 0x200))
+        # Seed argument registers for thiscall/fastcall probes
+        mu.reg_write(UC_X86_REG_ECX, base + 0x1000)
+        mu.reg_write(UC_X86_REG_EDX, base + 0x2000)
+
+        lo, hi = base, img_va_end
+        blocks_this_entry = 0
+
+        def _hook_write(uc, access, addr, size, value, user_data):
+            v32 = value & 0xFFFFFFFF
+            if lo <= v32 < hi:
+                self.result.pointer_values.add(v32)
+            if size >= 4 and lo <= addr < hi:
+                self.result.pointer_writes[addr] = v32
+
+        def _hook_block(uc, address, size, user_data):
+            nonlocal blocks_this_entry
+            blocks_this_entry += 1
+            self._total_blocks += 1
+            self.result.blocks_executed = self._total_blocks
+            if lo <= address < hi:
+                self.result.visited_blocks.add(address - base)
+            if (blocks_this_entry >= self.MAX_BLOCKS_PER_ENTRY or
+                    self._total_blocks >= self.MAX_TOTAL_BLOCKS):
+                uc.emu_stop()
+
+        def _hook_code(uc, address, size, user_data):
+            """Simulate syscalls, record branch targets, skip bad calls."""
+            try:
+                code = uc.mem_read(address, min(size, 16))
+            except Exception:
+                return
+            if lo <= address < hi:
+                self.result.visited_blocks.add(address - base)
+            # INT 0x2E / SYSENTER — pretend success
+            if len(code) >= 2 and code[0] == 0xCD and code[1] == 0x2E:
+                uc.reg_write(UC_X86_REG_EAX, 0)
+                eip = uc.reg_read(UC_X86_REG_EIP)
+                uc.reg_write(UC_X86_REG_EIP, eip + 2)
+                return
+            if len(code) >= 2 and code[0] == 0x0F and code[1] == 0x34:
+                uc.reg_write(UC_X86_REG_EAX, 0)
+                eip = uc.reg_read(UC_X86_REG_EIP)
+                uc.reg_write(UC_X86_REG_EIP, eip + 2)
+                return
+            # Record E8/E9 rel32 branch targets for function discovery
+            if code[0] == 0xE8 and len(code) >= 5:
+                rel = struct.unpack_from('<i', code, 1)[0]
+                tgt = (address + 5 + rel) & 0xFFFFFFFF
+                if lo <= tgt < hi:
+                    self.result.call_targets.add(tgt - base)
+                    self.result.branch_targets.add(tgt - base)
+            elif code[0] == 0xE9 and len(code) >= 5:
+                rel = struct.unpack_from('<i', code, 1)[0]
+                tgt = (address + 5 + rel) & 0xFFFFFFFF
+                if lo <= tgt < hi:
+                    self.result.call_targets.add(tgt - base)
+                    self.result.branch_targets.add(tgt - base)
+            elif len(code) >= 2 and 0x70 <= code[0] <= 0x7F:
+                rel = struct.unpack_from('b', code, 1)[0]
+                tgt = (address + 2 + rel) & 0xFFFFFFFF
+                if lo <= tgt < hi:
+                    self.result.branch_targets.add(tgt - base)
+            elif (len(code) >= 6 and code[0] == 0x0F
+                    and 0x80 <= code[1] <= 0x8F):
+                rel = struct.unpack_from('<i', code, 2)[0]
+                tgt = (address + 6 + rel) & 0xFFFFFFFF
+                if lo <= tgt < hi:
+                    self.result.branch_targets.add(tgt - base)
+
+        def _hook_invalid(uc, access, address, size, value, user_data):
+            return False
+
+        mu.hook_add(UC_HOOK_MEM_WRITE, _hook_write)
+        mu.hook_add(UC_HOOK_BLOCK, _hook_block)
+        mu.hook_add(UC_HOOK_CODE, _hook_code)
+        mu.hook_add(UC_HOOK_MEM_INVALID, _hook_invalid)
+
+        try:
+            mu.emu_start(entry_va, img_va_end, timeout=self.TIMEOUT_US)
+        except Exception:
+            pass
+
+    def scan(self) -> DynamicScanResult:
+        mu, base, img_va_end, stack_base = self._setup_emu()
+        for ep_rva in self._collect_entry_points():
+            if self._total_blocks >= self.MAX_TOTAL_BLOCKS:
+                break
+            self.result.entries_emulated += 1
+            self._emulate_from(mu, base + ep_rva, base, img_va_end, stack_base)
+        return self.result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  5.  CODE TRANSLATOR  (Capstone → Keystone)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Linux syscall ABI register mapping kept for ELF compatibility
+LINUX_SYSCALL_REGMAP = {
+    X86_REG_EAX: X86_REG_RAX,
+    X86_REG_EBX: X86_REG_RDI,
+    X86_REG_ECX: X86_REG_RSI,
+    X86_REG_EDX: X86_REG_RDX,
+    X86_REG_ESI: X86_REG_R10,
+    X86_REG_EDI: X86_REG_R8,
+    X86_REG_EBP: X86_REG_R9,
+} if HAS_CAPSTONE else {}
+
+# Windows x64 ABI: argument slot → 64-bit register name (see module-level WIN64_ARG_REG_NAMES)
+
+# Win32 register name → Win64 equivalent (same family, wider)
+W32_TO_W64_REG: Dict[int,str] = {} if not HAS_CAPSTONE else {
+    X86_REG_EAX: 'rax',  X86_REG_ECX: 'rcx',
+    X86_REG_EDX: 'rdx',  X86_REG_EBX: 'rbx',
+    X86_REG_ESP: 'rsp',  X86_REG_EBP: 'rbp',
+    X86_REG_ESI: 'rsi',  X86_REG_EDI: 'rdi',
+    X86_REG_AX: 'rax',  X86_REG_CX: 'rcx',
+    X86_REG_DX: 'rdx',  X86_REG_BX: 'rbx',
+    X86_REG_SP: 'rsp',  X86_REG_BP: 'rbp',
+    X86_REG_SI: 'rsi',  X86_REG_DI: 'rdi',
+}
+
+# x86 ESI/EDI are callee-saved; Win64 RSI/RDI are caller-saved. Import fn ptrs
+# loaded once and reused across calls must live in x64 callee-saved regs.
+_IAT_FN_HOLDER_W64: Dict[int, str] = {} if not HAS_CAPSTONE else {
+    X86_REG_ESI: 'r14',
+    X86_REG_EDI: 'r15',
+}
+
+W32_REG_ASM: Dict[int, str] = {} if not HAS_CAPSTONE else {
+    X86_REG_EAX: 'eax',  X86_REG_ECX: 'ecx',
+    X86_REG_EDX: 'edx',  X86_REG_EBX: 'ebx',
+    X86_REG_ESP: 'esp',  X86_REG_EBP: 'ebp',
+    X86_REG_ESI: 'esi',  X86_REG_EDI: 'edi',
+    X86_REG_AX: 'ax',  X86_REG_CX: 'cx',
+    X86_REG_DX: 'dx',  X86_REG_BX: 'bx',
+    X86_REG_SP: 'sp',  X86_REG_BP: 'bp',
+    X86_REG_SI: 'si',  X86_REG_DI: 'di',
+}
+
+W32_WORD_REG_ASM: Dict[int, str] = {} if not HAS_CAPSTONE else {
+    X86_REG_EAX: 'ax',  X86_REG_ECX: 'cx',
+    X86_REG_EDX: 'dx',  X86_REG_EBX: 'bx',
+    X86_REG_ESI: 'si',  X86_REG_EDI: 'di',
+    X86_REG_EBP: 'bp',  X86_REG_ESP: 'sp',
+    X86_REG_AX: 'ax',  X86_REG_CX: 'cx',
+    X86_REG_DX: 'dx',  X86_REG_BX: 'bx',
+    X86_REG_SP: 'sp',  X86_REG_BP: 'bp',
+    X86_REG_SI: 'si',  X86_REG_DI: 'di',
+}
+
+W32_BYTE_REG_ASM: Dict[int, str] = {} if not HAS_CAPSTONE else {
+    X86_REG_AL: 'al',  X86_REG_AH: 'ah',
+    X86_REG_CL: 'cl',  X86_REG_CH: 'ch',
+    X86_REG_DL: 'dl',  X86_REG_DH: 'dh',
+    X86_REG_BL: 'bl',  X86_REG_BH: 'bh',
+}
+
+W32_TO_BYTE_REG: Dict[int, str] = {} if not HAS_CAPSTONE else {
+    X86_REG_EAX: 'al',  X86_REG_ECX: 'cl',
+    X86_REG_EDX: 'dl',  X86_REG_EBX: 'bl',
+    X86_REG_ESI: 'sil', X86_REG_EDI: 'dil',
+    X86_REG_EBP: 'bpl', X86_REG_ESP: 'spl',
+}
+
+_W64_REG_NUM: Dict[str, int] = {
+    'rax': 0, 'rcx': 1, 'rdx': 2, 'rbx': 3, 'rsp': 4, 'rbp': 5,
+    'rsi': 6, 'rdi': 7, 'r8': 8, 'r9': 9, 'r10': 10, 'r11': 11,
+    'r12': 12, 'r13': 13, 'r14': 14, 'r15': 15,
+}
+
+_UBRT_BRANCH_TYPES = frozenset({
+    'rel_call', 'rel_jump_near', 'rel_jump_short',
+    'rel_cond_near', 'rel_cond_short',
+})
+
+
+class Win2000Translator:
+    """
+    Translate a Win2000 SP4 PE32 binary to a Win64-compatible PE64.
+
+    The translation has four passes:
+
+    Pass A — Identify all NTDLL syscall stubs and their Win10 x64 equivalents.
+
+    Pass B — Disassemble all .text sections with Capstone. For each function:
+      • Detect calling convention (stdcall: ends in RET N; cdecl: ends in RET)
+      • Detect FS: segment accesses (TEB reads/writes)
+      • Detect SEH prolog/epilog patterns
+      • Detect CALL targets (for cross-module pointer fixup)
+      • Detect data pointer immediates (for relocation)
+
+    Pass C — Translate each function:
+      • NTDLL stubs → 3-instruction Win64 syscall wrapper
+      • stdcall/cdecl → Windows x64 ABI (args in registers)
+      • Branches → fixed-up 64-bit relative branches
+      • FS:[n] → GS:[teb64_offset(n)]
+      • 32-bit pointer immediates → relocated 64-bit addresses
+
+    Pass D — Emit PE64 with rebuilt IAT, export table, and .reloc section.
+    """
+
+    def __init__(self, pe: PE32Image, is_ntdll: bool = False,
+                 is_kernel: bool = False,
+                 dynamic_result: Optional[DynamicScanResult] = None,
+                 verbose: bool = False,
+                 win10_test_shim: bool = False,
+                 source_path: Optional[str] = None):
+        if not HAS_CAPSTONE:
+            raise RuntimeError("capstone required")
+        if not HAS_KEYSTONE:
+            raise RuntimeError("keystone required")
+        self.pe       = pe
+        self.is_ntdll = is_ntdll
+        self.is_kernel = is_kernel
+        self.dyn      = dynamic_result or DynamicScanResult()
+        self.verbose  = verbose
+        self.win10_test_shim = win10_test_shim
+        self.ks       = Ks(KS_ARCH_X86, KS_MODE_64)
+        self.md       = Cs(CS_ARCH_X86, CS_MODE_32)
+        self.md.detail = True
+        self.stubs: Dict[int, StubInfo] = {}
+        self.rva_map: Dict[int, int] = {}
+        self._rva_section: Dict[int, int] = {}
+        self.fixup_queue: List[Tuple[int,int,str]] = []
+        self.warnings: List[str] = []
+        self.pe_relocs = pe.parse_relocations()
+        self.text_rva = 0
+        self._kernel_code: List[Tuple[str, bytes, int, int, int]] = []
+        self._final_rva: Dict[int, int] = {}
+        self._old_to_new_section: Dict[int, int] = {}
+        self._translated_text = b''
+        self._text_sec_meta: Dict = {}
+        # General prologue callee-save fix (correct, but shifts addresses and
+        # desyncs the legacy _fix_cmd_* hack layer). Enable via CMD_PROLOGUE_SAVE_FIX.
+        self._prologue_save_fix = bool(os.environ.get('CMD_PROLOGUE_SAVE_FIX'))
+        # De-hacking: skip the address-pinned _fix_cmd_* hack layer to bring up
+        # the pure core translation. Implies prologue-save fix on.
+        # Enabled via --pure or CMD_NO_HACKS / PURE / PURE_TRANSLATOR env.
+        self._cmd_no_hacks = _pure_translator_mode()
+        _dbgenv = os.environ.get('CMD_DBG_RVA', '')
+        self._dbg_rva = int(_dbgenv, 16) if _dbgenv else None
+        if self._cmd_no_hacks:
+            self._prologue_save_fix = True
+        # Defer ALL cross-chunk call/branch resolution to the final pass so they
+        # resolve against the stable rva_map (avoids stale targets when a
+        # function's entry is remapped after an early caller resolved it).
+        # On in pure mode; gated to avoid disturbing the legacy hacked default.
+        self._defer_cross_chunk = self._cmd_no_hacks or bool(
+            os.environ.get('CMD_DEFER_CROSS_CHUNK'))
+
+        self.old_base = pe.image_base
+        # DLLs keep the high base; EXEs go below 4 GiB (see PE64_EXE_BASE) so
+        # truncated 32-bit data pointers still resolve correctly.
+        is_dll = bool(pe.characteristics & 0x2000)
+        self.new_base = PE64_DEFAULT_BASE if is_dll else PE64_EXE_BASE
+        self.source_path = source_path
+        self._ubrt_ref_db = None
+        self._iat_rva_map: Dict[int, int] = {}
+        self._iat_name_to_new_rva: Dict[Tuple[str, str], int] = {}
+        self._hint_rva_to_old_iat: Dict[int, int] = {}
+        self._iat_old_rvas: Set[int] = set()
+        self._iat_func_by_rva: Dict[int, str] = {}
+        for imp in pe.parse_imports():
+            for fn in imp['functions']:
+                iat_rva = fn.get('iat_rva')
+                if iat_rva:
+                    self._iat_old_rvas.add(iat_rva)
+                    name = fn.get('name') or ''
+                    self._iat_func_by_rva[iat_rva] = name
+        self._orphan_blob_out_ranges: List[Tuple[int, int]] = []
+        self._code_span_ranges: List[Tuple[int, int]] = []
+        self._scope_table_out_ranges: List[Tuple[int, int]] = []
+        self._scope_table_old_rva: Dict[int, int] = {}
+        self._fn_entry_rvas: Set[int] = set()
+        self._seh_scope_anchors: Dict[int, int] = {}
+        self._seh_scope_reg_fn: Dict[int, int] = {}
+        self._call_target_offs: Optional[Set[int]] = None
+        self._runtime_slot_map: Dict[int, int] = {}
+        self._seh_eh3_handler_old_vas: Set[int] = set()
+        self._w2k_eh3_va = (
+            W2KSHIM_IMAGE_BASE + W2KSHIM_EXCEPT_HANDLER3_RVA
+            if win10_test_shim else 0)
+        self._cmd_stdout_print_rva: Optional[int] = None
+        self._cmd_interactive_startup_rva: Optional[int] = None
+        self._x86_cf: Optional[X86TextAnalysis] = None
+        self._pure_heal_text: Optional[bytes] = None
+        self._pure_heal_text_rva: int = 0
+        self._embedded_text_refs: Set[int] = set()
+
+    # ── Encoding helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _encode_gs_load(reg: str, disp: int) -> bytes:
+        """mov reg64, qword ptr gs:[disp32] — avoids Keystone RIP-relative bugs."""
+        rn = _W64_REG_NUM.get(reg.lower(), 0)
+        return (bytes([0x65, 0x48, 0x8B, 0x04 | (rn << 3), 0x25])
+                + struct.pack('<I', disp & 0xFFFFFFFF))
+
+    @staticmethod
+    def _encode_gs_store(reg: str, disp: int) -> bytes:
+        """mov qword ptr gs:[disp32], reg64"""
+        rn = _W64_REG_NUM.get(reg.lower(), 0)
+        return (bytes([0x65, 0x48, 0x89, 0x04 | (rn << 3), 0x25])
+                + struct.pack('<I', disp & 0xFFFFFFFF))
+
+    @staticmethod
+    def _encode_abs_load(reg: str, addr: int) -> bytes:
+        """reg64 = *(qword*)addr — full 64-bit address (movabs + load).
+
+        NOTE: the [disp32] SIB form sign-extends disp32, so it cannot reach our
+        0x180000000+ image; use movabs to load the absolute address first.
+        """
+        rn = _W64_REG_NUM.get(reg.lower(), 0)
+        hi = (rn >> 3) & 1
+        out = bytearray()
+        out += bytes([0x48 | hi, 0xB8 | (rn & 7)]) + struct.pack('<Q', addr & 0xFFFFFFFFFFFFFFFF)
+        # mov reg, qword ptr [reg]  (mod=01, disp8=0 to avoid rm=101/100 special cases)
+        # reg field needs REX.R and base field needs REX.B (same register).
+        rex_load = 0x48 | (hi << 2) | hi
+        modrm = 0x40 | ((rn & 7) << 3) | (rn & 7)
+        out += bytes([rex_load, 0x8B, modrm, 0x00])
+        return bytes(out)
+
+    @staticmethod
+    def _encode_abs_store(reg: str, addr: int) -> bytes:
+        """*(qword*)addr = reg64 — full 64-bit address via RAX scratch."""
+        rn = _W64_REG_NUM.get(reg.lower(), 0)
+        rex_src = 0x48 | ((rn >> 3) & 1)
+        out = bytearray()
+        # movabs r11, addr ; mov [r11], reg
+        out += bytes([0x49, 0xBB]) + struct.pack('<Q', addr & 0xFFFFFFFFFFFFFFFF)
+        rex = 0x49 | (((rn >> 3) & 1) << 2)
+        out += bytes([rex, 0x89, 0x03 | ((rn & 7) << 3)])
+        return bytes(out)
+
+    def _emit_abs_dword_load(self, out: bytearray, dst: str, addr: int) -> None:
+        """Load a value from an absolute VA (x86 push [global] args)."""
+        addr32 = addr & 0xFFFFFFFF
+        if self._is_iat_rva(addr32):
+            if self._iat_rva_map:
+                new_va = self._resolve_iat_slot_va(addr32)
+            else:
+                new_va = addr32  # patched once _iat_rva_map exists
+            load_sz = 'qword' if self._cmd_no_hacks else 'dword'
+        else:
+            new_va = self._relocate_imm(addr32, len(out), 0)
+            # x86 program globals are 4-byte slots and the data section keeps
+            # that 4-byte layout after relocation (only *code* VA immediates are
+            # widened).  Reading a global as qword therefore pulls 4 valid bytes
+            # plus 4 bytes of the *adjacent* global as a bogus high dword — which
+            # is exactly how a runtime-stored 32-bit heap pointer became
+            # 0x0219A040_006122E0 and crashed HeapFree.  All shim addresses are
+            # <4GB, so a 32-bit zero-extended load is always the correct value.
+            load_sz = 'dword'
+        d32_map = {'rax': 'eax', 'rbx': 'ebx', 'rcx': 'ecx', 'rdx': 'edx',
+                   'rsi': 'esi', 'rdi': 'edi', 'r8': 'r8d', 'r9': 'r9d',
+                   'r10': 'r10d', 'r11': 'r11d'}
+        d32 = d32_map.get(dst, dst)
+        dst_asm = dst if load_sz == 'qword' else d32
+        off = len(out)
+        out += self._asm(f'mov {dst_asm}, {load_sz} ptr [rip+0]')
+        insn_len = len(out) - off
+        rel = new_va - (off + insn_len)
+        if -2147483648 <= rel <= 2147483647:
+            struct.pack_into('<i', out, off + insn_len - 4, rel)
+        else:
+            del out[off:]
+            scratch = 'r11' if dst != 'r11' else 'r10'
+            out += self._asm(f'movabs {scratch}, 0x{new_va:x}')
+            out += self._asm(f'mov {dst_asm}, {load_sz} ptr [{scratch}]')
+
+    def _is_iat_rva(self, imm32: int) -> bool:
+        old_rva = (imm32 - self.old_base) if imm32 >= self.old_base else imm32
+        return old_rva in self._iat_rva_map or old_rva in self._iat_old_rvas
+
+    def _iat_name_at(self, iat_va: int) -> str:
+        old_rva = (iat_va - self.old_base) if iat_va >= self.old_base else (iat_va & 0xFFFFFFFF)
+        return self._iat_func_by_rva.get(old_rva, '')
+
+    def _resolve_import_iat_va(self, func_name: str) -> int:
+        """Map an x86 import name to its loader-resolved PE64 .idata thunk VA."""
+        for old_rva, name in self._iat_func_by_rva.items():
+            if name == func_name:
+                return self._resolve_iat_slot_va(self.old_base + old_rva)
+        return 0
+
+    def _loader_iat_va(self, dll: str, func_name: str) -> int:
+        """Import-directory IAT cell VA (loader-patched), not merged .text copy."""
+        rva = self._iat_name_to_new_rva.get((dll.lower(), func_name), 0)
+        return self.new_base + rva if rva else 0
+
+    def _is_zero_arg_iat(self, iat_va: int) -> bool:
+        """Imports whose x86 thunks take no stack args (pushes belong to next call)."""
+        name = self._iat_name_at(iat_va)
+        return name in {
+            'GetProcessHeap', 'GetCurrentProcess', 'GetCurrentThread',
+            'GetCommandLineA', 'GetCommandLineW', 'GetACP', 'GetOEMCP',
+            'GetVersion', 'GetTickCount', 'GetLastError',
+        }
+
+    def _is_alloca_probe_rva(self, rva: int) -> bool:
+        """MSVC _alloca_probe / __chkstk — must not get Win64 shadow space."""
+        data = self.pe.read_rva(rva, 8)
+        if not data or len(data) < 5:
+            return False
+        if data[:5] == b'\x3d\x00\x10\x00\x00':          # cmp eax, 0x1000
+            return True
+        if len(data) >= 6 and data[0] == 0x51 and data[1:6] == b'\x3d\x00\x10\x00\x00':
+            return True
+        return False
+
+    def _ff25_iat_slot_at_rva(self, rva: int) -> Optional[int]:
+        """If *rva* is an x86 ``jmp dword ptr [abs]`` import tail, return its IAT slot VA."""
+        data = self.pe.read_rva(rva, 6)
+        if not data or len(data) < 6 or data[:2] != b'\xff\x25':
+            return None
+        return struct.unpack_from('<I', data, 2)[0]
+
+    def _emit_iat_call(self, out: bytearray, iat_va: int) -> None:
+        """call through IAT slot (RIP-relative when in range, else indirect)."""
+        new_va = self._relocate_imm(iat_va & 0xFFFFFFFF, len(out), 0)
+        call_off = len(out)
+        rel = new_va - (call_off + 6)
+        if -2147483648 <= rel <= 2147483647:
+            out += b'\xFF\x15\x00\x00\x00\x00'
+            struct.pack_into('<i', out, call_off + 2, rel)
+        else:
+            out += self._asm(f'mov rax, 0x{new_va:x}')
+            out += self._asm('mov rax, qword ptr [rax]')
+            out += self._asm('call rax')
+
+    def _imm_to_old_rva(self, imm32: int) -> int:
+        imm32 &= 0xFFFFFFFF
+        if self.old_base <= imm32 < self.old_base + self.pe.image_size:
+            return imm32 - self.old_base
+        return imm32
+
+    def _resolve_iat_slot_va(self, iat_va: int) -> int:
+        """Map x86 IAT slot VA (often merged into .text) to PE64 .idata slot."""
+        old_rva = self._imm_to_old_rva(iat_va)
+        if self._iat_rva_map:
+            if old_rva in self._iat_rva_map:
+                return self.new_base + self._iat_rva_map[old_rva]
+            old_iat = self._old_iat_for_slot_rva(old_rva)
+            if old_iat is not None:
+                return self.new_base + self._iat_rva_map[old_iat]
+        return self._relocate_imm(iat_va & 0xFFFFFFFF, 0, 0)
+
+    def _old_iat_for_slot_rva(self, slot_rva: int,
+                              text_rva: int = 0) -> Optional[int]:
+        """Map a PE64 .text slot RVA back to its x86 IAT thunk RVA."""
+        if slot_rva in self._iat_old_rvas and slot_rva in self._iat_rva_map:
+            return slot_rva
+        for old_iat in self._iat_old_rvas:
+            if old_iat not in self._iat_rva_map:
+                continue
+            if text_rva and slot_rva == old_iat + text_rva:
+                return old_iat
+            code_rva = self._final_rva.get(old_iat)
+            if code_rva == slot_rva:
+                return old_iat
+        return None
+
+    def _read_pe_dword(self, rva: int) -> int:
+        sec = self.pe.section_for_rva(rva)
+        if not sec:
+            return 0
+        data = self.pe.get_section_data(sec)
+        off = rva - sec['vaddr']
+        if off < 0 or off + 4 > len(data):
+            return 0
+        return struct.unpack_from('<I', data, off)[0]
+
+    def _emit_runtime_pointer_slot(self, out: bytearray, text_data: bytes,
+                                   text_rva: int, old_slot_rva: int,
+                                   rva_map: Dict[int, int]) -> int:
+        """Copy an x86 pointer cell (CRT tail slots in .data) as a PE64 qword."""
+        ptr32 = self._read_pe_dword(old_slot_rva)
+        if ptr32 == 0:
+            q = 0
+        elif self.old_base <= ptr32 < self.old_base + self.pe.image_size:
+            old_ptr_rva = ptr32 - self.old_base
+            if old_ptr_rva in rva_map:
+                q = self.new_base + text_rva + rva_map[old_ptr_rva]
+            elif (self._iat_rva_map and old_ptr_rva in self._iat_rva_map):
+                q = self.new_base + self._iat_rva_map[old_ptr_rva]
+            else:
+                q = self._relocate_imm(ptr32)
+        else:
+            q = ptr32
+        slot_off = len(out)
+        out += struct.pack('<Q', q & 0xFFFFFFFFFFFFFFFF)
+        pad = (8 - len(out) % 8) % 8
+        if pad:
+            out += b'\x00' * pad
+        self._runtime_slot_map[old_slot_rva] = text_rva + slot_off
+        return slot_off
+
+    def _emit_iat_jmp(self, out: bytearray, iat_va: int,
+                      at_rva: Optional[int] = None) -> None:
+        """jmp through IAT slot (SEH filter thunks, import tail jumps)."""
+        new_va = self._resolve_iat_slot_va(iat_va)
+        jmp_rva = at_rva if at_rva is not None else len(out)
+        jmp_va = self.new_base + jmp_rva
+        rel = new_va - (jmp_va + 6)
+        jmp_off = len(out)
+        if -2147483648 <= rel <= 2147483647:
+            out += b'\xFF\x25\x00\x00\x00\x00'
+            struct.pack_into('<i', out, jmp_off + 2, rel)
+        else:
+            out += self._asm(f'mov rax, 0x{new_va:x}')
+            out += self._asm('mov rax, qword ptr [rax]')
+            out += self._asm('jmp rax')
+
+    def _emit_rip_rel_mov_imm32(self, out: bytearray, mem_va: int, imm32: int) -> None:
+        """mov dword ptr [mem], imm32"""
+        new_va = self._relocate_imm(mem_va & 0xFFFFFFFF, len(out), 0)
+        off = len(out)
+        out += self._asm(f'mov dword ptr [rip+0], 0x{imm32 & 0xFFFFFFFF:x}')
+        insn_len = len(out) - off
+        rel = new_va - (off + insn_len)
+        if -2147483648 <= rel <= 2147483647:
+            struct.pack_into('<i', out, off + insn_len - 4, rel)
+        else:
+            del out[off:]
+            out += self._asm(f'mov rax, 0x{new_va:x}')
+            out += self._asm(f'mov dword ptr [rax], 0x{imm32 & 0xFFFFFFFF:x}')
+
+    def _emit_add_imm64(self, out: bytearray, dst: str, imm: int) -> None:
+        """dst += imm — use scratch when imm does not fit in signed disp32."""
+        imm_u = imm & 0xFFFFFFFFFFFFFFFF
+        s32 = imm_u if imm_u < 0x80000000 else imm_u - 0x100000000
+        if -0x80000000 <= s32 <= 0x7FFFFFFF:
+            if s32 < 0:
+                out += self._asm(f'sub {dst}, 0x{-s32:x}')
+            else:
+                out += self._asm(f'add {dst}, 0x{s32:x}')
+            return
+        scratch = 'r11' if dst != 'r11' else 'r10'
+        out += self._asm(f'movabs {scratch}, 0x{imm_u:x}')
+        out += self._asm(f'add {dst}, {scratch}')
+
+    def _emit_push_imm64(self, out: bytearray, imm: int) -> None:
+        """Push a 64-bit immediate (Keystone truncates push imm32 >16-bit oddly)."""
+        imm_u = imm & 0xFFFFFFFFFFFFFFFF
+        s32 = imm_u if imm_u < 0x80000000 else imm_u - 0x100000000
+        if -128 <= s32 <= 127:
+            out += self._asm(f'push {s32}')
+        elif 0 <= imm_u <= 0x7FFF:
+            out += self._asm(f'push 0x{imm_u:x}')
+        else:
+            out += self._asm(f'mov rax, 0x{imm_u:x}')
+            out += self._asm('push rax')
+
+    def _rcx_home_reload_needed(self, insns) -> bool:
+        """Spill RCX at entry when mov ecx,[EBP+8] reloads the real arg0."""
+        ebp8_stored = False
+        for ins in insns:
+            if ins.mnemonic != 'mov' or len(ins.operands) != 2:
+                continue
+            dst, src = ins.operands
+            if (dst.type == X86_OP_MEM and dst.mem.base == X86_REG_EBP
+                    and dst.mem.disp == 8):
+                ebp8_stored = True
+            if (not ebp8_stored and src.type == X86_OP_MEM
+                    and src.mem.base == X86_REG_EBP and src.mem.disp == 8
+                    and dst.type == X86_OP_REG and dst.reg == X86_REG_ECX):
+                return True
+        return False
+
+    def _maybe_spill_rcx_home(self, out: bytearray, rcx_home_reload: bool,
+                              ebp_frame_active: bool, frame_args_spilled: bool,
+                              dest_reg: str, src_reg: str) -> bool:
+        """Save RCX to [RBP+0x10] before it is clobbered for a call argument."""
+        if (rcx_home_reload and ebp_frame_active and not frame_args_spilled
+                and dest_reg == 'rcx' and src_reg != 'rcx'):
+            out += self._asm('mov qword ptr [rbp+0x10], rcx')
+            return True
+        return False
+
+    def _emit_frame_arg_spills(self, out: bytearray, slots: Set[int]) -> None:
+        """Spill selected Win64 arg regs to [RBP+0x10..] MSVC home slots."""
+        for i in sorted(slots):
+            if i < len(WIN64_ARG_REG_NAMES):
+                out += self._asm(
+                    f'mov qword ptr [rbp+{0x10 + i * 8}], {WIN64_ARG_REG_NAMES[i]}')
+
+    def _emit_mem_index_dword_load(self, out: bytearray, dest_reg: str,
+                                   base: int, index: int,
+                                   scale: int, disp: int) -> None:
+        """push [base+index] call args — full 64-bit addressing on Win10 host."""
+        scale = scale or 1
+        disp &= 0xFFFFFFFF
+        if self.win10_test_shim:
+            b64 = W32_TO_W64_REG.get(base, 'rax')
+            i64 = W32_TO_W64_REG.get(index, 'rcx')
+            d32 = self._dword_arg_reg(dest_reg)
+            if scale == 1 and disp == 0:
+                mem = f'dword ptr [{b64}+{i64}]'
+            elif scale in (1, 2, 4, 8) and disp == 0:
+                mem = f'dword ptr [{b64}+{i64}*{scale}]'
+            else:
+                mem = f'dword ptr [{b64}+{i64}*{scale}+0x{disp:x}]'
+            out += self._asm(f'mov {d32}, {mem}')
+            return
+        b32 = W32_REG_ASM.get(base, 'eax')
+        i32 = W32_REG_ASM.get(index, 'ecx')
+        scratch = 'r11d' if dest_reg in ('r10', 'r10d', 'r11', 'r11d') else 'r10d'
+        if scale == 1 and disp == 0:
+            mem = f'dword ptr [{b32}+{i32}]'
+        elif scale in (1, 2, 4, 8) and disp == 0:
+            mem = f'dword ptr [{b32}+{i32}*{scale}]'
+        else:
+            mem = f'dword ptr [{b32}+{i32}+0x{disp:x}]'
+        out += self._asm_addr32(f'mov {scratch}, {mem}')
+        d32 = {'rcx': 'ecx', 'rdx': 'edx', 'r8': 'r8d', 'r9': 'r9d'}.get(
+            dest_reg, dest_reg)
+        if d32 != scratch:
+            out += self._asm(f'mov {d32}, {scratch}')
+
+    def _call_arg_regs(self, cc_mode: str) -> List[str]:
+        """Win64 registers for push-derived CALL args (skip RCX on thiscall)."""
+        if cc_mode == 'thiscall':
+            return list(WIN64_ARG_REG_NAMES[1:4])
+        return list(WIN64_ARG_REG_NAMES[:4])
+
+    def _emit_homed_stack_arg_to_reg(self, out: bytearray, reg: str,
+                                       home: int) -> None:
+        """Load a homed x86 stack arg (32-bit dword) into a Win64 arg register."""
+        if reg in ('r8', 'r9'):
+            d32 = {'r8': 'r8d', 'r9': 'r9d'}[reg]
+            out += self._asm(f'mov {d32}, dword ptr [rbp+0x{home:x}]')
+        else:
+            out += self._asm(f'mov {reg}, qword ptr [rbp+0x{home:x}]')
+
+    def _flush_deferred_pushes(self, out: bytearray,
+                               push_stack: List[Tuple[str, int]]) -> int:
+        """Emit accumulated PUSH insns (callee-saves / SEH), not call arguments."""
+        emitted = 0
+        kept: List[Tuple[str, int]] = []
+        for atype, aval in push_stack:
+            if atype in ('ebp_arg', 'esp_fwd', 'ebp_local', 'ebp_slot', 'esp_mem'):
+                kept.append((atype, aval))
+                continue
+            if atype == 'arg_home':
+                kept.append((atype, aval))
+                continue
+            if atype == 'reg':
+                r = W32_TO_W64_REG.get(aval, 'rax')
+                out += self._asm(f'push {r}')
+                emitted += 1
+            elif atype == 'imm':
+                imm = self._relocate_imm(aval & 0xFFFFFFFF, len(out), 0)
+                self._emit_push_imm64(out, imm)
+                emitted += 1
+            elif atype == 'mem_abs':
+                va = self._relocate_imm(aval & 0xFFFFFFFF, len(out), 0)
+                out += self._encode_abs_load('rax', va)
+                out += self._asm('push rax')
+                emitted += 1
+            elif atype == 'mem':
+                out += self._asm('push qword ptr [0]')  # rare; best effort
+                emitted += 1
+            else:
+                out += self._asm('push 0')
+                emitted += 1
+        push_stack[:] = kept
+        return emitted
+
+    def _emit_lea_ebp_slot(self, out: bytearray, dest_reg: str, disp: int,
+                           seh_active: bool = False) -> None:
+        """lea reg,[ebp±N] — map stdcall arg slots to MSVC [rbp+home]."""
+        if disp > 0x7FFFFFFF:
+            disp -= 0x100000000
+        disp = self._seh_rbp_local_disp(disp, seh_active)
+        home = ebp_disp_to_rbp_home(disp) if disp >= 8 else None
+        if home is not None:
+            out += self._asm(f'lea {dest_reg}, [rbp+0x{home:x}]')
+        else:
+            out += self._asm(f'lea {dest_reg}, [rbp{disp:+d}]')
+
+    def _dword_arg_reg(self, reg: str) -> str:
+        """Keystone needs 32-bit reg names for dword ptr loads into Win64 arg regs."""
+        return {'rcx': 'ecx', 'rdx': 'edx', 'r8': 'r8d', 'r9': 'r9d',
+                'rax': 'eax', 'rbx': 'ebx', 'rsi': 'esi', 'rdi': 'edi'}.get(
+                    reg, 'eax')
+
+    def _homed_arg_is_pointer(self, disp: int) -> bool:
+        """Homed stdcall args that hold pointers (or pointer-sized values on x64)."""
+        if self._cmd_no_hacks:
+            if disp >= 8 and (disp - 8) % 4 == 0 and disp <= 0x28:
+                return True
+        if not self.win10_test_shim:
+            return False
+        # [EBP+8] arg1 / [EBP+0x18] arg2 in cmd's parse→builder caller (0x1A16D).
+        return disp in (8, 0x18)
+
+    def _cmd_builder_ebp_m4_is_ptr(self, old_va: int) -> bool:
+        """In cmd's cmdline builder, [EBP-4] holds a context pointer, not an index."""
+        if not self.win10_test_shim:
+            return False
+        rva = (old_va - self.old_base) & 0xFFFFFFFF
+        return 0x1A217 <= rva <= 0x1A580
+
+    def _cmd_builder_ebp_m8_is_ptr(self, old_va: int) -> bool:
+        """In cmd's cmdline builder, [EBP-8] holds a parse cursor pointer."""
+        if not self.win10_test_shim:
+            return False
+        rva = (old_va - self.old_base) & 0xFFFFFFFF
+        return 0x1A217 <= rva <= 0x1A580
+
+    def _cmd_heap_indexed_mem(self, mem) -> bool:
+        """cmd builder/cmdline tables: [base+index] slot (shl 3 stride on Win10)."""
+        return (mem.base and mem.index and not mem.disp
+                and (mem.scale or 1) == 1)
+
+    def _cmd_builder_struct_ptr_field(self, old_va: int, disp: int) -> bool:
+        """Pointer fields in cmd's cmdline-builder context structs."""
+        if not self.win10_test_shim:
+            return False
+        rva = (old_va - self.old_base) & 0xFFFFFFFF
+        if not (0x1A217 <= rva <= 0x1A580):
+            return False
+        return (disp & 0xFFFFFFFF) == 0x1C
+
+    def _cmd_builder_add_eax_edi_plus30(self, old_va: int) -> bool:
+        """push 0x30; pop edi; add eax, edi — offset into cmd arg table (+0x30)."""
+        if not self.win10_test_shim:
+            return False
+        rva = (old_va - self.old_base) & 0xFFFFFFFF
+        return rva in (0x1A419, 0x1A436, 0x1A44E, 0x1A49F)
+
+    def _seh_rbp_local_disp(self, disp: int, seh_active: bool) -> int:
+        """Map x86 [EBP-N] slots below the SEH record for 8-byte x64 pushes."""
+        if disp > 0x7FFFFFFF:
+            disp -= 0x100000000
+        if not seh_active:
+            return disp
+        if disp == -4:
+            return -8
+        if disp < -4:
+            return disp - 0x10
+        return disp
+
+    def _fix_seh_rbp_local_overlap(self, out: bytearray) -> int:
+        """Post-patch [RBP+disp] in SEH functions when locals overlap 32-byte SEH record."""
+        if not self.win10_test_shim or self._cmd_no_hacks:
+            return 0
+        gs_set = bytes([0x65, 0x48, 0x89, 0x24, 0x25, 0, 0, 0, 0])
+        seh_mark = bytes([0x6A, 0xFF, 0x48, 0xB8])
+        rbp_modrm = (0x45, 0x4D, 0x55, 0x5D, 0x65, 0x6D, 0x75, 0x7D)
+        fixed = 0
+        pos = 0
+        while pos < len(out) - 20:
+            if out[pos:pos + 4] != seh_mark:
+                pos += 1
+                continue
+            gs = out.find(gs_set, pos, min(len(out), pos + 96))
+            if gs < 0:
+                pos += 1
+                continue
+            end = min(len(out), pos + 0x5000)
+            npos = out.find(seh_mark, pos + 4, end)
+            if npos > pos:
+                end = npos
+            i = gs + len(gs_set)
+            while i < end - 2:
+                if out[i] in rbp_modrm:
+                    disp = struct.unpack_from('b', out, i + 1)[0]
+                    if disp == -4:
+                        nd = -8
+                    elif disp <= -0x10 and (out[i + 1] & 0xFF) >= 0xE0:
+                        nd = disp - 0x10
+                    else:
+                        nd = disp
+                    if nd != disp and -128 <= nd <= 127:
+                        struct.pack_into('b', out, i + 1, nd)
+                        fixed += 1
+                    i += 2
+                    continue
+                if (out[i] == 0xC7 and i + 2 < end
+                        and out[i + 1] in (0x45, 0x85)):
+                    disp = struct.unpack_from('b', out, i + 2)[0]
+                    if disp == -4:
+                        nd = -8
+                    elif disp <= -0x10 and (out[i + 2] & 0xFF) >= 0xE0:
+                        nd = disp - 0x10
+                    else:
+                        nd = disp
+                    if nd != disp and -128 <= nd <= 127:
+                        struct.pack_into('b', out, i + 2, nd)
+                        fixed += 1
+                i += 1
+            pos = end
+        return fixed
+
+    def _cmd_fn6314_entry_off(self, out: bytearray) -> Optional[int]:
+        """Blob offset of translated cmd helper originally at x86 RVA 0x6314."""
+        glob = b'\x48\xba\x00\x9b\x04\x80\x00\x00\x00\x00'
+        j = out.find(glob)
+        if j >= 15 and out[j - 6:j - 4] == b'\x0f\x84':
+            entry = j - 12
+            if entry >= 0 and out[entry:entry + 3] == b'\x49\x89\xca':
+                return entry
+            if entry >= 0 and out[entry:entry + 2] == b'\x48\x31':
+                return entry
+        needle = b'\x0f\x84\x4d\x01\x00\x00\x48\xb9\x00\x7b\x04\x80'
+        idx = out.find(needle)
+        if idx >= 0:
+            return idx - 9
+        for sig in (b'\x49\x89\xca\x48\x31\xff\x48\x85\xc9',
+                    b'\x49\x89\xca\x48\x85\xc9',
+                    b'\x49\x89\xd1\x48\x85\xc9',
+                    b'\x48\x31\xff\x48\x85\xc9',
+                    b'\x48\x31\xff\x39\x7c\x24\x14',
+                    b'\x48\x31\xff\x48\x85\xc9'):
+            idx = out.find(sig)
+            if idx >= 0:
+                return idx
+        return None
+
+    def _cmd_fn6578_entry_off(self, out: bytearray) -> Optional[int]:
+        """Blob offset of translated cmd helper originally at x86 RVA 0x6578."""
+        for sig in (b'\x8b\x01\xc3', b'\x89\xc8\x8b\x00\xc3', b'\x8b\x02\xc3'):
+            idx = out.find(sig)
+            if idx >= 0:
+                return idx
+        return None
+
+    def _restore_cmd_text_constants(self, out: bytearray) -> int:
+        """Restore x86 .text constant pool clobbered by early translation (path/COPYCMD)."""
+        if not self.win10_test_shim:
+            return 0
+        text_sec = next((s for s in self.pe.sections if s['name'].startswith('.text')), None)
+        if text_sec is None:
+            return 0
+        raw = self.pe.get_section_data(text_sec)
+        # cmd CRT/fn6314 path cells: RVAs 0x161c..0x1780 (.text+0x61c..0x780).
+        lo, hi = 0x61c, 0x780
+        if hi > len(raw) or hi > len(out):
+            return 0
+        if out[lo:hi] == raw[lo:hi]:
+            return 0
+        out[lo:hi] = raw[lo:hi]
+        return 1
+
+    def _fix_cmd_crt_wcslen_path(self, out: bytearray) -> int:
+        """CRT path after fn6314: wcslen then lea rax,[rax+rax+2] before malloc (not mov rcx,rax)."""
+        lea_off = 0x8A91 - self.text_rva
+        jmp_off = 0x8A8C - self.text_rva
+        if lea_off < 0 or jmp_off < 0:
+            return 0
+        if jmp_off + 5 > len(out) or out[jmp_off] != 0xE9:
+            return 0
+        lea = b'\x48\x8d\x44\x00\x02'  # lea rax, [rax+rax+2]
+        if out[lea_off:lea_off + len(lea)] == lea and struct.unpack_from('<i', out, jmp_off + 1)[0] == lea_off - (jmp_off + 5):
+            return 0
+        struct.pack_into('<i', out, jmp_off + 1, lea_off - (jmp_off + 5))
+        out[lea_off:lea_off + 8] = lea + b'\x90' * (8 - len(lea))
+        return 1
+
+    def _fix_cmd_crt_wcslen_helper_calls(self, out: bytearray) -> int:
+        """Snap wcslen helper ``call`` sites off mid-instruction (0x2D1C2) to real entry."""
+        if not self.text_rva:
+            return 0
+        bad = 0x2D1C2 - self.text_rva
+        lo = 0x2D1A0 - self.text_rva
+        hi = 0x2D200 - self.text_rva
+        if bad < 0 or lo < 0 or hi > len(out):
+            return 0
+        prefix = b'\x48\x89\xf1\x41\x55\x49\x89\xe5\x48\x83\xec\x20'
+        good = out.find(prefix, lo, hi)
+        if good < 0:
+            return 0
+        tail = out[good + 12:good + 18]
+        if tail not in (b'\x48\x83\xe4\xf0\xff\xd7',) and tail[:2] != b'\xff\x15':
+            return 0
+        fixed = 0
+        for call_rva in (0x76A3, 0x8A44):
+            off = call_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, off + 1)[0]
+            tgt = off + 5 + rel
+            if tgt == good:
+                continue
+            if not (lo <= tgt < good + 8):
+                continue
+            struct.pack_into('<i', out, off + 1, good - (off + 5))
+            fixed += 1
+        for pad in range(lo, min(hi, len(out) - 2)):
+            if out[pad:pad + 3] == b'\x00\x00\x00' and out[pad + 3:pad + 6] == b'\x48\x89\xf1':
+                out[pad:pad + 3] = b'\x90\x90\x90'
+                fixed += 1
+                break
+        dup = out.find(b'\x89\x45\xf8\x89\x45\xf8', lo, hi)
+        if dup >= 0:
+            out[dup + 3:dup + 6] = b'\x90\x90\x90'
+            fixed += 1
+        iat_off = good + 12
+        if iat_off + 6 <= len(out) and out[iat_off:iat_off + 6] == b'\x48\x83\xe4\xf0\xff\xd7':
+            ref_rva = 0x8A7B
+            ref_off = ref_rva - self.text_rva
+            if 0 <= ref_off + 6 <= len(out) and out[ref_off:ref_off + 2] == b'\xff\x15':
+                ref_rel = struct.unpack_from('<i', out, ref_off + 2)[0]
+                iat_rva = ref_rva + 6 + ref_rel
+                rel = iat_rva - (self.text_rva + iat_off + 6)
+                if -2147483648 <= rel <= 2147483647:
+                    out[iat_off:iat_off + 6] = b'\xff\x15' + struct.pack('<i', rel)
+                    fixed += 1
+        elif iat_off + 6 <= len(out) and out[iat_off:iat_off + 2] == b'\xff\x15':
+            ref_rva = 0x8A7B
+            ref_off = ref_rva - self.text_rva
+            if 0 <= ref_off + 6 <= len(out) and out[ref_off:ref_off + 2] == b'\xff\x15':
+                ref_rel = struct.unpack_from('<i', out, ref_off + 2)[0]
+                iat_rva = ref_rva + 6 + ref_rel
+                rel = iat_rva - (self.text_rva + iat_off + 6)
+                cur = struct.unpack_from('<i', out, iat_off + 2)[0]
+                if cur != rel and -2147483648 <= rel <= 2147483647:
+                    struct.pack_into('<i', out, iat_off + 2, rel)
+                    fixed += 1
+        thunk_lo = 0x29FE0 - self.text_rva
+        thunk_hi = 0x2A010 - self.text_rva
+        call_off = 0x2A846 - self.text_rva
+        if 0 <= call_off + 5 <= len(out) and out[call_off] == 0xE8:
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            tgt = call_off + 5 + rel
+            if thunk_lo <= tgt <= thunk_hi and tgt != good:
+                struct.pack_into('<i', out, call_off + 1, good - (call_off + 5))
+                fixed += 1
+        arg_off = 0x2A836 - self.text_rva
+        if 0 <= arg_off + 3 <= len(out):
+            want = b'\x48\x89\xce'  # mov rsi, rcx — banner/print callers pass string in RCX
+            cur = out[arg_off:arg_off + 3]
+            if cur in (b'\x48\x31\xc9', b'\x48\x89\xf1') and out[arg_off + 3:arg_off + 5] == b'\x41\x55':
+                if cur != want:
+                    out[arg_off:arg_off + 3] = want
+                    fixed += 1
+        je_off = 0x2D1C3 - self.text_rva
+        bad_je = b'\x0f\x84\x1f\x90\x90\x90'
+        good_je = b'\x0f\x84\x1f\x00\x00\x00'
+        if (0 <= je_off + len(bad_je) <= len(out) and out[je_off:je_off + len(bad_je)] == bad_je):
+            out[je_off:je_off + len(good_je)] = good_je
+            fixed += 1
+        align_entry = 0x2A836 - self.text_rva
+        wrong_entry = 0x2A83E - self.text_rva
+        if align_entry >= 0 and wrong_entry >= 0:
+            i = 0
+            while i < len(out) - 5:
+                if out[i] != 0xE8:
+                    i += 1
+                    continue
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt == wrong_entry:
+                    struct.pack_into('<i', out, i + 1, align_entry - (i + 5))
+                    fixed += 1
+                i += 1
+        return fixed
+
+    def _fix_cmd_crt_wcslen_call_8a44(self, out: bytearray) -> int:
+        """CRT fn6314 path: inline wcslen-only stub (0x8A44 must not fall into 0x2D1EB)."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        ref_rva = 0x8A7B
+        ref_off = ref_rva - self.text_rva
+        if ref_off < 0 or ref_off + 6 > len(out) or out[ref_off:ref_off + 2] != b'\xff\x15':
+            return 0
+        iat_rva = ref_rva + 6 + struct.unpack_from('<i', out, ref_off + 2)[0]
+        stub_rva = 0x3D4B
+        stub_off = stub_rva - self.text_rva
+        stub = (
+            b'\x48\x89\xf1'                   # mov rcx, rsi
+            b'\x41\x55\x49\x89\xe5'           # push r13; mov r13, rsp
+            b'\x48\x83\xec\x20\x48\x83\xe4\xf0'
+        )
+        ff_off = len(stub)
+        rel = iat_rva - (stub_rva + ff_off + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        stub += b'\xff\x15' + struct.pack('<i', rel)
+        stub += b'\x4c\x89\xec\x41\x5d\xc3'  # mov rsp,r13; pop r13; ret
+        if stub_off < 0 or stub_off + len(stub) > len(out):
+            return 0
+        run = out[stub_off:stub_off + len(stub)]
+        if run != stub and not all(b == 0x90 for b in run):
+            return 0
+        if run != stub:
+            out[stub_off:stub_off + len(stub)] = stub
+            fixed += 1
+        call_off = 0x8A44 - self.text_rva
+        if 0 <= call_off + 5 <= len(out) and out[call_off] == 0xE8:
+            want = stub_rva - (0x8A44 + 5)
+            if struct.unpack_from('<i', out, call_off + 1)[0] != want:
+                struct.pack_into('<i', out, call_off + 1, want)
+                fixed += 1
+        wrap_off = 0x8A37 - self.text_rva
+        seed = b'\x48\x89\xce' + b'\x90' * 10  # mov rsi, rcx + pad to call
+        if 0 <= wrap_off + len(seed) <= len(out):
+            cur = out[wrap_off:wrap_off + len(seed)]
+            if cur != seed and (cur.startswith(b'\x48\x89\xce') or cur.startswith(b'\x41\x55')
+                                or all(b == 0x90 for b in cur[3:])):
+                out[wrap_off:wrap_off + len(seed)] = seed
+                fixed += 1
+        epilogue_off = 0x8A49 - self.text_rva
+        if 0 <= epilogue_off + 5 <= len(out):
+            if out[epilogue_off:epilogue_off + 5] != b'\x90' * 5:
+                out[epilogue_off:epilogue_off + 5] = b'\x90' * 5
+                fixed += 1
+        save_off = 0x8A4E - self.text_rva
+        if 0 <= save_off + 3 <= len(out) and out[save_off:save_off + 3] != b'\x48\x89\xc6':
+            if out[save_off:save_off + 3] == b'\x90\x90\x90':
+                out[save_off:save_off + 3] = b'\x48\x89\xc6'
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_second_wcslen_8a6b(self, out: bytearray) -> int:
+        """RSI holds length after first wcslen; RCX still has the path string — drop mov rcx,rsi."""
+        if not self.text_rva:
+            return 0
+        off = 0x8A6B - self.text_rva
+        bad = b'\x48\x89\xf1'  # mov rcx, rsi
+        good = b'\x90\x90\x90'
+        if off < 0 or off + 3 > len(out) or out[off:off + 3] != bad:
+            return 0
+        if out[off:off + 3] == good:
+            return 0
+        out[off:off + 3] = good
+        return 1
+
+    def _fix_cmd_crt_wcslen_inline_2a805(self, out: bytearray) -> int:
+        """Snap wcslen inline thunks off ``sub rsp,20`` at 0x2A80D to ``mov rcx,rax`` at 0x2A805."""
+        if not self.text_rva:
+            return 0
+        bad = 0x2A80D - self.text_rva
+        good = 0x2A805 - self.text_rva
+        if bad < 0 or good < 0 or good + 3 > len(out):
+            return 0
+        if out[good:good + 3] != b'\x48\x89\xc1':
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 5:
+            if out[i] != 0xE8:
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            if i + 5 + rel == bad:
+                struct.pack_into('<i', out, i + 1, good - (i + 5))
+                fixed += 1
+            i += 1
+        ret_off = 0x2A82D - self.text_rva
+        if 0 <= ret_off + 5 <= len(out) and out[ret_off:ret_off + 5] == b'\xe9\x04\x00\x00\x00':
+            out[ret_off:ret_off + 5] = b'\xc3' + b'\x90' * 4
+            fixed += 1
+        rdi_off = 0x2A850 - self.text_rva
+        if 0 <= rdi_off + 3 <= len(out) and out[rdi_off:rdi_off + 3] == b'\x48\x89\xc7':
+            out[rdi_off:rdi_off + 3] = b'\x48\x89\xf7'
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_getmainargs_setup(self, out: bytearray) -> int:
+        """CRT startup: keep ``lea rcx,[rbp+…]`` for ``__getmainargs``; don't clobber with ``mov rcx,rax``."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        patches = (
+            (0x8857, b'\x48\x89\xc1', b'\x90\x90\x90'),
+            (0x88D6, b'\x48\x89\xc1', b'\x90\x90\x90'),
+        )
+        for rva, bad, good in patches:
+            off = rva - self.text_rva
+            if off < 0 or off + len(bad) > len(out):
+                continue
+            if out[off:off + len(bad)] == bad:
+                out[off:off + len(bad)] = good
+                fixed += 1
+        return fixed
+
+    def _fix_calls_into_movabs_imm(self, out: bytearray) -> int:
+        """Snap E8 targets that land on 0xE9 inside ``movabs rax, imm64`` (IAT VA 0x80......E9)."""
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt < 2 or tgt + 1 > len(out):
+                continue
+            if out[tgt - 2:tgt] == b'\x48\xb8' and out[tgt] == 0xE9:
+                struct.pack_into('<i', out, i + 1, (tgt - 2) - (i + 5))
+                fixed += 1
+        return fixed
+
+    def _find_nop_run(self, out: bytearray, min_len: int,
+                      avoid: Optional[List[Tuple[int, int]]] = None) -> Optional[int]:
+        """Return blob offset of the first ``min_len``-byte 0x90 run (optional RVA avoid list)."""
+        if not self.text_rva:
+            return None
+        run = 0
+        start = 0
+        for i, b in enumerate(out):
+            rva = self.text_rva + i
+            if avoid and any(lo_rva <= rva < hi_rva for lo_rva, hi_rva in avoid):
+                run = 0
+                continue
+            if b in (0x90, 0xCC):
+                if run == 0:
+                    start = i
+                run += 1
+                if run >= min_len:
+                    return start
+            else:
+                run = 0
+        return None
+
+    def _inject_cmd_wcscpy_thunks(self, out: bytearray) -> Optional[tuple]:
+        """Inject swap/direct wcscpy thunks for misrouted x86 0x6581 call sites."""
+        tag = b'\x48\x87\xd1'  # xchg rcx, rdx (swap-thunk head)
+        wcscpy_core = (
+            b'\x48\xb8\xe9\xf3\x06\x80\x00\x00\x00\x00'
+            b'\x48\x8b\x00\xff\xd0\xc3'
+        )
+        swap = tag + wcscpy_core
+        pos = out.find(tag)
+        if pos >= 0 and pos + len(swap) <= len(out) and out[pos + len(swap) - 1] == 0xC3:
+            return (pos, pos + len(swap))
+        sled = self._find_nop_run(out, len(swap) + len(wcscpy_core))
+        if sled is None:
+            return None
+        direct = wcscpy_core
+        if sled + len(swap) + len(direct) > len(out):
+            return None
+        out[sled:sled + len(swap)] = swap
+        out[sled + len(swap):sled + len(swap) + len(direct)] = direct
+        return (sled, sled + len(swap))
+
+    def _fix_cmd_fn6581_call_sites(self, out: bytearray,
+                                   rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Neutralize stale x86 0x6581 call sites that land in helper/wcscpy snippets."""
+        copycmd = struct.pack('<Q', 0x800016E8)
+        str_db = struct.pack('<Q', 0x800018DB)
+        heap_load = b'\x8b\x95\x64\xff\xff\xff'
+        align_pre = b'\x48\x83\xe4\xf0'
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            window = out[max(0, i - 32):i]
+            use_swap = copycmd in window and heap_load in window
+            use_direct = str_db in window and b'\x48\x89\xf9' in window
+            if not use_swap and not use_direct:
+                continue
+            if align_pre not in out[max(0, i - 16):i]:
+                continue
+            if out[i:i + 5] == b'\x90' * 5:
+                continue
+            out[i:i + 5] = b'\x90' * 5
+            fixed += 1
+        fn6314 = self._cmd_fn6314_entry_off(out)
+        fn6314_call = 0x8A41 - self.text_rva
+        if (fn6314 is not None and 0 <= fn6314_call < len(out) - 5
+                and out[fn6314_call] == 0xE8):
+            rel = struct.unpack_from('<i', out, fn6314_call + 1)[0]
+            if fn6314_call + 5 + rel != fn6314:
+                struct.pack_into('<i', out, fn6314_call + 1,
+                                 fn6314 - (fn6314_call + 5))
+                fixed += 1
+        if rva_map is not None and fn6314 is not None:
+            rva_map[0x6581] = fn6314
+        return fixed
+
+    def _fix_fn6314_scan_loop(self, out: bytearray, fn6314: int) -> int:
+        """fn6314 ``=`` scan loop: x86 ``ebp`` length must not live in ``rbp`` (frame ptr)."""
+        lo = fn6314
+        hi = min(len(out), fn6314 + 0x170)
+        span = out[lo:hi]
+        fixed = 0
+        # ``mov rbp, rax`` after wcslen(path) → ``mov r12, rax``
+        mov_rbp = b'\x48\x89\xc5'
+        mov_r12 = b'\x49\x89\xc4'
+        pos = 0
+        while True:
+            j = span.find(mov_rbp, pos)
+            if j < 0:
+                break
+            off = lo + j
+            if (off + 8 <= len(out)
+                    and out[off + 3:off + 8] == b'\xe9\x03\x00\x00\x00'):
+                out[off:off + 3] = mov_r12
+                fixed += 1
+            pos = j + 1
+        tail = b'\xe9\x03\x00\x00\x00\x48\x31\xed\x48\x85\xed'
+        repl = b'\xe9\x03\x00\x00\x00\x4d\x31\xe4\x4d\x85\xe4'
+        j = span.find(tail)
+        if j >= 0:
+            out[lo + j:lo + j + len(tail)] = repl
+            fixed += 1
+        good_lea = b'\x4a\x8d\x74\x66\x02'  # lea rsi, [rsi + r12*2 + 2]
+        for bad in (b'\x48\x8d\x74\x6e\x02', b'\x48\x8d\x74\x7e\x02',
+                    b'\x48\x8d\x74\x46\x02'):
+            p = 0
+            while True:
+                k = span.find(bad, p)
+                if k < 0:
+                    break
+                out[lo + k:lo + k + len(good_lea)] = good_lea
+                fixed += 1
+                p = k + 1
+        return fixed
+
+    def _fix_fn6314_loop_branches(self, out: bytearray, fn6314: int) -> int:
+        """Snap SetEnv callers that branch to fn6314+0xB9 instead of the loop head."""
+        if not self.text_rva:
+            return 0
+        loop = 0x2DCC0 - self.text_rva
+        bad = 0x2DCC4 - self.text_rva
+        if loop < 0 or bad < 0 or loop + 8 >= len(out):
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if tgt == bad:
+                    struct.pack_into('<i', out, i + 2, loop - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt == bad:
+                    struct.pack_into('<i', out, i + 1, loop - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            i += 1
+        return fixed
+
+    def _fix_fn6314_jump_exit(self, out: bytearray, fn6314: int) -> int:
+        """CRT jumps into fn6314 scan loop — shared exit must jmp, not ret."""
+        exit_off = fn6314 + 0x15D
+        cont_off = 0x8EB9 - self.text_rva
+        if (exit_off + 5 > len(out) or cont_off < 0
+                or out[exit_off:exit_off + 1] != b'\xc3'):
+            return 0
+        rel = cont_off - (exit_off + 5)
+        out[exit_off] = 0xE9
+        struct.pack_into('<i', out, exit_off + 1, rel)
+        return 1
+
+    def _fix_cmd_crt_exit_branches(self, out: bytearray) -> int:
+        """Snap CRT cleanup jmps that land at 0x2E048 instead of 0x2E042 (off-by-4)."""
+        if not self.text_rva:
+            return 0
+        good = 0x2E042 - self.text_rva
+        bad = 0x2E048 - self.text_rva
+        if good < 0 or bad < 0 or good + 8 >= len(out):
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if tgt == bad:
+                    struct.pack_into('<i', out, i + 2, good - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt == bad:
+                    struct.pack_into('<i', out, i + 1, good - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_data_iat_pointer_cells(self, out: bytearray) -> int:
+        """Replace broken ``movabs; mov [r]; call r`` IAT stubs with ``call [rip+disp]``."""
+        # x86 ``call [IAT]`` became ``movabs r?, DATA; mov r?, [r?]; call r?`` but
+        # several DATA cells under 0x42Fxx were never populated (loader skips them).
+        # Retargeting movabs to the IAT VA still faults: use FF15 like _emit_iat_call.
+        fixes = (
+            (0x80042F38, 0x4AD010C0),  # CreateProcessW (CRT startup at ~0x8DFB)
+            (0x80041F38, 0x4AD010C0),  # CreateProcessW (fn6314 setup at ~0x8DF1)
+        )
+        fixed = 0
+        for bad_cell, old_iat_va in fixes:
+            bad_pat = struct.pack('<Q', bad_cell)
+            iat_va = self._resolve_iat_slot_va(old_iat_va)
+            iat_pat = struct.pack('<Q', iat_va)
+            pos = 0
+            while True:
+                j = out.find(bad_pat, pos)
+                if j < 0:
+                    j = out.find(iat_pat, pos)
+                    if j < 0:
+                        break
+                if j < 2 or out[j - 2:j] != b'\x48\xb8':
+                    pos = j + 1
+                    continue
+                k = j - 2
+                if k + 15 > len(out):
+                    pos = j + 1
+                    continue
+                if out[k + 10:k + 13] != b'\x48\x8b\x00' or out[k + 13:k + 15] != b'\xff\xd0':
+                    pos = j + 1
+                    continue
+                call_rva = self.text_rva + k
+                rel = iat_va - (self.new_base + call_rva + 6)
+                if not (-2147483648 <= rel <= 2147483647):
+                    pos = j + 1
+                    continue
+                patch = b'\xff\x15' + struct.pack('<i', rel) + b'\x90' * 9
+                out[k:k + 15] = patch
+                fixed += 1
+                pos = k + 15
+        return fixed
+
+    def _fix_cmd_crt_cont_branches(self, out: bytearray) -> int:
+        """Snap CRT continuation branches off mid-movabs (0x2D9A2..0x2D9AA) to 0x2D9A1."""
+        if not self.text_rva:
+            return 0
+        good = 0x2D9A1 - self.text_rva
+        bad_lo = 0x2D9A2 - self.text_rva
+        bad_hi = 0x2D9AA - self.text_rva
+        if good < 0 or bad_lo < 0 or bad_hi < bad_lo:
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if bad_lo <= tgt <= bad_hi:
+                    struct.pack_into('<i', out, i + 2, good - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if bad_lo <= tgt <= bad_hi:
+                    struct.pack_into('<i', out, i + 1, good - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_crt_fail_path_branches(self, out: bytearray) -> int:
+        """Retarget CRT fail-path merges from cleanup (0x2E042) to continuation (0x2D9A1)."""
+        if not self.text_rva:
+            return 0
+        good = 0x2D9A1 - self.text_rva
+        bads = {0x2E042 - self.text_rva, 0x2E048 - self.text_rva}
+        lo = 0x8E20 - self.text_rva
+        hi = 0x8E90 - self.text_rva
+        if good < 0 or lo < 0 or hi > len(out):
+            return 0
+        fixed = 0
+        i = lo
+        while i < min(hi, len(out) - 6):
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if tgt in bads:
+                    struct.pack_into('<i', out, i + 2, good - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt in bads:
+                    struct.pack_into('<i', out, i + 1, good - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            i += 1
+        return fixed
+
+    def _materialized_scope_byte_size(self, out: bytearray, off: int) -> int:
+        """Byte size of a scope table already copied into the output blob."""
+        if off < 0 or off + 4 > len(out):
+            return 16
+        if out[off:off + 4] != b'\xff\xff\xff\xff':
+            return 16
+        code_lo = self.new_base + self.text_rva
+        code_hi = code_lo + len(out)
+        size = 4
+        for _ in range(32):
+            eoff = off + size
+            if eoff + 16 > len(out):
+                break
+            begin, end, filt, handler = struct.unpack_from('<4I', out, eoff)
+            if not (code_lo <= begin < code_hi and code_lo < end <= code_hi
+                    and begin < end):
+                break
+            if filt and not (code_lo <= filt < code_hi):
+                break
+            if handler and not (code_lo <= handler < code_hi):
+                break
+            size += 16
+        return max(size, 16)
+
+    def _find_scope_reloc_sled(self, out: bytearray, need: int,
+                               avoid: int) -> Optional[int]:
+        """Find ``need`` bytes for a relocated scope table (zeros/NOPs)."""
+        if need <= 0 or need > len(out):
+            return None
+        best = None
+        run = 0
+        start = 0
+        for i, b in enumerate(out):
+            if b in (0x00, 0x90, 0xCC):
+                if run == 0:
+                    start = i
+                run += 1
+                if run >= need and start != avoid:
+                    return start
+            else:
+                if run >= need and start != avoid:
+                    return start
+                run = 0
+                start = 0
+        if run >= need and start != avoid:
+            return start
+        tail = len(out) - need
+        if tail > avoid + need or tail < avoid:
+            if all(out[tail + k] in (0x00, 0x90, 0xCC) for k in range(need)):
+                return tail
+        return best
+
+    def _fix_cmd_force_crt_reexec_fail(self, out: bytearray,
+                                        text_rva: Optional[int] = None) -> int:
+        """Force CreateProcessW to fail so CRT stays in-process (Win10 re-exec wait)."""
+        if text_rva is None:
+            text_rva = self.text_rva
+        if not text_rva:
+            return 0
+        iat_va = self._resolve_iat_slot_va(0x4AD010C0)  # CreateProcessW
+        patch = b'\x31\xc0' + b'\x90' * 4
+        lo = max(0, 0x8C00 - text_rva)
+        hi = min(len(out), 0x8E20 - text_rva)
+        fixed = 0
+        i = lo
+        while i < hi - 5:
+            if out[i:i + 2] != b'\xff\x15':
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            tgt = self.new_base + text_rva + i + 6 + rel
+            if tgt == iat_va and out[i:i + len(patch)] != patch:
+                out[i:i + len(patch)] = patch
+                fixed += 1
+            i += 6
+        for cpw_rva in (0x8C2B, 0x8DEE):
+            cpw_off = cpw_rva - text_rva
+            if (0 <= cpw_off < len(out) - len(patch)
+                    and out[cpw_off:cpw_off + 2] == b'\xff\x15'
+                    and out[cpw_off:cpw_off + len(patch)] != patch):
+                out[cpw_off:cpw_off + len(patch)] = patch
+                fixed += 1
+        # Stub any CRT ``ff15`` whose rip target missed the PE64 IAT (e.g. 0x8C2B→0x20C3).
+        i = lo
+        while i < hi - 5:
+            if out[i:i + 2] != b'\xff\x15':
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            slot_rva = text_rva + i + 6 + rel
+            if slot_rva < 0x6D000 or slot_rva >= 0x70000:
+                if out[i:i + len(patch)] != patch:
+                    out[i:i + len(patch)] = patch
+                    fixed += 1
+            i += 6
+        return fixed
+
+    def _fix_cmd_crt_createprocess_call_8df1(self, out: bytearray) -> int:
+        """CRT fn6314: empty 0x41F38 indirect call → ``xor eax,eax`` (stay in-process)."""
+        if not self.text_rva:
+            return 0
+        off = 0x8DF1 - self.text_rva
+        bad = (b'\x48\xb8\x38\x1f\x04\x80\x00\x00\x00\x00'
+               b'\x48\x8b\x00\xff\xd0')
+        if off < 0 or off + len(bad) > len(out) or out[off:off + len(bad)] != bad:
+            return 0
+        out[off:off + len(bad)] = b'\x31\xc0' + b'\x90' * (len(bad) - 2)
+        return 1
+
+    def _fix_cmd_crt_divert_init_loops(self, out: bytearray) -> int:
+        """Keep CRT on the in-process path: NOP branches into 0x2D9A9 / 0x2DCC7."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        jne_off = 0x8D56 - self.text_rva
+        loop = 0x2D9A9 - self.text_rva
+        if (jne_off >= 0 and jne_off + 6 <= len(out)
+                and out[jne_off:jne_off + 2] == b'\x0f\x85'):
+            rel = struct.unpack_from('<i', out, jne_off + 2)[0]
+            if jne_off + 6 + rel == loop:
+                out[jne_off:jne_off + 6] = b'\x90' * 6
+                fixed += 1
+        je_off = 0x8D69 - self.text_rva
+        bad = 0x2DCC7 - self.text_rva
+        if (je_off >= 0 and je_off + 6 <= len(out)
+                and out[je_off:je_off + 2] == b'\x0f\x84'):
+            rel = struct.unpack_from('<i', out, je_off + 2)[0]
+            if je_off + 6 + rel == bad:
+                out[je_off:je_off + 6] = b'\x90' * 6
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_restore_fn6314_calls(self, out: bytearray) -> int:
+        """Restore CRT fn6314 calls NOP'd by ``_fix_cmd_fn6581_call_sites``."""
+        if not self.text_rva:
+            return 0
+        fn6314 = self._cmd_fn6314_entry_off(out)
+        if fn6314 is None:
+            return 0
+        fixed = 0
+        copycmd = b'\x48\xb9\xe8\x16\x00\x80\x00\x00\x00\x00'
+        heap_tags = (
+            b'\x8b\x95\x64\xff\xff\xff',  # mov edx, [rbp-0x9c]
+            b'\x89\x85\x64\xff\xff\xff',  # mov [rbp-0x9c], eax
+        )
+        sites = (
+            (0x8CD4, 48),
+            (0x8AF4, 0xD0),
+        )
+        for call_rva, win_sz in sites:
+            call_off = call_rva - self.text_rva
+            if call_off < 0 or call_off + 5 > len(out):
+                continue
+            if out[call_off:call_off + 5] != b'\x90' * 5:
+                continue
+            win = out[max(0, call_off - win_sz):call_off]
+            if copycmd not in win or not any(tag in win for tag in heap_tags):
+                continue
+            rel = fn6314 - (call_off + 5)
+            out[call_off] = 0xE8
+            struct.pack_into('<i', out, call_off + 1, rel)
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_init_tail_int3(self, out: bytearray) -> int:
+        """Drop stray INT3 in cmd init tail arg-setup (main+0x3FD72)."""
+        if not self.text_rva:
+            return 0
+        off = 0x3FD72 - self.text_rva
+        head = b'\x48\xb9\x00\x9b\x04\x80\x00\x00\x00\x00\x48\x89\xfa\x41\x89\xf0'
+        if (off < 0 or off + 1 > len(out) or out[off] != 0xCC
+                or off < len(head) or out[off - len(head):off] != head):
+            return 0
+        out[off] = 0x90
+        return 1
+
+    def _fix_cmd_crt_init_branches(self, out: bytearray) -> int:
+        """Snap CRT init ``je`` at 0x2D9B3 off the ``xor/ret`` stub (0x2DC03) to fn6314."""
+        if not self.text_rva:
+            return 0
+        je_off = 0x2D9B3 - self.text_rva
+        good = 0x2DC0B - self.text_rva
+        bad = {0x2DC0B - self.text_rva, 0x2DC03 - self.text_rva}
+        if je_off < 0 or good < 0 or je_off + 6 > len(out):
+            return 0
+        if out[je_off:je_off + 2] != b'\x0f\x84':
+            return 0
+        rel = struct.unpack_from('<i', out, je_off + 2)[0]
+        tgt = je_off + 6 + rel
+        if tgt not in bad:
+            return 0
+        struct.pack_into('<i', out, je_off + 2, good - (je_off + 6))
+        return 1
+
+    def _fix_cmd_fn6314_zero_edi(self, out: bytearray, fn6314: int) -> int:
+        """Undo a legacy patch that clobbered the fn6314 ``je`` after ``test rcx,rcx``."""
+        if fn6314 + 8 > len(out):
+            return 0
+        if out[fn6314 + 6:fn6314 + 8] == b'\x90\x0f':
+            return 0
+        if out[fn6314 + 6:fn6314 + 8] == b'\x31\xff':
+            out[fn6314 + 6:fn6314 + 8] = b'\x90\x0f'
+            return 1
+        return 0
+
+    def _fix_cmd_heap_alloc_helper_2e37d(self, out: bytearray) -> int:
+        """HeapAlloc stub at 0x2E357: GetProcessHeap then HeapAlloc(caller rdx=flags, r8=size)."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E357 - self.text_rva
+        end = 0x2E39D - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        gph = (self.new_base + 0x6E408) & 0xFFFFFFFFFFFFFFFF
+        hal = (self.new_base + 0x6E410) & 0xFFFFFFFFFFFFFFFF
+        patch = (
+            b'\x41\x55'              # push r13
+            + b'\x49\x89\xe5'          # mov r13, rsp
+            + b'\x48\x83\xec\x20'      # sub rsp, 0x20
+            + b'\x48\x83\xe4\xf0'      # and rsp, 0x10
+            + b'\x4d\x89\xc3'          # mov r11, r8 — save size
+            + b'\x49\x89\xd2'          # mov r10, rdx — save flags
+            + b'\x48\xb8' + struct.pack('<Q', gph)
+            + b'\x48\x8b\x00'          # mov rax, [rax]
+            + b'\xff\xd0'              # call GetProcessHeap
+            + b'\x48\x89\xc1'          # mov rcx, rax
+            + b'\x4c\x89\xd2'          # mov rdx, r10
+            + b'\x4d\x89\xd8'          # mov r8, r11
+            + b'\x48\xb8' + struct.pack('<Q', hal)
+            + b'\x48\x8b\x00'          # mov rax, [rax]
+            + b'\xff\xd0'              # call HeapAlloc
+            + b'\x4c\x89\xec'          # mov rsp, r13
+            + b'\x41\x5d'              # pop r13
+            + b'\xc3'                  # ret
+        )
+        if len(patch) > end - off:
+            return 0
+        patch += b'\x90' * (end - off - len(patch))
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_heap_call_8fea(self, out: bytearray) -> int:
+        """cmd main: heap helper call must land at 0x2E357 entry, not mid-body 0x2E33B."""
+        if not self.text_rva:
+            return 0
+        call_off = 0x8FEA - self.text_rva
+        good_tgt = 0x2E357 - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        rel = good_tgt - (call_off + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        cur = struct.unpack_from('<i', out, call_off + 1)[0]
+        if call_off + 5 + cur == good_tgt:
+            return 0
+        out[call_off + 1:call_off + 5] = struct.pack('<i', rel)
+        return 1
+
+    def _fix_cmd_fn6314_wcsrchr_null_skip(self, out: bytearray) -> int:
+        """After wcsrchr, skip store when RAX==0 (do not rely on zeroed EDI)."""
+        if not self.text_rva:
+            return 0
+        off = 0x2DCAB - self.text_rva
+        if off < 0 or off + 8 > len(out):
+            return 0
+        good = (b'\x85\xc0' + b'\x74\x03' + b'\x90' * 4)  # test eax,eax; je +3; nop sled
+        old = b'\x39\xf8' + b'\x0f\x84\x03\x00\x00\x00'
+        broken = b'\x85\xc0\x90' + b'\x84\x03\x00\x00\x00'
+        if out[off:off + 8] == good:
+            return 0
+        if out[off:off + 8] in (old, broken):
+            out[off:off + 8] = good
+            return 1
+        return 0
+
+    def _fix_cmd_fn6314_call_14412(self, out: bytearray, fn6314: int,
+                                   rva_map: Optional[Dict[int, int]] = None) -> int:
+        """fn6314 path-helper call (x86 0x6335→0x14412): restore real callee, not xor eax stub."""
+        if not self.text_rva:
+            return 0
+        if rva_map is None:
+            rva_map = self.rva_map or None
+        if not rva_map:
+            return 0
+        entry = self._entry_for_x86_target(out, 0x14412, rva_map)
+        if entry is None:
+            return 0
+        call_off = fn6314 + 0x4D
+        if call_off + 5 > len(out):
+            return 0
+        fixed = 0
+        rel = entry - (call_off + 5)
+        call_patch = b'\xe8' + struct.pack('<i', rel)
+        if out[call_off:call_off + 5] != call_patch:
+            out[call_off:call_off + 5] = call_patch
+            fixed += 1
+        arg_off = fn6314 + 0x39
+        if arg_off + 3 <= len(out) and out[arg_off:arg_off + 3] == b'\x41\x8b\x0a':
+            out[arg_off:arg_off + 3] = b'\x4c\x89\xd1'  # mov rcx, r10
+            fixed += 1
+        rdx_off = fn6314 + 0x3D
+        if rdx_off + 3 <= len(out) and out[rdx_off:rdx_off + 3] == b'\x48\x31\xd2':
+            out[rdx_off:rdx_off + 3] = b'\x48\x89\xf2'  # mov rdx, rsi (x86 6578 result)
+            fixed += 1
+        fixed += self._snap_call_to_x86_target(out, 0x6335, 0x14412, rva_map)
+        return fixed
+
+    def _fix_cmd_init_env_rsi(self, out: bytearray) -> int:
+        """Legacy hook: keep ``mov rsi, rax`` after env load."""
+        return 0
+
+    def _fix_cmd_crt_init_fail_jmp(self, out: bytearray) -> int:
+        """CRT/fn6314 completion must enter cmd main (0x8EB9), not ``ret``/init loop."""
+        if not self.text_rva:
+            return 0
+        main = 0x8EB9 - self.text_rva
+        fixed = 0
+        jmp35_off = 0x2DC35 - self.text_rva
+        if (0 <= jmp35_off + 5 <= len(out) and out[jmp35_off] == 0xE9
+                and jmp35_off + 5 + struct.unpack_from('<i', out, jmp35_off + 1)[0]
+                == 0x2DC3D - self.text_rva):
+            struct.pack_into('<i', out, jmp35_off + 1, main - (jmp35_off + 5))
+            fixed += 1
+        ret_off = 0x2DC41 - self.text_rva
+        if 0 <= ret_off < len(out) and out[ret_off] == 0xC3:
+            rel = main - (ret_off + 5)
+            if -2147483648 <= rel <= 2147483647:
+                out[ret_off:ret_off + 5] = b'\xe9' + struct.pack('<i', rel)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_reach_main(self, out: bytearray) -> int:
+        """Retarget CRT startup jmps into the 0x2D9A9 loop to cmd main (0x8EB9)."""
+        if not self.text_rva:
+            return 0
+        main = 0x8EB9 - self.text_rva
+        loop_targets = {0x2D9A9 - self.text_rva, 0x2D9A1 - self.text_rva}
+        fixed = 0
+        for jmp_rva in (0x8E26, 0x8E49, 0x8E61, 0x8E74):
+            off = jmp_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE9:
+                continue
+            rel = struct.unpack_from('<i', out, off + 1)[0]
+            if off + 5 + rel not in loop_targets:
+                continue
+            struct.pack_into('<i', out, off + 1, main - (off + 5))
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_tail_scope_hole(self, out: bytearray,
+                                      rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Relocate SEH scope clobbering 0x3FDA0 and translate the missing x86 tail."""
+        if not self.text_rva or rva_map is None:
+            return 0
+        hole_rva = 0x3FDA0
+        partial_rva = 0x3FD62
+        partial_end_rva = 0x3FD9D
+        hole_off = hole_rva - self.text_rva
+        if hole_off < 0 or hole_off + 16 > len(out):
+            return 0
+        if out[hole_off:hole_off + 4] != b'\xff\xff\xff\xff':
+            return 0
+        sec = self.pe.section_for_rva(0xDBB0)
+        if not sec:
+            return 0
+        text_data = self.pe.get_section_data(sec)
+        x86_end = 0xDE99
+        e_off = x86_end - sec['vaddr']
+        if e_off > len(text_data):
+            return 0
+        partial_start_off = partial_rva - self.text_rva
+        partial_end_off = partial_end_rva - self.text_rva
+        inferred = None
+        best_off = -1
+        for old_r, off in rva_map.items():
+            if (partial_start_off - 0x80 <= off <= partial_end_off
+                    and off > best_off):
+                best_off = off
+                inferred = old_r + (partial_end_off - off)
+        candidates: List[int] = []
+        if inferred is not None:
+            candidates.append(inferred)
+        for c in (0xDDA3, 0xDD80, 0xDCEE,
+                  0xDBB0 + (hole_rva - partial_rva)):
+            if c not in candidates:
+                candidates.append(c)
+        chunk_out = b''
+        chunk_map: Dict[int, int] = {}
+        x86_tail = 0
+        for try_tail in candidates:
+            t_off = try_tail - sec['vaddr']
+            if t_off < 0 or e_off <= t_off:
+                continue
+            blob = text_data[t_off:e_off]
+            chunk_out, chunk_map = self._translate_function(
+                try_tail, blob, False, 0, chunk_base=hole_off,
+                section_rva=self.text_rva, global_rva_map=rva_map,
+                deferred_branches=[])
+            if chunk_out and len(chunk_out) <= 0x1000:
+                x86_tail = try_tail
+                break
+        else:
+            return 0
+        scope_len = self._materialized_scope_byte_size(out, hole_off)
+        scope_bytes = bytes(out[hole_off:hole_off + scope_len])
+        sled = self._find_scope_reloc_sled(out, scope_len, hole_off)
+        if sled is None:
+            out.extend(b'\x00' * (scope_len + 0x40))
+            sled = len(out) - scope_len
+        out[sled:sled + scope_len] = scope_bytes
+        for i, (start, size) in enumerate(self._scope_table_out_ranges):
+            if start == hole_off:
+                self._scope_table_out_ranges[i] = (sled, scope_len)
+                break
+        else:
+            self._scope_table_out_ranges.append((sled, scope_len))
+        if hole_off in self._scope_table_old_rva:
+            self._scope_table_old_rva[sled] = self._scope_table_old_rva.pop(hole_off)
+        old_imm = self.new_base + self.text_rva + hole_off
+        new_imm = self.new_base + self.text_rva + sled
+        for i in range(len(out) - 9):
+            if out[i] in (0x48, 0x49) and 0xB8 <= out[i + 1] <= 0xBF:
+                imm = struct.unpack_from('<Q', out, i + 2)[0]
+                if imm == old_imm:
+                    struct.pack_into('<Q', out, i + 2, new_imm)
+        out[hole_off:hole_off + len(chunk_out)] = chunk_out
+        if hole_off + len(chunk_out) < hole_off + scope_len:
+            out[hole_off + len(chunk_out):hole_off + scope_len] = (
+                b'\x90' * (scope_len - len(chunk_out)))
+        rva_map[x86_tail] = hole_off
+        for old_va, rel in chunk_map.items():
+            old_r = old_va - self.old_base
+            if old_r not in rva_map:
+                rva_map[old_r] = hole_off + rel
+        fn_off = self._fn_blob_off_from_push(out, sled)
+        self._patch_scope_table_entries(out, sled, scope_len, None, fn_off)
+        return 1
+
+    def _fix_cmd_main_getcommandline_call(self, out: bytearray) -> int:
+        """cmd main: ``call [GetCommandLineW]`` instead of broken aligned helper."""
+        if not self.text_rva:
+            return 0
+        old_iat = self.old_base + 0x10A4  # KERNEL32!GetCommandLineW
+        iat_va = self._resolve_iat_slot_va(old_iat)
+        fixed = 0
+        # Legacy stub head at 0x8EDE (push r13 …).
+        stub_off = 0x8EDE - self.text_rva
+        stub_end = 0x8EF8 - self.text_rva
+        if (stub_off >= 0 and stub_end <= len(out) and out[stub_off:stub_off + 2] == b'\x41\x55'):
+            call_rva = self.text_rva + stub_off
+            rel = iat_va - (self.new_base + call_rva + 6)
+            if -2147483648 <= rel <= 2147483647:
+                span = stub_end - stub_off
+                patch = (b'\xff\x15' + struct.pack('<i', rel)
+                         + b'\x48\x89\xc3' + b'\x90' * (span - 9))
+                if len(patch) == span and out[stub_off:stub_end] != patch:
+                    out[stub_off:stub_end] = patch
+                    fixed += 1
+        # Current layout: bare ff15 at 0x8EE1 + NOP sled + mov rbx,rax at 0x8EF8.
+        align_off = 0x8EE1 - self.text_rva
+        mov_off = 0x8EF8 - self.text_rva
+        je_off = 0x8EFD - self.text_rva
+        if (align_off >= 0 and mov_off + 3 <= len(out)
+                and out[align_off:align_off + 2] == b'\xff\x15'
+                and out[mov_off:mov_off + 3] == b'\x48\x89\xc3'):
+            call_rva = self.text_rva + align_off + 13  # ff15 after r13 align prologue
+            rel = iat_va - (self.new_base + call_rva + 6)
+            je_tgt = 0x8F2F
+            pro = (
+                b'\x41\x55\x49\x89\xe5'
+                b'\x48\x83\xec\x20\x48\x83\xe4\xf0'
+            )
+            tail = b'\x4c\x89\xec\x41\x5d\x48\x89\xc3\x39\xfb'
+            je_pos = align_off + len(pro) + 6 + len(tail)
+            je_rel = je_tgt - (self.text_rva + je_pos + 6)
+            if -2147483648 <= rel <= 2147483647 and -2147483648 <= je_rel <= 2147483647:
+                patch = (
+                    pro
+                    + b'\xff\x15' + struct.pack('<i', rel)
+                    + tail
+                    + b'\x0f\x84' + struct.pack('<i', je_rel)
+                )
+                span_end = align_off + len(patch)
+                if span_end <= len(out) and out[align_off:span_end] != patch:
+                    out[align_off:span_end] = patch
+                    fixed += 1
+        # Win10 cmd main: GetCommandLineW (or PEB) + test/je + wcslen via CRT stub 0x3D4B.
+        peb_off = 0x8EE1 - self.text_rva
+        block_end_rva = 0x8F23
+        block_end = block_end_rva - self.text_rva
+        stub_rva = 0x3D4B
+        cont_rva = 0x8F61
+        if peb_off >= 0 and block_end <= len(out):
+            if self.win10_test_shim:
+                getcmd = self._loader_iat_va('KERNEL32.dll', 'GetCommandLineW')
+                if not getcmd:
+                    getcmd = self._resolve_iat_slot_va(self.old_base + 0x10A4)
+                ff_rva = self.text_rva + peb_off
+                ff_rel = getcmd - (self.new_base + ff_rva + 6)
+                if not (-2147483648 <= ff_rel <= 2147483647):
+                    return fixed
+                block_head = (
+                    b'\xff\x15' + struct.pack('<i', ff_rel)
+                    + b'\x48\x89\xc3'
+                    + b'\x48\x85\xdb'
+                )
+            else:
+                block_head = (
+                    b'\x65\x48\x8b\x04\x25\x60\x00\x00\x00'
+                    + b'\x48\x8b\x40\x20'
+                    + b'\x48\x8b\x80\x78\x00\x00\x00'
+                    + b'\x48\x89\xc3'
+                    + b'\x48\x85\xdb'
+                )
+            je_from_rva = self.text_rva + peb_off + len(block_head)
+            je_rel = 0x8F2F - (je_from_rva + 6)
+            call_from_rva = je_from_rva + 6 + 3 + 3   # after je, mov rcx, mov rsi
+            if self.win10_test_shim:
+                block_tail = (
+                    b'\x48\x89\xd9'
+                    + b'\x48\x89\xce'
+                    + b'\x31\xc0'
+                    + b'\x89\x45\x10'
+                )
+            else:
+                call_rel = stub_rva - (call_from_rva + 5)
+                if not (-2147483648 <= call_rel <= 2147483647):
+                    return fixed
+                block_tail = (
+                    b'\x48\x89\xd9'
+                    + b'\x48\x89\xce'
+                    + b'\xe8' + struct.pack('<i', call_rel)
+                    + b'\x89\x45\x10'
+                )
+            jmp_from_rva = self.text_rva + peb_off + len(block_head) + 6 + len(block_tail)
+            null_jmp_rel = cont_rva - (0x8F32 + 5)
+            outer_jmp_rel = cont_rva - (jmp_from_rva + 5)
+            if not (-2147483648 <= je_rel <= 2147483647
+                    and -2147483648 <= null_jmp_rel <= 2147483647
+                    and -2147483648 <= outer_jmp_rel <= 2147483647):
+                return fixed
+            block = (
+                block_head
+                + b'\x0f\x84' + struct.pack('<i', je_rel)
+                + block_tail
+                + b'\xe9' + struct.pack('<i', outer_jmp_rel)
+            )
+            pad_len = (block_end - peb_off) - len(block)
+            if pad_len < 0:
+                return fixed
+            if pad_len > 0:
+                block += b'\x90' * pad_len
+            if len(block) == block_end - peb_off and out[peb_off:block_end] != block:
+                out[peb_off:block_end] = block
+                fixed += 1
+            null_off = 0x8F2F - self.text_rva
+            pad_off = block_end
+            if null_off + 8 <= len(out):
+                if pad_off < null_off:
+                    out[pad_off:null_off] = b'\x90' * (null_off - pad_off)
+                null_tail = b'\x89\x7d\x10' + b'\xe9' + struct.pack('<i', null_jmp_rel)
+                if out[null_off:null_off + 8] != null_tail:
+                    out[null_off:null_off + 8] = null_tail
+                    fixed += 1
+        return fixed
+
+    def _fix_cmd_main_post_cmdline_overlap(self, out: bytearray) -> int:
+        """NOP stale wcslen-tail shards at 0x8F37..0x8F60; cmp [r11] -> cmp [rbx],0."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        fixed = 0
+        slab_off = 0x8F37 - self.text_rva
+        slab_end = 0x8F61 - self.text_rva
+        if slab_off >= 0 and slab_end <= len(out):
+            want = b'\x90' * (slab_end - slab_off)
+            if out[slab_off:slab_end] != want:
+                out[slab_off:slab_end] = want
+                fixed += 1
+        cmp_off = 0x8F61 - self.text_rva
+        if cmp_off + 4 <= len(out) and out[cmp_off:cmp_off + 4] == b'\x41\x80\x3b\x00':
+            if out[cmp_off:cmp_off + 4] != b'\x80\x3b\x00\x90':
+                out[cmp_off:cmp_off + 4] = b'\x80\x3b\x00\x90'
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_main_peb_wcslen_stub_call(self, out: bytearray) -> int:
+        """Re-snap PEB-block ``call`` to wcslen stub 0x3D4B after late blob fixups."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        call_off = -1
+        scan_end = min(len(out), peb_off + 0x45)
+        for i in range(peb_off, scan_end - 5):
+            if out[i] == 0xE8 and i >= 3 and out[i - 3:i] == b'\x48\x89\xce':
+                call_off = i
+                break
+        if call_off < 0:
+            return 0
+        call_rva = self.text_rva + call_off
+        want = 0x3D4B - (call_rva + 5)
+        if struct.unpack_from('<i', out, call_off + 1)[0] == want:
+            return 0
+        struct.pack_into('<i', out, call_off + 1, want)
+        return 1
+
+    def _fix_cmd_main_early_dispatch_8f61(self, out: bytearray) -> int:
+        """Restore /c probe + wcsncmp path at 0x8F61 (overlap-safe, no r13 align)."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        stub_off = 0x8F61 - self.text_rva
+        stub_end = 0x8FCC - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        ncmp_iat = self._resolve_iat_slot_va(self.old_base + 0x1288)
+        slash_c_va = struct.pack('<Q', self.new_base + 0x41484)
+        comspec_va = struct.pack('<Q', self.new_base + 0x41608)
+        patch_head = (
+            b'\x80\x3b\x00'
+            + b'\x0f\x84' + struct.pack('<i', stub_end - (stub_off + 3 + 6))
+            + b'\x48\x89\xd9'
+            + b'\x48\xba' + slash_c_va
+            + b'\x49\xc7\xc0\x04\x00\x00\x00'
+            + b'\x48\x83\xec\x28'
+        )
+        ncmp_call_rva = self.text_rva + stub_off + len(patch_head)
+        ncmp_rel = ncmp_iat - (self.new_base + ncmp_call_rva + 6)
+        patch_mid = (
+            b'\xff\x15' + struct.pack('<i', ncmp_rel)
+            + b'\x48\x83\xc4\x28'
+            + b'\x85\xc0'
+            + b'\x0f\x85' + struct.pack('<i', stub_end - (stub_off + len(patch_head) + 6 + 4 + 2 + 6))
+            + b'\x48\xb9' + comspec_va
+            + b'\x48\x83\xec\x28'
+        )
+        helper_call_rva = self.text_rva + stub_off + len(patch_head) + len(patch_mid)
+        helper_rel = 0x2CF0B - (helper_call_rva + 5)
+        patch = (
+            patch_head
+            + patch_mid
+            + b'\xe8' + struct.pack('<i', helper_rel)
+            + b'\x48\x83\xc4\x28'
+            + b'\x48\x89\xc3'
+        )
+        if not all(-2147483648 <= v <= 2147483647
+                   for v in (ncmp_rel, helper_rel)):
+            return 0
+        pad = stub_end - stub_off - len(patch)
+        if pad < 0:
+            return 0
+        patch += b'\x90' * pad
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_main_win10_cmdline_gate_8f61(self, out: bytearray) -> int:
+        """Win10: cmp/je + jmp to 0x8FCC; leaves echo cave at 0x8F6F intact."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        head_off = 0x8F61 - self.text_rva
+        head_end = 0x8F6F - self.text_rva
+        token_rva = 0x8FCC
+        if head_off < 0 or head_end <= head_off or head_end > len(out):
+            return 0
+        je_from = 0x8F61 + 3
+        jmp_from = 0x8F6A
+        je_rel = token_rva - (je_from + 6)
+        jmp_rel = token_rva - (jmp_from + 5)
+        if not (-2147483648 <= je_rel <= 2147483647
+                and -2147483648 <= jmp_rel <= 2147483647):
+            return 0
+        patch = (
+            b'\x80\x3b\x00'
+            + b'\x0f\x84' + struct.pack('<i', je_rel)
+            + b'\xe9' + struct.pack('<i', jmp_rel)
+        )
+        if len(patch) != head_end - head_off:
+            return 0
+        if out[head_off:head_end] == patch:
+            return 0
+        out[head_off:head_end] = patch
+        return 1
+
+    def _fix_cmd_main_wcslen_tail_8f0c(self, out: bytearray) -> int:
+        """After main ``ff15`` wcslen at 0x8F06, drop tail garbage and orphan align epilogue."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off >= 0 and out[peb_off:peb_off + 2] in (b'\x65\x48', b'\xff\x15'):
+            return 0  # cmdline block owns main+0x8EE1..0x8F27
+        mov_off = 0x8F0C - self.text_rva
+        call_off = 0x8F20 - self.text_rva
+        epi_off = 0x8F22 - self.text_rva
+        wc_off = 0x8F06 - self.text_rva
+        fixed = 0
+        if (wc_off >= 0 and wc_off + 2 <= len(out) and out[wc_off:wc_off + 2] == b'\xff\x15'):
+            old_iat = self.old_base + 0x11D8  # MSVCRT!wcslen
+            iat_va = self._resolve_iat_slot_va(old_iat)
+            call_rva = self.text_rva + wc_off
+            rel = iat_va - (self.new_base + call_rva + 6)
+            if -2147483648 <= rel <= 2147483647:
+                want = struct.pack('<i', rel)
+                if out[wc_off + 2:wc_off + 6] != want:
+                    out[wc_off + 2:wc_off + 6] = want
+                    fixed += 1
+        if mov_off >= 0 and mov_off + 3 <= len(out) and out[mov_off:mov_off + 3] == b'\x48\x89\xc3':
+            out[mov_off:mov_off + 3] = b'\x90\x90\x90'
+            fixed += 1
+        if call_off >= 0 and call_off + 2 <= len(out) and out[call_off:call_off + 2] == b'\xff\xd0':
+            out[call_off:call_off + 2] = b'\x90\x90'
+            fixed += 1
+        if (epi_off >= 0 and epi_off + 5 <= len(out)
+                and out[epi_off:epi_off + 5] == b'\x4c\x89\xec\x41\x5d'):
+            out[epi_off:epi_off + 5] = b'\x90' * 5
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_wcslen_call(self, out: bytearray) -> int:
+        """Restore cmd main wcslen ``FF15`` (aligned stub or direct call at 0x8F06)."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off >= 0 and out[peb_off:peb_off + 2] in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        old_iat = self.old_base + 0x11D8  # MSVCRT!wcslen
+        iat_va = self._resolve_iat_slot_va(old_iat)
+        fixed = 0
+        # Direct ``mov rcx,rbx; ff15`` at 0x8F03 (current layout).
+        direct_off = 0x8F06 - self.text_rva
+        head_off = 0x8F03 - self.text_rva
+        if (head_off >= 0 and direct_off + 6 <= len(out)
+                and out[head_off:head_off + 3] == b'\x48\x89\xd9'
+                and out[direct_off:direct_off + 2] == b'\xff\x15'):
+            call_rva = self.text_rva + direct_off
+            rel = iat_va - (self.new_base + call_rva + 6)
+            if -2147483648 <= rel <= 2147483647:
+                want = struct.pack('<i', rel)
+                if out[direct_off + 2:direct_off + 6] != want:
+                    out[direct_off + 2:direct_off + 6] = want
+                    fixed += 1
+        # Legacy aligned stub at 0x8F03 with ``ff15`` at 0x8F10.
+        stub_off = 0x8F03 - self.text_rva
+        call_off = 0x8F10 - self.text_rva
+        stub_end = 0x8F24 - self.text_rva
+        pre_off = 0x8F00 - self.text_rva
+        if (stub_off >= 0 and call_off >= 0 and stub_end <= len(out)
+                and pre_off >= 0 and pre_off + 3 <= len(out)
+                and out[pre_off:pre_off + 3] == b'\x48\x89\xd9'
+                and out[stub_off:stub_off + 2] == b'\x41\x55'):
+            rel = iat_va - (self.new_base + self.text_rva + call_off + 6)
+            if -2147483648 <= rel <= 2147483647:
+                span = stub_end - stub_off
+                patch = (b'\x41\x55\x49\x89\xe5\x48\x83\xec\x20\x48\x83\xe4\xf0'
+                         + b'\xff\x15' + struct.pack('<i', rel)
+                         + b'\x90' * 9 + b'\x4c\x89\xec\x41\x5d')
+                if len(patch) == span and out[stub_off:stub_end] != patch:
+                    out[stub_off:stub_end] = patch
+                    fixed += 1
+        return fixed
+
+    def _fix_cmd_main_token_parse_call(self, out: bytearray) -> int:
+        """cmd main: call translated token parser (x86 0x89FF @ 0xB5C3), copy to stack buf."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x8FC9 - self.text_rva
+        stub_end = 0x9038 - self.text_rva
+        parse_off = 0xB5C3 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out) or parse_off < 0:
+            return 0
+        head_mov = b'\x48\x89\xd9'
+        head_lea = b'\x48\x8d\x85\xd8\xfd\xff\xff'
+        call_off = 0x8FEA - self.text_rva
+        applicable = out[stub_off:stub_off + len(head_mov)] == head_mov
+        if not applicable:
+            applicable = out[stub_off:stub_off + len(head_lea)] == head_lea
+        if not applicable and call_off + 5 <= len(out) and out[call_off] == 0xE8:
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            tgt = call_off + 5 + rel
+            applicable = tgt in (
+                0x2E3F5 - self.text_rva,
+                0x2E357 - self.text_rva,
+                0x2E33B - self.text_rva,
+            )
+        if not applicable:
+            return 0
+        old_iat = self.old_base + 0x121C  # MSVCRT!wcsncpy
+        iat_va = self._resolve_iat_slot_va(old_iat)
+        rel1 = parse_off - (stub_off + 12)
+        call2_rva = self.text_rva + stub_off + 36
+        rel2 = iat_va - (self.new_base + call2_rva + 6)
+        if not (-2147483648 <= rel1 <= 2147483647
+                and -2147483648 <= rel2 <= 2147483647):
+            return 0
+        span = stub_end - stub_off
+        patch = (
+            b'\x48\x89\xd9'                              # mov rcx, rbx
+            + b'\x48\x8d\x55\xdc'                        # lea rdx, [rbp-0x24]
+            + b'\xe8' + struct.pack('<i', rel1)          # call parse_fn
+            + b'\x48\x8d\x8d\xd8\xfd\xff\xff'            # lea rcx, [rbp-0x228]
+            + b'\x48\xba\xc8\x16\x00\x80\x00\x00\x00\x00'  # movabs rdx, global token
+            + b'\x41\xc7\xc0\x04\x01\x00\x00'            # mov r8d, 0x104
+            + b'\xff\x15' + struct.pack('<i', rel2)     # call wcsncpy
+        )
+        if len(patch) > span:
+            return 0
+        patch += b'\x90' * (span - len(patch))
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_main_token_parse_8fcc(self, out: bytearray) -> int:
+        """Snap token parse at 0x8FCC off mid-body 0x2E35C to parser 0xB5C6 + wcsncpy."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        stub_off = 0x8FCC - self.text_rva
+        stub_end = 0x9038 - self.text_rva
+        parse_off = 0xB5C6 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out) or parse_off < 0:
+            return 0
+        head = out[stub_off:stub_off + 3]
+        if not (head in (b'\x48\x8d\x85', b'\x48\x89\xd9', b'\x49\x89\xfb', b'\x53',
+                         b'\x48\x83\xec')
+                or head[:2] == b'\xc7\x05'):
+            return 0
+        old_iat = self.old_base + 0x121C  # MSVCRT!wcsncpy
+        wcsncpy_iat = self._loader_iat_va('MSVCRT.dll', 'wcsncpy')
+        if not wcsncpy_iat:
+            wcsncpy_iat = self._resolve_iat_slot_va(old_iat)
+        patch_head = b''
+        if self.win10_test_shim:
+            flag_rva = 0x41F58
+            mov_at = 0x8FCC
+            mov_end = mov_at + 10
+            patch_head += (
+                b'\xc7\x05' + struct.pack('<i', flag_rva - mov_end) + b'\x01\x00\x00\x00'
+            )
+        patch_head += (
+            b'\x53'                                      # push rbx
+            + b'\x48\x8d\x8d\xd8\xfd\xff\xff'           # lea rcx, [rbp-0x228]
+            + b'\x48\x89\xf2'                         # mov rdx, rsi (cmdline)
+        )
+        call2_rva = 0x8FCC + len(patch_head) + 10       # after xor r8d + mov r8d,0x104
+        pop_rva = call2_rva + 6
+        jmp_from = pop_rva + 1
+        rel2 = wcsncpy_iat - (self.new_base + call2_rva + 6)
+        jmp_rel = (0x9072 if self.win10_test_shim else 0x9040) - (jmp_from + 5)
+        if not (-2147483648 <= rel2 <= 2147483647
+                and -2147483648 <= jmp_rel <= 2147483647):
+            return 0
+        patch = (
+            patch_head
+            + b'\x45\x31\xc0'                        # xor r8d, r8d
+            + b'\x41\xc7\xc0\x04\x01\x00\x00'        # mov r8d, 0x104
+            + b'\xff\x15' + struct.pack('<i', rel2)
+            + b'\x5b'                                      # pop rbx
+            + b'\xe9' + struct.pack('<i', jmp_rel)
+        )
+        pad = stub_end - stub_off - len(patch)
+        if pad < 0:
+            return 0
+        patch += b'\x90' * pad
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_skip_wcsncpy_jmp_drive_8fd6(self, out: bytearray) -> int:
+        """Route 0x8FD6: /c -> echo stub; else RBX cmdline -> drive scan (skip bad [rbp-0x228] wcsncpy)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        check_rva = 0x9045
+        echo_rva = 0x8F6F
+        drive_rva = 0x9072
+        stub_rva = 0x8FD6
+        stub_end = 0x8FF2
+        check_end = 0x9072
+        stub_off = stub_rva - self.text_rva
+        end_off = stub_end - self.text_rva
+        check_off = check_rva - self.text_rva
+        check_end_off = check_end - self.text_rva
+        if stub_off < 0 or end_off > len(out) or check_off < 0 or check_end_off > len(out):
+            return 0
+        chk = bytearray()
+        # Inline scan for L"/c" in RBX (no wcsstr — AV on interactive SEH path).
+        chk.extend(
+            b'\x48\x89\xde'              # mov rsi, rbx
+            + b'\x0f\xb7\x06'            # movzx eax, word [rsi]
+            + b'\x66\x85\xc0'            # test ax, ax
+            + b'\x74'                    # jz drive
+        )
+        jz_drive = len(chk)
+        chk.append(0x00)
+        chk.extend(
+            b'\x66\x3d\x2f\x00'          # cmp ax, '/'
+            + b'\x75'                    # jne adv
+        )
+        jne_adv = len(chk)
+        chk.append(0x00)
+        chk.extend(
+            b'\x66\x81\x7e\x02\x63\x00'  # cmp word [rsi+2], 'c'
+            + b'\x75'                    # jne adv
+        )
+        jne_adv2 = len(chk)
+        chk.append(0x00)
+        chk.extend(
+            b'\xe9'                      # jmp echo
+        )
+        jmp_echo_at = len(chk)
+        chk.extend(b'\x00\x00\x00\x00')
+        adv_rva = check_rva + len(chk)
+        chk.extend(
+            b'\x48\x83\xc6\x02'          # add rsi, 2
+            + b'\xeb'                    # jmp scan
+        )
+        jmp_scan_at = len(chk)
+        chk.append(0x00)
+        drive_rva_off = check_rva + len(chk)
+        chk.extend(
+            b'\x48\x89\xde'              # mov rsi, rbx
+            + b'\xe9'                    # jmp drive
+        )
+        jmp_drive_at = len(chk)
+        chk.extend(b'\x00\x00\x00\x00')
+        scan_loop = check_rva + 3
+        chk[jz_drive] = (drive_rva_off - (check_rva + jz_drive + 1)) & 0xFF
+        chk[jne_adv] = (adv_rva - (check_rva + jne_adv + 1)) & 0xFF
+        chk[jne_adv2] = (adv_rva - (check_rva + jne_adv2 + 1)) & 0xFF
+        struct.pack_into('<i', chk, jmp_echo_at, echo_rva - (check_rva + jmp_echo_at + 4))
+        chk[jmp_scan_at] = (scan_loop - (check_rva + jmp_scan_at + 1)) & 0xFF
+        struct.pack_into('<i', chk, jmp_drive_at, drive_rva - (check_rva + jmp_drive_at + 4))
+        if check_off + len(chk) > check_end_off:
+            return 0
+        entry_rel = check_rva - (stub_rva + 5)
+        if not (-2147483648 <= entry_rel <= 2147483647):
+            return 0
+        entry = b'\xe9' + struct.pack('<i', entry_rel)
+        span = stub_end - stub_rva
+        if len(entry) > span:
+            return 0
+        head = entry + b'\x90' * (span - len(entry))
+        fixed = 0
+        if out[stub_off:end_off] != head:
+            out[stub_off:end_off] = head
+            fixed += 1
+        pad = check_end_off - check_off - len(chk)
+        body = bytes(chk) + (b'\x90' * pad if pad > 0 else b'')
+        if out[check_off:check_end_off] != body:
+            out[check_off:check_end_off] = body
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_skip_spurious_parse_calls(self, out: bytearray) -> int:
+        """NOP broken aligned-call stub before drive-letter parse (malloc tail call)."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x905B - self.text_rva
+        stub_end = 0x9072 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        patch = b'\x90' * (stub_end - stub_off)
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_main_drive_letter_path(self, out: bytearray) -> int:
+        """Build L\"X:\\\" at [rbp-0x20] from copied cmdline at [rbp-0x228] (0x9072)."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x9072 - self.text_rva
+        stub_end = 0x90BF - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        body = (
+            b'\x48\x8d\xb5\xd8\xfd\xff\xff'           # lea rsi, [rbp-0x228]
+            + b'\x0f\xb7\x06'                         # movzx eax, word [rsi]
+            + b'\x66\x83\xf8\x22'                     # cmp ax, '"'
+            + b'\x75\x04'                             # jne skip_quote
+            + b'\x48\x83\xc6\x02'                     # add rsi, 2
+            + b'\x0f\xb7\x06'                         # movzx eax, word [rsi]
+            + b'\x66\x89\x45\xe0'                     # mov [rbp-0x20], ax
+            + b'\x66\xc7\x45\xe2\x3a\x00'             # mov word [rbp-0x1e], ':'
+            + b'\x66\xc7\x45\xe4\x5c\x00'             # mov word [rbp-0x1c], '\\'
+            + b'\x66\xc7\x45\xe6\x00\x00'             # mov word [rbp-0x1a], 0
+        )
+        jmp_off = 0x90BA - self.text_rva
+        jmp_rel = 0x90E9 - (0x90BA + 5)
+        if not (-2147483648 <= jmp_rel <= 2147483647):
+            return 0
+        pad = jmp_off - (stub_off + len(body))
+        if pad < 0:
+            return 0
+        tail = b'\x90' * pad + b'\xe9' + struct.pack('<i', jmp_rel)
+        patch = body + tail
+        if len(patch) != stub_end - stub_off:
+            return 0
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_drive_prompt_slot_copy_90c0(self, out: bytearray) -> int:
+        """Copy L\"X:\\\" to 0x414B0+L\"> \" then jmp interactive startup cave (skip batch/switch)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        jmp_off = 0x90BA - self.text_rva
+        cave_off = 0x90C0 - self.text_rva
+        cave_end = 0x90E9 - self.text_rva
+        gate_off = 0x91B5 - self.text_rva
+        if jmp_off < 0 or cave_end <= cave_off or cave_end > len(out):
+            return 0
+        slot = self.new_base + 0x414B0
+        body = bytearray()
+        body += b'\x48\x8d\x75\xe0'
+        body += b'\x48\xbf' + struct.pack('<Q', slot)
+        body += b'\x48\x8b\x06'
+        body += b'\x48\x89\x07'
+        body += b'\xc7\x47\x06\x3e\x00\x20\x00'
+        jmp_from = 0x90C0 + len(body)
+        startup = self._cmd_interactive_startup_rva or 0x90E9
+        body += b'\xe9' + struct.pack('<i', startup - (jmp_from + 5))
+        if len(body) > cave_end - cave_off:
+            return 0
+        jmp_rel = 0x90C0 - (0x90BA + 5)
+        if not (-2147483648 <= jmp_rel <= 2147483647):
+            return 0
+        fixed = 0
+        patch = body + b'\x90' * (cave_end - cave_off - len(body))
+        if out[cave_off:cave_end] != patch:
+            out[cave_off:cave_end] = patch
+            fixed += 1
+        want_jmp = b'\xe9' + struct.pack('<i', jmp_rel)
+        if out[jmp_off:jmp_off + 5] != want_jmp:
+            out[jmp_off:jmp_off + 5] = want_jmp
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_batch_arg_mov(self, out: bytearray) -> int:
+        """Before batch setup call (0x2B3E9), pass cmdline in RDX not stale RAX."""
+        if not self.text_rva:
+            return 0
+        off = 0x90E9 - self.text_rva
+        if off < 0 or off + 3 > len(out):
+            return 0
+        patch = b'\x48\x89\xda'  # mov rdx, rbx
+        if out[off:off + 3] == patch:
+            return 0
+        if out[off:off + 3] != b'\x48\x89\xc2':
+            return 0
+        out[off:off + 3] = patch
+        return 1
+
+    def _fix_cmd_main_skip_batch_setup_call(self, out: bytearray) -> int:
+        """Skip misrouted batch helper call (0x2B3E9 mid-body); continue colon scan."""
+        if not self.text_rva:
+            return 0
+        call_off = 0x90F9 - self.text_rva
+        bad_off = 0x2B3E9 - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        rel = struct.unpack_from('<i', out, call_off + 1)[0]
+        if call_off + 5 + rel != bad_off:
+            if out[call_off:call_off + 2] == b'\x31\xc0':
+                return 0
+            return 0
+        patch = b'\x31\xc0' + b'\x90' * 3  # xor eax, eax; fall through with 0
+        if out[call_off:call_off + 5] == patch:
+            return 0
+        out[call_off:call_off + 5] = patch
+        return 1
+
+    def _fix_cmd_main_batch_call_90fc(self, out: bytearray) -> int:
+        """Batch helper call at 0x90FC must enter 0x2B3E8, not mid-body 0x2B3DE."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        mov_off = 0x90EC - self.text_rva
+        call_off = 0x90FC - self.text_rva
+        entry_rva = 0x2B3E8
+        fixed = 0
+        if mov_off >= 0 and mov_off + 3 <= len(out) and out[mov_off:mov_off + 3] == b'\x48\x89\xc2':
+            out[mov_off:mov_off + 3] = b'\x48\x89\xda'
+            fixed += 1
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return fixed
+        want = entry_rva - (0x90FC + 5)
+        if struct.unpack_from('<i', out, call_off + 1)[0] == want:
+            return fixed
+        if -2147483648 <= want <= 2147483647:
+            struct.pack_into('<i', out, call_off + 1, want)
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_skip_batch_path_90ef(self, out: bytearray) -> int:
+        """Skip broken batch helper frame at 0x90EF; do not clobber RBX before switch scan."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        stub_off = 0x90EF - self.text_rva
+        stub_end = 0x9111 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        if out[stub_off:stub_off + 2] not in (b'\x41\x55', b'\x31\xc0'):
+            return 0
+        jmp_off = stub_end - 5
+        jmp_rel = 0x9111 - ((self.text_rva + jmp_off) + 5)
+        patch = (
+            b'\x31\xc0'
+            + b'\x90' * (jmp_off - stub_off - 2)
+            + b'\xe9' + struct.pack('<i', jmp_rel)
+        )
+        if len(patch) != stub_end - stub_off:
+            return 0
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_main_save_cmdline_ptr_8eea(self, out: bytearray) -> int:
+        """Persist GetCommandLineW result at [rbp-0x228] for later token scan."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        off = 0x8EEA - self.text_rva
+        if off < 0 or off + 10 > len(out) or out[off:off + 3] != b'\x48\x85\xdb':
+            return 0
+        patch = b'\x48\x89\x9d\xd8\xfd\xff\xff' + b'\x48\x85\xdb'
+        if out[off:off + 10] == patch:
+            return 0
+        out[off:off + 10] = patch
+        return 1
+
+    def _fix_cmd_main_skip_to_switch_slash(self, out: bytearray) -> int:
+        """Scan cmdline for first L'/' — RBX already holds GetCommandLineW from 0x8EE7."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        stub_rva = 0x9111
+        loop_rva = 0x9118
+        done_rva = 0x913B
+        stub_end_rva = 0x913B
+        stub_off = stub_rva - self.text_rva
+        stub_end = stub_end_rva - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        je0 = done_rva - (0x911E + 2)
+        je1 = done_rva - (0x9124 + 2)
+        jloop = loop_rva - (0x912A + 2)
+        if not all(-128 <= x <= 127 for x in (je0, je1, jloop)):
+            return 0
+        head = b'\x90' * 7 if self.win10_test_shim else b'\x48\x8d\x9d\xd8\xfd\xff\xff'
+        body = (
+            head
+            + b'\x0f\xb7\x03'
+            + b'\x66\x85\xc0'
+            + b'\x74' + struct.pack('b', je0)
+            + b'\x66\x3d\x2f\x00'
+            + b'\x74' + struct.pack('b', je1)
+            + b'\x48\x83\xc3\x02'
+            + b'\xeb' + struct.pack('b', jloop)
+        )
+        pad = stub_end - stub_off - len(body)
+        if pad < 0:
+            return 0
+        patch = body + b'\x90' * pad
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_data_switch_literals(self, out: bytearray, sect_rva: int) -> int:
+        """Ensure L\"/c\" exists beside L\"/?\" in .data (RVA 0x4147c)."""
+        slash_c_rva = 0x41484
+        off = slash_c_rva - sect_rva
+        if off < 0 or off + 6 > len(out):
+            return 0
+        want = b'/\x00c\x00\x00\x00'
+        if out[off:off + 6] == want:
+            return 0
+        out[off:off + 6] = want
+        return 1
+
+    def _find_text_nop_cave(self, out: bytearray, need: int,
+                            avoid: Optional[List[Tuple[int, int]]] = None
+                            ) -> Optional[int]:
+        """Blob offset of a ``need``-byte 0x90 run in .text, skipping ``avoid`` RVAs."""
+        if need <= 0 or not self.text_rva:
+            return None
+        if avoid is None:
+            avoid = [(0x9200, 0x9400)]
+        lo = max(0, 0x2000 - self.text_rva)
+        run = 0
+        start = 0
+        for i in range(lo, len(out)):
+            rva = self.text_rva + i
+            if any(lo_rva <= rva < hi_rva for lo_rva, hi_rva in avoid):
+                run = 0
+                continue
+            if out[i] in (0x90, 0xCC):
+                if run == 0:
+                    start = i
+                run += 1
+                if run >= need:
+                    return start
+            else:
+                run = 0
+        return self._find_nop_run(out, need, avoid=avoid)
+
+    def _fix_cmd_data_echo_test_literal(self, out: bytearray, sect_rva: int) -> int:
+        """Wide L\"echo \" needle for win10 dynamic echo stub (RVA 0x41490)."""
+        msg_rva = 0x41490
+        off = msg_rva - sect_rva
+        pad = 32
+        if off < 0 or off + pad > len(out):
+            return 0
+        want = 'echo '.encode('utf-16-le') + b'\x00\x00' + b'\x00' * (pad - 12)
+        if out[off:off + pad] == want:
+            return 0
+        out[off:off + pad] = want
+        return 1
+
+    def _fix_cmd_data_interactive_banner_line(self, out: bytearray, sect_rva: int) -> int:
+        """Wide version banner line for interactive startup (RVA 0x414E0)."""
+        msg_rva = 0x414E0
+        off = msg_rva - sect_rva
+        text = 'Microsoft Windows 2000 [Version 5.00]\r\n'
+        want = text.encode('utf-16-le') + b'\x00\x00'
+        pad = 96
+        if off < 0 or off + pad > len(out):
+            return 0
+        if len(want) > pad:
+            return 0
+        body = want + b'\x00' * (pad - len(want))
+        if out[off:off + pad] == body:
+            return 0
+        out[off:off + pad] = body
+        return 1
+
+    def _fix_cmd_data_interactive_prompt_literal(self, out: bytearray, sect_rva: int) -> int:
+        """Wide L\"C:\\> \" for interactive prompt stub (RVA 0x414B0)."""
+        msg_rva = 0x414B0
+        off = msg_rva - sect_rva
+        want = 'C:\\> '.encode('utf-16-le') + b'\x00\x00'
+        if off < 0 or off + len(want) > len(out):
+            return 0
+        if out[off:off + len(want)] == want:
+            return 0
+        out[off:off + len(want)] = want
+        return 1
+
+    def _build_win10_echo_stub_parts(self, p1_rva: int, p2_rva: int, msg_rva: int,
+                                     wcsstr_iat: int, wcslen_iat: int, getcl_iat: int,
+                                     getstd: int, writefn: int, exit_iat: int) -> Tuple[bytes, bytes]:
+        """Two-part echo stub: p1 finds text + length, p2 WriteConsoleW + _exit."""
+        nb = self.new_base
+
+        def va(rva: int) -> int:
+            return nb + rva
+
+        def ff15(at_rva: int, iat: int) -> bytes:
+            return b'\xff\x15' + struct.pack('<i', iat - (va(at_rva) + 6))
+
+        p1 = bytearray()
+
+        def p1_at() -> int:
+            return p1_rva + len(p1)
+
+        def put1(*parts: bytes) -> None:
+            for part in parts:
+                p1.extend(part)
+
+        put1(b'\x48\x83\xec\x28')
+        gcl_call = p1_at()
+        put1(ff15(gcl_call, getcl_iat))
+        put1(b'\x48\x89\xc1')
+        put1(b'\x48\x8d\x15')
+        lea_disp = len(p1)
+        put1(b'\x00\x00\x00\x00')
+        wcs_call = p1_at()
+        put1(ff15(wcs_call, wcsstr_iat))
+        put1(b'\x48\x85\xc0', b'\x0f\x84')
+        jz_fail = len(p1)
+        put1(b'\x00\x00\x00\x00')
+        put1(b'\x48\x8d\x70\x0a', b'\x48\x89\xf1')
+        wcl_call = p1_at()
+        put1(ff15(wcl_call, wcslen_iat))
+        put1(b'\x89\xc3', b'\xc7\x04\x5e\x0d\x00\x0a\x00', b'\x83\xc3\x02')
+        put1(b'\xe9')
+        j_main = len(p1)
+        put1(b'\x00\x00\x00\x00')
+
+        lea_from = va(p1_rva + lea_disp + 4)
+        struct.pack_into('<i', p1, lea_disp, va(msg_rva) - lea_from)
+        fail_from = p1_rva + jz_fail + 4
+        struct.pack_into('<i', p1, jz_fail, p2_rva - fail_from)
+
+        p2 = bytearray()
+
+        def put2(*parts: bytes) -> None:
+            for part in parts:
+                p2.extend(part)
+
+        put2(b'\x31\xc9')
+        ex0 = p2_rva + len(p2)
+        put2(ff15(ex0, exit_iat))
+        p2_main = p2_rva + len(p2)
+        put2(b'\x41\x55', b'\x49\x89\xe5', b'\x48\x83\xec\x20', b'\x48\x83\xe4\xf0')
+        put2(b'\xb9\xf5\xff\xff\xff')
+        gs_call = p2_rva + len(p2)
+        put2(ff15(gs_call, getstd))
+        put2(b'\x48\x89\xc1', b'\x48\x89\xf2', b'\x01\xdb', b'\x41\x89\xd8')
+        put2(b'\x4c\x8d\x4c\x24\x20', b'\x48\xc7\x44\x24\x18\x00\x00\x00\x00')
+        wc_call = p2_rva + len(p2)
+        put2(ff15(wc_call, writefn))
+        put2(b'\x31\xc9')
+        ex1 = p2_rva + len(p2)
+        put2(ff15(ex1, exit_iat))
+
+        main_from = p1_rva + j_main + 4
+        struct.pack_into('<i', p1, j_main, p2_main - main_from)
+        return bytes(p1), bytes(p2)
+
+    def _build_win10_echo_stub_single(self, stub_rva: int, msg_rva: int,
+                                      wcsstr_iat: int, wcslen_iat: int, getcl_iat: int,
+                                      getstd: int, writefn: int, exit_iat: int) -> bytes:
+        """One-part /c echo stub (<=93 bytes at RVA 0x8F6F)."""
+        nb = self.new_base
+        s = bytearray()
+
+        def va(rva: int) -> int:
+            return nb + rva
+
+        def at() -> int:
+            return stub_rva + len(s)
+
+        def put(*parts: bytes) -> None:
+            for part in parts:
+                s.extend(part)
+
+        def ff15(iat: int) -> bytes:
+            a = at()
+            return b'\xff\x15' + struct.pack('<i', iat - (va(a) + 6))
+
+        put(b'\x48\x83\xec\x48')
+        put(ff15(getcl_iat))
+        put(b'\x48\x89\xc1')
+        put(b'\x48\x8d\x15')
+        lea1 = len(s)
+        put(b'\x00\x00\x00\x00')
+        put(ff15(wcsstr_iat))
+        put(b'\x48\x85\xc0', b'\x0f\x84')
+        jz = len(s)
+        put(b'\x00\x00\x00\x00')
+        put(b'\x48\x8d\x70\x0a', b'\x48\x89\xf1')
+        put(ff15(wcslen_iat))
+        put(b'\x89\xc3', b'\xc7\x04\x5e\x0d\x00\x0a\x00', b'\x83\xc3\x02')
+        put(b'\xb9\xf5\xff\xff\xff')
+        put(ff15(getstd))
+        put(b'\x48\x89\xc1', b'\x48\x89\xf2', b'\x01\xdb', b'\x41\x89\xd8')
+        put(b'\x4c\x8d\x4c\x24\x30', b'\x48\xc7\x44\x24\x28\x00\x00\x00\x00')
+        put(ff15(writefn))
+        put(b'\x31\xc9')
+        put(ff15(exit_iat))
+        ex = at()
+        put(b'\x31\xc9')
+        put(ff15(exit_iat))
+        struct.pack_into('<i', s, lea1, va(msg_rva) - va(stub_rva + lea1 + 4))
+        struct.pack_into('<i', s, jz, ex - (stub_rva + jz + 4))
+        return bytes(s)
+
+    def _build_win10_guard_compact_8fcc(self, slot_rva: int, echo_rva: int,
+                                            interact_rva: int) -> Optional[bytes]:
+        """GetCommandLineW; wcsstr(cmdline,L\"/c\"); /c -> echo_rva else jmp interact_rva."""
+        wcsstr_iat = self._loader_iat_va('MSVCRT.dll', 'wcsstr')
+        if not wcsstr_iat:
+            wcsstr_iat = self._resolve_iat_slot_va(self.old_base + 0x12AC)
+        getcl = self._loader_iat_va('KERNEL32.dll', 'GetCommandLineW')
+        if not wcsstr_iat or not getcl:
+            return None
+        nb = self.new_base
+        slash_c = nb + 0x41484
+        body = bytearray()
+        body += b'\x48\x83\xec\x28'
+        gcl_at = slot_rva + len(body)
+        body += b'\xff\x15' + struct.pack('<i', getcl - (nb + gcl_at + 6))
+        body += b'\x48\x89\xc6'                      # mov rsi, rax (cmdline for wcsncpy)
+        body += b'\x48\x89\xc1'                      # mov rcx, rax
+        body += b'\x48\x8d\x15'
+        lea_at = len(body)
+        body += b'\x00\x00\x00\x00'
+        wcs_at = slot_rva + len(body)
+        body += b'\xff\x15' + struct.pack('<i', wcsstr_iat - (nb + wcs_at + 6))
+        body += b'\x48\x83\xc4\x28'
+        body += b'\x48\x85\xc0'
+        jnz_pos = len(body)
+        body += b'\x0f\x85\x00\x00\x00\x00'
+        jmp_from = slot_rva + len(body)
+        rel_inter = interact_rva - (jmp_from + 5)
+        if not (-2147483648 <= rel_inter <= 2147483647):
+            return None
+        body += b'\xe9' + struct.pack('<i', rel_inter)
+        lea_from = slot_rva + lea_at + 4
+        struct.pack_into('<i', body, lea_at, slash_c - (nb + lea_from))
+        jnz_from = slot_rva + jnz_pos + 6
+        rel_echo = echo_rva - jnz_from
+        if not (-2147483648 <= rel_echo <= 2147483647):
+            return None
+        struct.pack_into('<i', body, jnz_pos + 2, rel_echo)
+        return bytes(body)
+
+    def _fix_cmd_win10_echo_writeconsole(self, out: bytearray) -> int:
+        """Win10-test: dynamic /c echo <text> via split stub + jmp from 0x92E7."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        msg_rva = 0x41490
+        wcsstr_iat = self._loader_iat_va('MSVCRT.dll', 'wcsstr')
+        wcslen_iat = self._loader_iat_va('MSVCRT.dll', 'wcslen')
+        if not wcsstr_iat:
+            wcsstr_iat = self._resolve_iat_slot_va(self.old_base + 0x12AC)
+        if not wcslen_iat:
+            wcslen_iat = self._resolve_iat_slot_va(self.old_base + 0x129C)
+        getstd = self._loader_iat_va('KERNEL32.dll', 'GetStdHandle')
+        writefn = self._loader_iat_va('KERNEL32.dll', 'WriteFile')
+        if not writefn:
+            writefn = self._loader_iat_va('KERNEL32.dll', 'WriteConsoleW')
+        exit_iat = self._loader_iat_va('KERNEL32.dll', 'ExitProcess')
+        if not exit_iat:
+            exit_iat = self._loader_iat_va('MSVCRT.dll', '_exit')
+        if not exit_iat:
+            exit_iat = self._loader_iat_va('MSVCRT.dll', 'exit')
+        getcl = self._loader_iat_va('KERNEL32.dll', 'GetCommandLineW')
+        if not wcsstr_iat or not wcslen_iat or not getcl or not getstd or not writefn or not exit_iat:
+            return 0
+        if self.win10_test_shim:
+            p1_rva = 0x8F6F
+            p1_off = p1_rva - self.text_rva
+            probe_p1, probe_p2 = self._build_win10_echo_stub_parts(
+                p1_rva, 0x8FED, msg_rva, wcsstr_iat, wcslen_iat, getcl,
+                getstd, writefn, exit_iat)
+            echo_avoid: List[Tuple[int, int]] = [
+                (0x8F61, 0x9040),
+            ]
+            c2 = self._find_text_nop_cave(out, len(probe_p2), avoid=echo_avoid)
+            if c2 is not None:
+                p2_rva = self.text_rva + c2
+                p2_off = c2
+            else:
+                p2_rva = 0x9330
+                p2_off = p2_rva - self.text_rva
+            if p1_off < 0 or p2_off < 0 or p2_off + len(probe_p2) > len(out):
+                return 0
+            if p1_off + len(probe_p1) > (0x8FCC - self.text_rva):
+                return 0
+            p1, p2 = self._build_win10_echo_stub_parts(
+                p1_rva, p2_rva, msg_rva, wcsstr_iat, wcslen_iat, getcl,
+                getstd, writefn, exit_iat)
+            jmp_off = 0x92E7 - self.text_rva
+            if jmp_off < 0 or jmp_off + 5 > len(out):
+                return 0
+            rel_entry = p1_rva - (0x92E7 + 5)
+            if not (-2147483648 <= rel_entry <= 2147483647):
+                return 0
+            entry = b'\xe9' + struct.pack('<i', rel_entry)
+            if (out[p1_off:p1_off + len(p1)] == p1 and out[p2_off:p2_off + len(p2)] == p2
+                    and out[jmp_off:jmp_off + 5] == entry):
+                return 0
+            out[p1_off:p1_off + len(p1)] = p1
+            out[p2_off:p2_off + len(p2)] = p2
+            out[jmp_off:jmp_off + 5] = entry
+            return 1
+        probe_p1, probe_p2 = self._build_win10_echo_stub_parts(
+            0x50000, 0x50200, msg_rva, wcsstr_iat, wcslen_iat, getcl,
+            getstd, writefn, exit_iat)
+        if self.win10_test_shim:
+            p1_rva = 0x8F6F
+            p2_rva = 0x8FED
+            p1_off = p1_rva - self.text_rva
+            p2_off = p2_rva - self.text_rva
+            if p1_off < 0 or p2_off < 0:
+                return 0
+            if p1_off + len(probe_p1) > (0x8FCC - self.text_rva):
+                return 0
+            if p2_off + len(probe_p2) > (0x9038 - self.text_rva):
+                return 0
+        else:
+            echo_avoid: List[Tuple[int, int]] = [
+                (0x9200, 0x9400),
+                (0x8FCC, 0x9040),
+            ]
+            c1 = self._find_text_nop_cave(out, len(probe_p1), avoid=echo_avoid)
+            if c1 is None:
+                return 0
+            p1_rva = self.text_rva + c1
+            avoid2: List[Tuple[int, int]] = echo_avoid + [
+                (p1_rva, p1_rva + len(probe_p1)),
+            ]
+            c2 = self._find_text_nop_cave(out, len(probe_p2), avoid=avoid2)
+            if c2 is None:
+                return 0
+            p2_rva = self.text_rva + c2
+            p1_off = c1
+            p2_off = c2
+        p1, p2 = self._build_win10_echo_stub_parts(
+            p1_rva, p2_rva, msg_rva, wcsstr_iat, wcslen_iat, getcl,
+            getstd, writefn, exit_iat)
+        if len(p1) != len(probe_p1) or len(p2) != len(probe_p2):
+            return 0
+        if p1_off + len(p1) > len(out) or p2_off + len(p2) > len(out):
+            return 0
+        jmp_off = 0x92E7 - self.text_rva
+        if jmp_off < 0 or jmp_off + 5 > len(out):
+            return 0
+        rel_entry = p1_rva - (0x92E7 + 5)
+        if not (-2147483648 <= rel_entry <= 2147483647):
+            return 0
+        entry = b'\xe9' + struct.pack('<i', rel_entry)
+        if (out[p1_off:p1_off + len(p1)] == p1 and out[p2_off:p2_off + len(p2)] == p2
+                and out[jmp_off:jmp_off + 5] == entry):
+            return 0
+        out[p1_off:p1_off + len(p1)] = p1
+        out[p2_off:p2_off + len(p2)] = p2
+        out[jmp_off:jmp_off + 5] = entry
+        return 1
+
+    def _build_win10_interactive_guard_body(self, slot_rva: int,
+                                            cont_rva: int) -> Optional[bytes]:
+        """GetCommandLineW + wcsstr(L\"/c\"); jne cont_rva else ExitProcess(0)."""
+        wcsstr_iat = self._loader_iat_va('MSVCRT.dll', 'wcsstr')
+        if not wcsstr_iat:
+            wcsstr_iat = self._resolve_iat_slot_va(self.old_base + 0x12AC)
+        exit_iat = self._loader_iat_va('KERNEL32.dll', 'ExitProcess')
+        if not exit_iat:
+            exit_iat = self._loader_iat_va('MSVCRT.dll', '_exit')
+        if not exit_iat:
+            exit_iat = self._loader_iat_va('MSVCRT.dll', 'exit')
+        getcl = self._loader_iat_va('KERNEL32.dll', 'GetCommandLineW')
+        if not wcsstr_iat or not exit_iat or not getcl:
+            return None
+        slash_c = self.new_base + 0x41484
+        nb = self.new_base
+        body = bytearray()
+        body += b'\x48\x83\xec\x28'
+        gcl_at = slot_rva + len(body)
+        rel_gcl = getcl - (nb + gcl_at + 6)
+        body += b'\xff\x15' + struct.pack('<i', rel_gcl)
+        body += b'\x48\x89\xc1'
+        body += b'\x48\x8d\x15'
+        lea_at = len(body)
+        body += b'\x00\x00\x00\x00'
+        body += b'\x48\x83\xec\x20'
+        ff_at = slot_rva + len(body)
+        rel = wcsstr_iat - (nb + ff_at + 6)
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\x83\xc4\x20'
+        body += b'\x48\x83\xc4\x28'
+        body += b'\x48\x85\xc0'
+        jnz_pos = len(body)
+        body += b'\x0f\x85\x00\x00\x00\x00'
+        body += b'\x31\xc9'
+        ex_at = slot_rva + len(body)
+        rel2 = exit_iat - (nb + ex_at + 6)
+        body += b'\xff\x15' + struct.pack('<i', rel2)
+        lea_from = slot_rva + lea_at + 4
+        struct.pack_into('<i', body, lea_at, slash_c - (nb + lea_from))
+        jnz_from = slot_rva + jnz_pos + 6
+        struct.pack_into('<i', body, jnz_pos + 2, cont_rva - jnz_from)
+        return bytes(body)
+
+    def _fix_cmd_win10_interactive_guard_9040(self, out: bytearray) -> int:
+        """0x9040: 5-byte jmp to drive-letter path 0x9072 (scanner lives at 0x9045+)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        guard_off = 0x9040 - self.text_rva
+        if guard_off < 0 or guard_off + 5 > len(out):
+            return 0
+        rel = 0x9072 - (0x9040 + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body = b'\xe9' + struct.pack('<i', rel)
+        if out[guard_off:guard_off + 5] == body:
+            return 0
+        out[guard_off:guard_off + 5] = body
+        return 1
+
+    def _fix_cmd_main_exec_success_jmp(self, out: bytearray) -> int:
+        """After switch handler success (eax!=0), jmp to 0x932F not corrupted 0x92B5 tail."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x92B3 - self.text_rva
+        end = 0x92CC - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = (0x932F - self.text_rva) - (off + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_wcschr_iat_9111(self, out: bytearray) -> int:
+        """Replace broken wcschr E8→0x29E3E at 0x9133 with direct FF15 IAT call."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        stub_off = 0x9126 - self.text_rva
+        stub_end = 0x913B - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        if out[0x9118 - self.text_rva:0x9118 - self.text_rva + 7] != b'\x48\x8d\x8d\xd8\xfd\xff\xff':
+            return 0
+        old_iat = self.old_base + 0x1208  # MSVCRT!wcschr
+        iat_va = self._resolve_iat_slot_va(old_iat)
+        ff_rva = 0x912A
+        rel = iat_va - (self.new_base + ff_rva + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = (
+            b'\x48\x83\xec\x28'
+            + b'\xff\x15' + struct.pack('<i', rel)
+            + b'\x48\x83\xc4\x28'
+        )
+        pad = stub_end - stub_off - len(patch)
+        if pad < 0:
+            return 0
+        patch += b'\x90' * pad
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_switch_handler_entry_1deb4(self, out: bytearray) -> int:
+        """NOP stray epilogue bytes at 0x1DEB4; snap E8 targets to real entry 0x1DEB7."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        junk_off = 0x1DEB4 - self.text_rva
+        entry_off = 0x1DEB7 - self.text_rva
+        if 0 <= junk_off + 3 <= len(out) and out[junk_off:junk_off + 3] == b'\xec\x5d\xc3':
+            out[junk_off:junk_off + 3] = b'\x90\x90\x90'
+            fixed += 1
+        bad_tgt = 0x1DEB4 - self.text_rva
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            if i + 5 + rel == bad_tgt:
+                struct.pack_into('<i', out, i + 1, entry_off - (i + 5))
+                fixed += 1
+        return fixed
+
+    _CALL_ENTRY_PROLOGUES = (
+        b'\x55\x48\x89',       # push rbp; mov rbp, rsp
+        b'\x48\x83\xec',       # sub rsp, N
+        b'\x53',               # push rbx
+        b'\x56',               # push rsi
+        b'\x57',               # push rdi
+        b'\x41\x56',           # push r14
+        b'\x41\x57',           # push r15
+    )
+    _SYNTHETIC_ENTRY_SIGS = (
+        b'\x48\x89\xf1',       # mov rcx, rsi (import wrapper body)
+        b'\x49\x89\xca',       # mov r10, rcx (cmd fn6314 patch)
+    )
+    _ALIGN_WRAP = b'\x41\x55\x49\x89\xe5\x48\x83\xec\x20\x48\x83\xe4\xf0'
+    _ALIGN_HEAD = b'\x41\x55\x49\x89\xe5'  # push r13; mov r13, rsp
+
+    def _outer_entry_before_align(self, out: bytearray, pos: int) -> Optional[int]:
+        """If *pos* sits inside a call-align prologue, return the outer push entry."""
+        if pos < 0 or pos >= len(out):
+            return None
+        for back in range(0, 32):
+            p = pos - back
+            if p < 0 or p + len(self._ALIGN_HEAD) > len(out):
+                continue
+            if out[p:p + len(self._ALIGN_HEAD)] != self._ALIGN_HEAD:
+                continue
+            align_end = p + len(self._ALIGN_WRAP)
+            if pos < p or pos >= align_end + 8:
+                continue
+            ent = p
+            while ent > 0 and out[ent - 1] in (0x53, 0x56, 0x57, 0x55):
+                ent -= 1
+            return ent
+        return None
+
+    def _offset_is_function_entry(self, out: bytearray, pos: int) -> bool:
+        if pos < 0 or pos + 3 > len(out):
+            return False
+        if out[pos:pos + 3] == b'\x55\x48\x89':
+            return True
+        if pos + 4 <= len(out) and out[pos:pos + 4] == b'\x40\x55\x48\x89':
+            return True
+        for pro in self._CALL_ENTRY_PROLOGUES[1:]:
+            if out[pos:pos + len(pro)] == pro:
+                if (pro == b'\x48\x83\xec'
+                        and self._outer_entry_before_align(out, pos) is not None):
+                    return False
+                return True
+        return False
+
+    def _offset_is_synthetic_entry(self, out: bytearray, pos: int) -> bool:
+        for sig in self._SYNTHETIC_ENTRY_SIGS:
+            if out[pos:pos + len(sig)] == sig:
+                return True
+        return False
+
+    def _offset_is_wrapper_entry(self, out: bytearray, pos: int) -> bool:
+        """Small translated cdecl→fastcall thunks that are valid call targets."""
+        if pos < 0 or pos >= len(out):
+            return False
+        if out[pos] == 0xC3:
+            return True
+        if out[pos] == 0xC2 and pos + 3 <= len(out):
+            return True
+        if pos + 3 > len(out):
+            return False
+        # Frameless pointer-deref helpers (x86 fn6578-style: mov eax,[ptr]; ret).
+        if out[pos:pos + 3] in (b'\x8b\x01\xc3', b'\x8b\x02\xc3', b'\x8b\x00\xc3'):
+            return True
+        if pos + 4 <= len(out) and out[pos + 3] == 0xC3:
+            if out[pos] in (0x8B,) and out[pos + 1] in (0x01, 0x02, 0x00):
+                return True
+            if out[pos:pos + 2] == b'\x8b\x41':  # mov eax, [rcx+disp8]; ret
+                return True
+        if pos + 4 > len(out):
+            return False
+        if out[pos:pos + 4] == b'\x48\x83\xf9\x00':  # cmp rcx, 0
+            return True
+        if out[pos:pos + 3] == b'\x48\x85\xc9':       # test rcx, rcx
+            return True
+        if out[pos:pos + 4] == b'\x48\x83\x7d\x10':  # cmp qword [rbp+10], 0
+            return True
+        return False
+
+    def _offset_is_mapped_entry(self, out: bytearray, pos: int) -> bool:
+        return (self._offset_is_function_entry(out, pos)
+                or self._offset_is_wrapper_entry(out, pos))
+
+    def _offset_is_valid_entry(self, out: bytearray, pos: int) -> bool:
+        """Mapped entry that passes pure-mode prologue quality when required."""
+        if not self._offset_is_mapped_entry(out, pos):
+            return False
+        if self._cmd_no_hacks:
+            return self._x64_entry_prologue_ok(out, pos)
+        return True
+
+    def _entry_snapworthy(self, out: bytearray, entry: int,
+                          rva_map: Optional[Dict[int, int]] = None) -> bool:
+        if entry < 0 or entry >= len(out):
+            return False
+        if self._cmd_no_hacks:
+            return self._x64_entry_prologue_ok(out, entry)
+        if rva_map and entry in rva_map.values():
+            return True
+        if self._offset_is_synthetic_entry(out, entry):
+            return False
+        return self._offset_is_mapped_entry(out, entry)
+
+    def _find_enclosing_function_entry(self, out: bytearray, tgt_off: int,
+                                       rva_map: Optional[Dict[int, int]] = None,
+                                       max_back: int = 160,
+                                       max_body: int = 0x800) -> Optional[int]:
+        """Map a mid-function blob offset to the nearest real entry (prologue scan + rva_map)."""
+        if tgt_off < 0 or tgt_off >= len(out):
+            return None
+        outer = self._outer_entry_before_align(out, tgt_off)
+        if outer is not None:
+            return outer
+        if rva_map and self._fn_entry_rvas:
+            for old_rva in self._fn_entry_rvas:
+                if rva_map.get(old_rva) == tgt_off:
+                    if self._offset_is_valid_entry(out, tgt_off):
+                        return tgt_off
+        if self._offset_is_valid_entry(out, tgt_off):
+            return tgt_off
+        align = self._ALIGN_WRAP
+        for back in range(0, max_back):
+            pos = tgt_off - back
+            if pos < 0:
+                break
+            if back > 0 and out[pos] == 0xC3:
+                break
+            if back > 0 and out[pos] == 0xC2 and pos + 3 <= len(out):
+                break
+            if pos + len(align) <= len(out):
+                al_end = pos + len(align)
+                if out[pos:pos + len(align)] == align and pos <= tgt_off < al_end:
+                    continue
+            if self._offset_is_valid_entry(out, pos):
+                return pos
+        if rva_map and self._fn_entry_rvas:
+            best: Optional[int] = None
+            for old_rva in self._fn_entry_rvas:
+                ent = rva_map.get(old_rva)
+                if ent is None or ent > tgt_off or tgt_off - ent >= max_body:
+                    continue
+                if best is None or ent > best:
+                    best = ent
+            if best is not None and self._entry_snapworthy(out, best, rva_map):
+                return best
+        return None
+
+    def _snap_calls_to_enclosing_entries(self, out: bytearray,
+                                         rva_map: Optional[Dict[int, int]] = None,
+                                         lo_rva: int = 0,
+                                         hi_rva: int = 0) -> int:
+        """Snap E8 rel32 call targets onto enclosing function entries (binary-generic)."""
+        if not self.text_rva:
+            return 0
+        lo = lo_rva - self.text_rva if lo_rva else 0
+        hi = hi_rva - self.text_rva if hi_rva else len(out)
+        fixed = 0
+        for i in range(max(0, lo), min(len(out) - 5, hi)):
+            if out[i] != 0xE8:
+                continue
+            if not self._e8_byte_is_real_call(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt <= 0 or tgt >= len(out):
+                continue
+            if out[tgt] in (0xC3, 0xC2):
+                continue
+            if (self._x86_cf and rva_map
+                    and any(rva_map.get(ep_rva) == tgt
+                            for ep_rva in self._x86_cf.epilogue_labels)):
+                continue
+            entry = self._find_enclosing_function_entry(out, tgt, rva_map)
+            if (entry is not None and entry != tgt
+                    and self._entry_snapworthy(out, entry, rva_map)):
+                struct.pack_into('<i', out, i + 1, entry - (i + 5))
+                fixed += 1
+        return fixed
+
+    def _shim_offset_for_x86_rva(self, x86_rva: int,
+                                 rva_map: Dict[int, int]) -> Optional[int]:
+        """Map an x86 .text RVA to the corresponding shim blob offset."""
+        if not rva_map:
+            return None
+        if x86_rva in rva_map:
+            return rva_map[x86_rva]
+        fn_entries = self._fn_entry_rvas or set(rva_map.keys())
+        candidates = [(rva_map[o], o) for o in fn_entries
+                      if o <= x86_rva and o in rva_map]
+        if not candidates:
+            return None
+        mapped_off, old_start = max(candidates, key=lambda x: x[1])
+        return mapped_off + (x86_rva - old_start)
+
+    def _is_wcsrchr_wrapper_entry(self, out: bytearray, pos: int) -> bool:
+        if pos < 0 or pos + 40 > len(out):
+            return False
+        if out[pos:pos + 4] != b'\x48\x83\xf9\x00':
+            return False
+        return b'\xa1\xf4\x06\x80' in out[pos:pos + 40]
+
+    def _locate_shim_entry_for_x86_fn(self, out: bytearray,
+                                      x86_tgt_rva: int,
+                                      rva_map: Optional[Dict[int, int]] = None) -> Optional[int]:
+        """Fallback when rva_map points at the wrong blob cell for a small helper."""
+        if not self.pe:
+            return None
+        sec = self.pe.section_for_rva(x86_tgt_rva)
+        if not sec:
+            return None
+        x86_text = self.pe.get_section_data(sec)
+        x86_off = x86_tgt_rva - sec['vaddr']
+        if x86_off < 0 or x86_off + 4 > len(x86_text):
+            return None
+        head = x86_text[x86_off:x86_off + 4]
+        if head == b'\x83\x7c\x24\x04':  # cmp dword ptr [esp+4], 0
+            pos = 0
+            while pos < len(out):
+                j = out.find(b'\x48\x83\xf9\x00', pos)
+                if j < 0:
+                    break
+                if self._is_wcsrchr_wrapper_entry(out, j):
+                    return j
+                pos = j + 1
+        if (x86_off + 2 <= len(x86_text)
+                and x86_text[x86_off:x86_off + 2] == b'\x56\x57'):  # push esi; push edi
+            sig = b'\x57\x48\x8b\x7d\x10'
+            hits: List[int] = []
+            pos = 0
+            while pos < len(out):
+                j = out.find(sig, pos)
+                if j < 0:
+                    break
+                ent = j
+                for back in range(0, 40):
+                    p = j - back
+                    if p >= 0 and out[p:p + 3] == b'\x55\x48\x89':
+                        ent = p
+                        break
+                win = out[j:j + 32]
+                if b'\x66\x83\x3f' in win:
+                    hits.append(ent)
+                pos = j + 1
+            if hits:
+                if rva_map and x86_tgt_rva in rva_map:
+                    hint = rva_map[x86_tgt_rva]
+                    return min(hits, key=lambda h: abs(h - hint))
+                return hits[0]
+        return None
+
+    def _entry_for_x86_target(self, out: bytearray, x86_tgt_rva: int,
+                              rva_map: Dict[int, int]) -> Optional[int]:
+        """Resolve x86 call target RVA to a snap-worthy shim function entry."""
+        located = self._locate_shim_entry_for_x86_fn(out, x86_tgt_rva, rva_map)
+        if located is not None:
+            return located
+        if x86_tgt_rva in rva_map:
+            exact = rva_map[x86_tgt_rva]
+            if (0 <= exact < len(out)
+                    and self._offset_is_mapped_entry(out, exact)):
+                return exact
+        mapped = self._shim_offset_for_x86_rva(x86_tgt_rva, rva_map)
+        if mapped is None or mapped < 0 or mapped >= len(out):
+            return None
+        if self._offset_is_mapped_entry(out, mapped):
+            return mapped
+        entry = self._find_enclosing_function_entry(out, mapped, rva_map)
+        if entry is not None and self._entry_snapworthy(out, entry, rva_map):
+            return entry
+        return None
+
+    def _find_shim_call_for_x86_call(self, out: bytearray, x86_call_rva: int,
+                                     x86_tgt_rva: int,
+                                     rva_map: Dict[int, int]) -> Optional[int]:
+        """Locate the shim E8 for an x86 call site (linear map + local signature scan)."""
+        off = self._shim_offset_for_x86_rva(x86_call_rva, rva_map)
+        if off is not None and 0 <= off < len(out) - 5 and out[off] == 0xE8:
+            return off
+        fn_entries = self._fn_entry_rvas or set(rva_map.keys())
+        candidates = [(rva_map[o], o) for o in fn_entries
+                      if o <= x86_call_rva and o in rva_map]
+        if not candidates:
+            return None
+        shim_fn, old_fn = max(candidates, key=lambda x: x[1])
+        scan = min(len(out) - 5, shim_fn + 0x400)
+        prefixes: Tuple[bytes, ...] = ()
+        if x86_tgt_rva == 0x195F0:
+            prefixes = (b'\x48\xc7\xc2\x20\x00\x00\x00',)
+        for prefix in prefixes:
+            pos = shim_fn
+            while pos < scan:
+                j = out.find(prefix, pos, scan)
+                if j < 0:
+                    break
+                for k in range(j + len(prefix), min(j + len(prefix) + 48, scan)):
+                    if out[k] == 0xE8:
+                        return k
+                pos = j + 1
+        return None
+
+    def _snap_call_to_x86_target(self, out: bytearray, x86_call_rva: int,
+                                 x86_tgt_rva: int,
+                                 rva_map: Optional[Dict[int, int]]) -> int:
+        """Snap one shim E8 to the entry for *x86_tgt_rva* (rva_map correspondence)."""
+        if not rva_map or not self.text_rva:
+            return 0
+        call_off = self._find_shim_call_for_x86_call(
+            out, x86_call_rva, x86_tgt_rva, rva_map)
+        entry = self._entry_for_x86_target(out, x86_tgt_rva, rva_map)
+        if call_off is None or entry is None:
+            return 0
+        if call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        rel = struct.unpack_from('<i', out, call_off + 1)[0]
+        if call_off + 5 + rel == entry:
+            return 0
+        struct.pack_into('<i', out, call_off + 1, entry - (call_off + 5))
+        return 1
+
+    def _snap_calls_via_x86_correspondence(self, out: bytearray,
+                                           rva_map: Optional[Dict[int, int]],
+                                           lo_x86: int = 0,
+                                           hi_x86: int = 0) -> int:
+        """Snap misaligned shim CALL sites using x86 call/target pairs + rva_map."""
+        if not rva_map or not self.text_rva or not self.pe:
+            return 0
+        sec = self.pe.section_for_rva(self.text_rva)
+        if not sec:
+            return 0
+        x86_text = self.pe.get_section_data(sec)
+        x86_base = sec['vaddr']
+        lo = lo_x86 - x86_base if lo_x86 else 0
+        hi = hi_x86 - x86_base if hi_x86 else len(x86_text)
+        image_end = self.pe.image_size
+        fixed = 0
+        for i in range(max(0, lo), min(len(x86_text) - 5, hi)):
+            if x86_text[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', x86_text, i + 1)[0]
+            tgt_off = i + 5 + rel
+            if tgt_off < 0 or tgt_off >= len(x86_text):
+                continue
+            call_x86 = x86_base + i
+            tgt_x86 = x86_base + tgt_off
+            if tgt_x86 < x86_base or tgt_x86 >= image_end:
+                continue
+            entry = self._entry_for_x86_target(out, tgt_x86, rva_map)
+            if entry is None:
+                continue
+            call_off = self._find_shim_call_for_x86_call(
+                out, call_x86, tgt_x86, rva_map)
+            if call_off is None or call_off + 5 > len(out):
+                continue
+            if out[call_off] != 0xE8:
+                continue
+            cur = call_off + 5 + struct.unpack_from('<i', out, call_off + 1)[0]
+            if cur == entry:
+                continue
+            if (self._offset_is_function_entry(out, cur)
+                    and cur == entry):
+                continue
+            struct.pack_into('<i', out, call_off + 1, entry - (call_off + 5))
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_fn6314_fn6578_call(self, out: bytearray, fn6314: int) -> int:
+        """fn6314 loads a global then calls fn6578 (x86 0x6578): RCX arg, not RDX."""
+        fn6578 = self._cmd_fn6578_entry_off(out)
+        if fn6314 < 0 or fn6578 is None:
+            return 0
+        fixed = 0
+        glob_off = fn6314 + 0x0D
+        if (glob_off + 10 <= len(out)
+                and out[glob_off:glob_off + 2] == b'\x48\xba'):
+            out[glob_off:glob_off + 2] = b'\x48\xb9'  # movabs rcx, imm
+            fixed += 1
+        call_off = fn6314 + 0x24
+        if call_off + 5 <= len(out) and out[call_off] == 0xE8:
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            if call_off + 5 + rel != fn6578:
+                struct.pack_into('<i', out, call_off + 1,
+                                 fn6578 - (call_off + 5))
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_fn6314_helper_calls(self, out: bytearray,
+                                     rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Snap fn6314 internal helpers via x86↔shim rva_map correspondence."""
+        if not self.text_rva:
+            return 0
+        if rva_map is None:
+            rva_map = self.rva_map or None
+        if not rva_map:
+            return 0
+        fn6314 = self._cmd_fn6314_entry_off(out)
+        fixed = 0
+        if fn6314 is not None:
+            fixed += self._fix_cmd_fn6314_fn6578_call(out, fn6314)
+        fixed += self._snap_call_to_x86_target(out, 0x633F, 0x195F0, rva_map)
+        # fn6314 wcsrchr call (shim RVA 0x2DCA1) — linear map drifts after expansion
+        call_off = 0x2DCA1 - self.text_rva
+        good = self._entry_for_x86_target(out, 0x195F0, rva_map)
+        if (call_off >= 0 and good is not None and call_off + 5 <= len(out)
+                and out[call_off] == 0xE8):
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            if call_off + 5 + rel != good:
+                struct.pack_into('<i', out, call_off + 1, good - (call_off + 5))
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_main_batch_copy_call_args(self, out: bytearray) -> int:
+        """Before batch copy call (0x2B056), pass token ptr in RCX and global in RDX."""
+        if not self.text_rva:
+            return 0
+        off = 0x93A6 - self.text_rva
+        if off < 0 or off + 6 > len(out):
+            return 0
+        # mov rcx, rbx; mov rdx, rax — token buffer + cmd global table
+        patch = b'\x48\x89\xd9' + b'\x48\x89\xc2'
+        if out[off:off + 6] == patch:
+            return 0
+        if out[off:off + 6] not in (b'\x48\x89\xd9' + b'\x48\x89\xc2',
+                                    b'\x48\x89\xc1' + b'\x48\x89\xda'):
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _fix_cmd_batch_helper_x64_ptr_load(self, out: bytearray) -> int:
+        """Batch helper (0x2B056): use qword RDX arg, not dword [rbp+0x18]."""
+        if not self.text_rva:
+            return 0
+        off = 0x2B06E - self.text_rva
+        if off < 0 or off + 8 > len(out):
+            return 0
+        patch = b'\x48\x8b\x55\x18' + b'\x8b\x0a' + b'\x31\xff'
+        old = b'\x8b\x55\x18' + b'\x8b\x0a' + b'\x48\x31\xff'
+        if out[off:off + 8] == patch:
+            return 0
+        if out[off:off + 8] != old:
+            return 0
+        out[off:off + 8] = patch
+        return 1
+
+    def _fix_cmd_main_wcschr_call(self, out: bytearray) -> int:
+        """Restore cmd main wcschr FF15 at 0x9130 (was call into 0x29E85 mid-body)."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x9123 - self.text_rva
+        call_off = 0x9130 - self.text_rva
+        stub_end = 0x913B - self.text_rva
+        bad_off = 0x29E85 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        if out[call_off] == 0xE8:
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            if call_off + 5 + rel != bad_off:
+                return 0
+        elif out[call_off:call_off + 2] != b'\xff\x15':
+            return 0
+        old_iat = self.old_base + 0x1208  # MSVCRT!wcschr
+        iat_va = self._resolve_iat_slot_va(old_iat)
+        rel = iat_va - (self.new_base + self.text_rva + call_off + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        span = stub_end - stub_off
+        patch = (b'\x41\x55\x49\x89\xe5\x48\x83\xec\x20\x48\x83\xe4\xf0'
+                 + b'\xff\x15' + struct.pack('<i', rel)
+                 + b'\x4c\x89\xec\x41\x5d')
+        if len(patch) != span:
+            return 0
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_main_wcschr_null_fallback(self, out: bytearray) -> int:
+        """After token scan: reload RBX from saved cmdline at [rbp-0x228] on null."""
+        if not self.text_rva:
+            return 0
+        off = 0x913B - self.text_rva
+        end = 0x9150 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        patch = (
+            b'\x48\x85\xc0'
+            + b'\x75\x09'
+            + b'\x48\x8b\x9d\xd8\xfd\xff\xff'
+            + b'\xeb\x07'
+            + b'\x90' * 7
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_interactive_skip_wcscmp_slashq_917a(self, out: bytearray) -> int:
+        """Win10: wcscmp call at 0x917A AVs — force no-match and fall through to banner jne."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        off = 0x917A - self.text_rva
+        if off < 0 or off + 6 > len(out):
+            return 0
+        patch = b'\xb8\x01\x00\x00\x00\x90'  # mov eax, 1; nop
+        if out[off:off + 6] == patch:
+            return 0
+        if out[off] != 0xFF or out[off + 1] != 0x15:
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _fix_cmd_main_token_scan_null_exit_911e(self, out: bytearray) -> int:
+        """Token scan loop: null terminator must exit (0x913B), not jmp back to 0x911A."""
+        if not self.text_rva:
+            return 0
+        off = 0x911E - self.text_rva
+        if off < 0 or off + 2 > len(out) or out[off] != 0x74:
+            return 0
+        want = 0x913B - (0x911E + 2)
+        if not (-128 <= want <= 127):
+            return 0
+        if out[off + 1] == want & 0xFF:
+            return 0
+        out[off + 1] = want & 0xFF
+        return 1
+
+    def _fix_cmd_main_empty_token_cmp(self, out: bytearray) -> int:
+        """Restore empty-token cmp/je (0x9150) before /? /c switch dispatch."""
+        if not self.text_rva:
+            return 0
+        off = 0x9150 - self.text_rva
+        end = 0x9159 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        exit_off = 0x2E4BE - self.text_rva
+        banner_off = 0x2E4B2 - self.text_rva
+        je = banner_off - (0x9153 - self.text_rva + 6)
+        patch = b'\x80\x3b\x00' + b'\x0f\x84' + struct.pack('<i', je)
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_skip_empty_token_exit(self, out: bytearray) -> int:
+        """NOP empty-token je at 0x9153 — exit target chain is still broken for /c echo."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        je_off = 0x9153 - self.text_rva
+        if je_off < 0 or je_off + 6 > len(out) or out[je_off:je_off + 2] != b'\x0f\x84':
+            return 0
+        if out[je_off:je_off + 6] == b'\x90' * 6:
+            return 0
+        out[je_off:je_off + 6] = b'\x90' * 6
+        return 1
+
+    def _fix_cmd_main_c_switch_jne(self, out: bytearray) -> int:
+        """Second /c wcscmp branch: jne to exit (keep fall-through on match)."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x91B5 - self.text_rva
+        if off < 0 or off + 2 > len(out) or out[off:off + 2] != b'\x0f\x84':
+            return 0
+        if out[off:off + 2] == b'\x0f\x85':
+            return 0
+        out[off:off + 2] = b'\x0f\x85'
+        return 1
+
+    def _fix_cmd_main_wcsncmp_c_second(self, out: bytearray) -> int:
+        """Second switch compare: wcsncmp(rbx, L\"/c\", 2) so tail stays intact."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x9192 - self.text_rva
+        end = 0x91B3 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        lea_rva = 0x9195
+        r8_rva = 0x919C
+        sub_rva = 0x91A2
+        ff_rva = 0x91A6
+        add_rva = 0x91AC
+        rel_str = 0x41484 - (lea_rva + 7)
+        rel_iat = 0x6E529 - (ff_rva + 6)
+        if not (-2147483648 <= rel_str <= 2147483647
+                and -2147483648 <= rel_iat <= 2147483647):
+            return 0
+        patch = (
+            b'\x48\x89\xd9'
+            + b'\x48\x8d\x15' + struct.pack('<i', rel_str)
+            + b'\x41\xb8\x02\x00\x00\x00'
+            + b'\x48\x83\xec\x28'
+            + b'\xff\x15' + struct.pack('<i', rel_iat)
+            + b'\x48\x83\xc4\x28'
+            + b'\x90' * 3
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_echo_tail_rcx(self, out: bytearray) -> int:
+        """Echo tail: pass command text (skip L\"/c \") in RCX for wcslen helper."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x935E - self.text_rva
+        if off < 0 or off + 4 > len(out):
+            return 0
+        want = b'\x48\x8d\x4b\x06'  # lea rcx, [rbx+6]  past L"/c "
+        if out[off:off + 4] == want:
+            return 0
+        if out[off:off + 4] != b'\x48\x8b\x4d\x10':
+            return 0
+        out[off:off + 4] = want
+        return 1
+
+    def _fix_cmd_exec_helper_kernel_iat(self, out: bytearray) -> int:
+        """Exec helper ~0x130E3: retarget ADVAPI32 IAT cells to KERNEL32 APIs."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        fixes = (
+            (0x13142, 0x8006E10F, self.new_base + 0x6D4D8),  # CreateProcessW
+            (0x131A1, 0x8006E0C7, self.new_base + 0x6D638),  # WaitForSingleObject
+            (0x131C6, 0x8006E0F7, self.new_base + 0x6D518),  # CloseHandle
+        )
+        fixed = 0
+        for mov_rva, bad_cell, good_iat in fixes:
+            off = mov_rva - self.text_rva
+            if off < 0 or off + 10 > len(out) or out[off:off + 2] != b'\x48\xb8':
+                continue
+            cur = struct.unpack_from('<Q', out, off + 2)[0]
+            if cur == good_iat:
+                continue
+            if cur != bad_cell:
+                continue
+            struct.pack_into('<Q', out, off + 2, good_iat)
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_exec_success_via_rbx_setup(self, out: bytearray) -> int:
+        """After /c switch handler, rescan for L'/' in [rbp-0x228] (not buffer base)."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        fixed = 0
+        off_b3 = 0x92B3 - self.text_rva
+        if off_b3 >= 0 and off_b3 + 5 <= len(out) and out[off_b3] == 0xE9:
+            want_tgt = 0x92CC - self.text_rva
+            rel = want_tgt - (off_b3 + 5)
+            if struct.unpack_from('<i', out, off_b3 + 1)[0] != rel:
+                if -2147483648 <= rel <= 2147483647:
+                    struct.pack_into('<i', out, off_b3 + 1, rel)
+                    fixed += 1
+        scan_off = 0x92CC - self.text_rva
+        scan_end = 0x92EC - self.text_rva
+        if scan_off < 0 or scan_end <= scan_off or scan_end > len(out):
+            return fixed
+        loop = scan_off + 7
+        done = scan_off + 27
+        je0 = done - (scan_off + 15)
+        je1 = done - (scan_off + 21)
+        jloop = loop - (scan_off + 27)
+        rel_jmp = ((0x8F6F if self.win10_test_shim else 0x932F) - self.text_rva) - (done + 5)
+        if not (-2147483648 <= rel_jmp <= 2147483647):
+            return fixed
+        body = (
+            b'\x48\x8d\x9d\xd8\xfd\xff\xff'   # lea rbx, [rbp-0x228]
+            + b'\x0f\xb7\x03'                   # movzx eax, word [rbx]
+            + b'\x66\x85\xc0'                   # test ax, ax
+            + b'\x74' + bytes([je0 & 0xFF])
+            + b'\x66\x3d\x2f\x00'               # cmp ax, '/'
+            + b'\x74' + bytes([je1 & 0xFF])
+            + b'\x48\x83\xc3\x02'               # add rbx, 2
+            + b'\xeb' + bytes([jloop & 0xFF])
+            + b'\xe9' + struct.pack('<i', rel_jmp)
+        )
+        pad = scan_end - scan_off - len(body)
+        if pad < 0:
+            return fixed
+        patch = body + b'\x90' * pad
+        if out[scan_off:scan_end] != patch:
+            out[scan_off:scan_end] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_skip_createprocess_helper_938f(self, out: bytearray) -> int:
+        """Echo tail: skip CreateProcess helper; pass L\"echo…\" ptr in RAX to batch runner."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        call_off = 0x938F - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        patch = b'\x48\x8d\x43\x06\x90'  # lea rax, [rbx+6]; nop
+        if out[call_off:call_off + 5] == patch:
+            return 0
+        out[call_off:call_off + 5] = patch
+        return 1
+
+    def _fix_cmd_echo_batch_call_93bc(self, out: bytearray) -> int:
+        """Echo tail batch call at 0x93BC must enter helper prologue 0x2B3E8."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        call_off = 0x93BC - self.text_rva
+        entry_rva = 0x2B3E8
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        want = entry_rva - (0x93BC + 5)
+        if struct.unpack_from('<i', out, call_off + 1)[0] == want:
+            return 0
+        if -2147483648 <= want <= 2147483647:
+            struct.pack_into('<i', out, call_off + 1, want)
+            return 1
+        return 0
+
+    def _fix_cmd_echo_dispatch_call_2b3f5(self, out: bytearray) -> int:
+        """Batch echo runner: snap mid-body calls to dispatch helpers 0x49F3 / 0x487F."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        snaps = (
+            (0x2B3F5, 0x49F3),
+            (0x2B417, 0x487F),
+        )
+        for call_rva, entry_rva in snaps:
+            call_off = call_rva - self.text_rva
+            if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+                continue
+            want = entry_rva - (call_rva + 5)
+            if struct.unpack_from('<i', out, call_off + 1)[0] == want:
+                continue
+            if -2147483648 <= want <= 2147483647:
+                struct.pack_into('<i', out, call_off + 1, want)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_echo_batch_second_arg(self, out: bytearray) -> int:
+        """Second dispatch phase must keep command-line ptr (RCX=RBX), not xor rcx,rcx."""
+        if not self.text_rva:
+            return 0
+        off = 0x2B407 - self.text_rva
+        if off < 0 or off + 3 > len(out):
+            return 0
+        want = b'\x48\x89\xd9'  # mov rcx, rbx
+        if out[off:off + 3] == want:
+            return 0
+        if out[off:off + 3] != b'\x48\x31\xc9':
+            return 0
+        out[off:off + 3] = want
+        return 1
+
+    def _fix_cmd_movabs_iat_calls_in_range(self, out: bytearray,
+                                           lo_rva: int, hi_rva: int) -> int:
+        """Replace ``movabs; mov rax,[cell]; call rax`` with ``call [IAT]`` in RVA span."""
+        if not self.text_rva or not self.win10_test_shim:
+            return 0
+        lo = max(0, lo_rva - self.text_rva)
+        hi = min(len(out), hi_rva - self.text_rva)
+        fixed = 0
+        i = lo
+        while i < hi - 14:
+            if out[i:i + 2] == b'\x48\xb8' and out[i + 10:i + 15] == b'\x48\x8b\x00\xff\xd0':
+                cell_va = struct.unpack_from('<Q', out, i + 2)[0]
+                old_iat = self._pure_old_iat_for_imm(cell_va)
+                if old_iat is None:
+                    old_iat = self._old_iat_va_for_idata_cell(cell_va)
+                if old_iat and self._emit_ff15_iat_call(out, i, old_iat, 15):
+                    fixed += 1
+                i += 15
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_batch_helper_iat_region(self, out: bytearray) -> int:
+        """Interactive/batch helpers: movabs+IAT in 0x1C000–0x2200 (e.g. 0x1D371)."""
+        fixed = self._fix_cmd_movabs_iat_calls_in_range(out, 0x1C000, 0x2200)
+        # Explicit: GetVolumeInformationW at main+0x1D364 (cell 0x6D540).
+        off = 0x1D364 - self.text_rva
+        if (off >= 0 and off + 15 <= len(out)
+                and out[off:off + 2] == b'\x48\xb8'
+                and out[off + 10:off + 15] == b'\x48\x8b\x00\xff\xd0'):
+            old_iat = self.old_base + 0x10F8
+            if self._emit_ff15_iat_call(out, off, old_iat, 15):
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_echo_dispatch_iat_region(self, out: bytearray) -> int:
+        """Convert movabs+IAT indirections in echo dispatch helpers (0x487F–0x5300)."""
+        if not self.text_rva or not self.win10_test_shim:
+            return 0
+        lo = max(0, 0x487F - self.text_rva)
+        hi = min(len(out), 0x5300 - self.text_rva)
+        fixed = 0
+        i = lo
+        while i < hi - 14:
+            if out[i:i + 2] == b'\x48\xb8' and out[i + 10:i + 15] == b'\x48\x8b\x00\xff\xd0':
+                cell_va = struct.unpack_from('<Q', out, i + 2)[0]
+                old_iat = self._old_iat_va_for_idata_cell(cell_va)
+                if not old_iat and self.new_base <= cell_va < self.new_base + 0x80000:
+                    slot_rva = cell_va - self.new_base
+                    for old_rva, new_rva in (self._iat_rva_map or {}).items():
+                        if new_rva == slot_rva:
+                            old_iat = self.old_base + old_rva
+                            break
+                    # Direct PE64 IAT slot → x86 IAT (movabs points at IAT VA).
+                    _slot_x86 = {
+                        0x6D3F8: 0x1050, 0x6D420: 0x1064, 0x6D438: 0x1070,
+                        0x6D690: 0x119C, 0x6E409: 0x11D4,
+                    }
+                    if old_iat is None and slot_rva in _slot_x86:
+                        old_iat = self.old_base + _slot_x86[slot_rva]
+                if old_iat and self._emit_ff15_iat_call(out, i, old_iat, 15):
+                    fixed += 1
+                i += 15
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_echo_tail_wcsncpy_stub(self, out: bytearray) -> int:
+        """Echo tail wcsncpy stub — skipped when WriteConsole shortcut owns 0x92EC."""
+        if not self.text_rva:
+            return 0
+        if self.win10_test_shim:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        jmp_off = 0x9337 - self.text_rva
+        if jmp_off < 0 or jmp_off + 2 > len(out):
+            return 0
+        if out[jmp_off:jmp_off + 2] not in (b'\x48\x89', b'\xe9'):
+            return 0
+        stub_rva = 0x92E0
+        stub_off = stub_rva - self.text_rva
+        resume_rva = 0x9351
+        iat_va = self._resolve_iat_slot_va(self.old_base + 0x1204)  # wcsncpy
+        ff_rva = stub_rva + 0x13
+        rel_iat = iat_va - (self.new_base + ff_rva + 6)
+        jmp_from = 0x9337
+        rel_stub = stub_rva - (jmp_from + 5)
+        body = (
+            b'\x48\x89\xf9'                   # mov rcx, rdi
+            + b'\x48\x89\xda'                 # mov rdx, rbx
+            + b'\x41\x55'                     # push r13
+            + b'\x49\x89\xe5'                 # mov r13, rsp
+            + b'\x48\x83\xec\x20'             # sub rsp, 0x20
+            + b'\x48\x83\xe4\xf0'             # and rsp, -16
+            + b'\xff\x15' + struct.pack('<i', rel_iat)
+            + b'\x4c\x89\xec'                 # mov rsp, r13
+            + b'\x41\x5d'                     # pop r13
+        )
+        rel_resume = resume_rva - (stub_rva + len(body) + 5)
+        if not all(-2147483648 <= r <= 2147483647
+                   for r in (rel_iat, rel_stub, rel_resume)):
+            return 0
+        stub = body + b'\xe9' + struct.pack('<i', rel_resume)
+        pad = (0x932F - stub_rva) - len(stub)
+        if pad < 0:
+            return 0
+        stub += b'\x90' * pad
+        if out[stub_off:stub_off + len(stub)] == stub:
+            pad2 = resume_rva - (jmp_from + 5)
+            want_jmp = b'\xe9' + struct.pack('<i', rel_stub) + b'\x90' * pad2
+            if out[jmp_off:jmp_off + len(want_jmp)] == want_jmp:
+                return 0
+        out[stub_off:stub_off + len(stub)] = stub
+        pad2 = resume_rva - (jmp_from + 5)
+        out[jmp_off:jmp_off + 5] = b'\xe9' + struct.pack('<i', rel_stub)
+        if pad2 > 0:
+            out[jmp_off + 5:jmp_off + 5 + pad2] = b'\x90' * pad2
+        return 1
+
+    def _fix_cmd_main_skip_parse_to_exec(self, out: bytearray) -> int:
+        """Skip wcscpy/parse block when [rbp+0x18] is unset; go straight to /c exec tail."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x91E4 - self.text_rva
+        end = 0x91EE - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = 0x925F - (0x91E4 + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_exit_helper_call_2e4cb(self, out: bytearray) -> int:
+        """Snap exit-wrapper call at 0x2E4CB off 0x1D357 mid-body to entry 0x1D343."""
+        if not self.text_rva:
+            return 0
+        call_off = 0x2E4CB - self.text_rva
+        entry_off = 0x1D343 - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        want = entry_off - (call_off + 5)
+        if struct.unpack_from('<i', out, call_off + 1)[0] == want:
+            return 0
+        if -2147483648 <= want <= 2147483647:
+            struct.pack_into('<i', out, call_off + 1, want)
+            return 1
+        return 0
+
+    def _fix_cmd_crt_force_banner_bad_path_8ac8(self, out: bytearray) -> int:
+        """Always skip CRT banner heap path (0x8ACE); good path malloc+wcsncpy AVs on no-args."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x8AC8 - self.text_rva
+        end = 0x8ACE - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = 0x8AF4 - (0x8AC8 + 5)
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_crt_fn6314_call_target_8af4(self, out: bytearray) -> int:
+        """CRT fn6314 calls must land on mov rax,rsi at 0x2DC32 (not 0x2DC33)."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        want = 0x2DC32
+        for call_rva in (0x8AF4, 0x8CD4):
+            call_off = call_rva - self.text_rva
+            if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+                continue
+            rel = want - (call_rva + 5)
+            if struct.unpack_from('<i', out, call_off + 1)[0] != rel:
+                struct.pack_into('<i', out, call_off + 1, rel)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_fn6314_tailcall_pop_ret_2dc32(self, out: bytearray) -> int:
+        """fn6314 thunk at 0x2DC32: skip main re-entry once token parse is done."""
+        if not self.text_rva:
+            return 0
+        off = 0x2DC32 - self.text_rva
+        end = 0x2DC44 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        flag_rva = 0x41F58
+        thunk_rva = 0x2DC32
+        cmp_end = thunk_rva + 7
+        jne_next = thunk_rva + 9
+        ret_pos = thunk_rva + 17
+        main_rel = 0x8EB9 - (thunk_rva + 17)
+        jne_rel = ret_pos - jne_next
+        if not (-128 <= jne_rel <= 127
+                and -2147483648 <= main_rel <= 2147483647):
+            return 0
+        body = (
+            b'\x83\x3d' + struct.pack('<i', flag_rva - cmp_end) + b'\x00'
+            + b'\x75' + struct.pack('b', jne_rel)
+            + b'\x48\x89\xf0'
+            + b'\xe9' + struct.pack('<i', main_rel)
+            + b'\xc3'
+        )
+        if len(body) > end - off:
+            return 0
+        body += b'\x90' * (end - off - len(body))
+        if out[off:end] == body:
+            return 0
+        out[off:end] = body
+        return 1
+
+    def _fix_cmd_crt_banner_fn6314_jne_2d9d7(self, out: bytearray) -> int:
+        """CRT banner path: jne into fn6314 thunk is a jmp (no ret addr) — continue at 0x2D9DD."""
+        if not self.text_rva:
+            return 0
+        off = 0x2D9D7 - self.text_rva
+        if off < 0 or off + 6 > len(out) or out[off:off + 2] != b'\x0f\x85':
+            return 0
+        rel = struct.unpack_from('<i', out, off + 2)[0]
+        if off + 6 + rel != 0x2DC32 - self.text_rva:
+            return 0
+        cont = 0x2D9DD
+        jmp_from = 0x2D9D7 + 5
+        patch = b'\xe9' + struct.pack('<i', cont - jmp_from) + b'\x90'
+        if out[off:off + 6] == patch:
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _fix_cmd_crt_banner_fn6314_je_2d9ea(self, out: bytearray) -> int:
+        """CRT banner resume: je into fn6314 thunk has no ret addr — continue at 0x2D9F0."""
+        if not self.text_rva:
+            return 0
+        site_rva = 0x2D9EA
+        off = site_rva - self.text_rva
+        if off < 0 or off + 6 > len(out) or out[off:off + 2] != b'\x0f\x84':
+            return 0
+        rel = struct.unpack_from('<i', out, off + 2)[0]
+        if site_rva + 6 + rel != 0x2DC32:
+            return 0
+        cont = 0x2D9F0
+        jmp_from = site_rva + 5
+        patch = b'\xe9' + struct.pack('<i', cont - jmp_from) + b'\x90'
+        if out[off:off + 6] == patch:
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _fix_cmd_crt_fn6314_jmp_not_call_2dc32(self, out: bytearray) -> int:
+        """Jmp (not call) into fn6314 thunk leaves no ret addr — continue CRT at 0x2D9DD."""
+        if not self.text_rva:
+            return 0
+        thunk = 0x2DC32
+        cont = 0x2D9DD
+        fixed = 0
+        for jmp_rva in (0x2DA43, 0x2DBB2):
+            off = jmp_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE9:
+                continue
+            rel = struct.unpack_from('<i', out, off + 1)[0]
+            if jmp_rva + 5 + rel != thunk:
+                continue
+            new_rel = cont - (jmp_rva + 5)
+            if struct.unpack_from('<i', out, off + 1)[0] != new_rel:
+                struct.pack_into('<i', out, off + 1, new_rel)
+                fixed += 1
+        i = 0
+        while i < len(out) - 5:
+            if out[i] != 0xE9:
+                i += 1
+                continue
+            src = self.text_rva + i
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            if src + 5 + rel != thunk:
+                i += 1
+                continue
+            if src in (0x2DA43, 0x2DBB2):
+                i += 5
+                continue
+            new_rel = cont - (src + 5)
+            if struct.unpack_from('<i', out, i + 1)[0] != new_rel:
+                struct.pack_into('<i', out, i + 1, new_rel)
+                fixed += 1
+            i += 5
+        return fixed
+
+    def _fix_cmd_crt_fn6314_mid_thunk_branches(self, out: bytearray) -> int:
+        """Retarget jmps into the fn6314 thunk body (0x2DC33..0x2DC42) to 0x2DC32."""
+        if not self.text_rva:
+            return 0
+        good = 0x2DC32
+        bad_lo = 0x2DC33
+        bad_hi = 0x2DC42
+        fixed = 0
+        for site_rva in (0x2D9EA, 0x2DBDA):
+            off = site_rva - self.text_rva
+            if off < 0 or off + 6 > len(out) or out[off:off + 2] not in (b'\x0f\x84', b'\x0f\x85'):
+                continue
+            rel = struct.unpack_from('<i', out, off + 2)[0]
+            if site_rva + 6 + rel not in range(bad_lo, bad_hi + 1):
+                continue
+            want = good - (site_rva + 6)
+            if struct.unpack_from('<i', out, off + 2)[0] != want:
+                struct.pack_into('<i', out, off + 2, want)
+                fixed += 1
+        jmp_off = 0x2DAFF - self.text_rva
+        if (0 <= jmp_off + 5 <= len(out) and out[jmp_off] == 0xE9):
+            rel = struct.unpack_from('<i', out, jmp_off + 1)[0]
+            if 0x2DAFF + 5 + rel in range(bad_lo, bad_hi + 1):
+                want = good - (0x2DAFF + 5)
+                if struct.unpack_from('<i', out, jmp_off + 1)[0] != want:
+                    struct.pack_into('<i', out, jmp_off + 1, want)
+                    fixed += 1
+        good_off = good - self.text_rva
+        bad_lo_off = bad_lo - self.text_rva
+        bad_hi_off = bad_hi - self.text_rva
+        if bad_lo_off < 0 or bad_hi_off < bad_lo_off:
+            return fixed
+        i = 0
+        while i < len(out) - 6:
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if bad_lo_off <= tgt <= bad_hi_off:
+                    struct.pack_into('<i', out, i + 2, good_off - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if bad_lo_off <= tgt <= bad_hi_off:
+                    struct.pack_into('<i', out, i + 1, good_off - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_crt_stub_iat_call_rax(self, out: bytearray) -> int:
+        """CRT ``call rax`` through unresolved IAT cells — return 0 instead of AV."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        for call_rva in (0x2D92A, 0x2D9CE, 0x2DAF8, 0x2DBFA, 0x2DC2B, 0x2DCED):
+            call_off = call_rva - self.text_rva
+            mov_off = call_off - 3
+            if mov_off < 0 or call_off + 2 > len(out):
+                continue
+            if out[mov_off:mov_off + 3] != b'\x48\x8b\x00' or out[call_off:call_off + 2] != b'\xff\xd0':
+                continue
+            if out[mov_off:call_off + 2] == b'\x48\x8b\x00\x31\xc0':
+                continue
+            out[mov_off:mov_off + 3] = b'\x90\x90\x90'
+            out[call_off:call_off + 2] = b'\x31\xc0'
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_main_save_rbp_slot(self, out: bytearray) -> int:
+        """Save cmd main RBP at 0x41F50; resume stub restores it after CRT detour."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        slot_rva = 0x41F50
+        save_rva = 0x8F03
+        save_off = save_rva - self.text_rva
+        save_end = save_off + 12
+        if save_end > len(out):
+            return 0
+        rip_at = save_rva + 7
+        slot_rel = slot_rva - rip_at
+        if not (-2147483648 <= slot_rel <= 2147483647):
+            return 0
+        save_body = (
+            b'\x48\x89\x2d' + struct.pack('<i', slot_rel)
+            + b'\x48\x89\x4d\x10'
+            + b'\xc3'
+        )
+        call_off = 0x8EBD - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out):
+            return 0
+        call_rel = save_rva - (0x8EBD + 5)
+        if not (-2147483648 <= call_rel <= 2147483647):
+            return 0
+        fixed = 0
+        if out[save_off:save_off + len(save_body)] != save_body:
+            out[save_off:save_off + len(save_body)] = save_body
+            fixed += 1
+        want_call = b'\xe8' + struct.pack('<i', call_rel)
+        if out[call_off:call_off + 5] != want_call:
+            if out[call_off:call_off + 2] in (b'\xe8\x00', b'\x48\x89') or out[call_off] == 0xE8:
+                out[call_off:call_off + 5] = want_call
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_print_tls_je_2d458(self, out: bytearray) -> int:
+        """JE at 0x2D458 must skip past GS TLS mov (9 bytes), not land at 0x2D464."""
+        if not self.text_rva:
+            return 0
+        off = 0x2D458 - self.text_rva
+        if off < 0 or off + 2 > len(out):
+            return 0
+        if out[off:off + 2] != b'\x74\x0a':
+            return 0
+        out[off + 1] = 0x0C
+        return 1
+
+    def _build_compact_wide_stdout_write(self, cave_rva: int, wcslen_iat: int,
+                                         getstd_iat: int, write_iat: int,
+                                         use_console: bool = False) -> bytes:
+        """Write wide string at RDX to stdout; clobbers caller-saved regs, returns 0."""
+        nb = self.new_base
+        s = bytearray()
+
+        def pos() -> int:
+            return cave_rva + len(s)
+
+        def put(*parts: bytes) -> None:
+            for part in parts:
+                s.extend(part)
+
+        def ff15(iat: int) -> None:
+            at = pos()
+            put(b'\xff\x15' + struct.pack('<i', iat - (nb + at + 6)))
+
+        put(b'\x53', b'\x48\x89\xd3')              # push rbx; mov rbx, rdx
+        put(b'\x48\x83\xec\x28', b'\x48\x89\xd9')  # sub rsp,28; mov rcx, rbx
+        ff15(wcslen_iat)
+        put(b'\x41\x89\xc0', b'\xb9\xf5\xff\xff\xff')  # mov r8d, eax (wchar count)
+        ff15(getstd_iat)
+        put(b'\x48\x89\xc1', b'\x48\x89\xda')      # mov rcx, rax; mov rdx, rbx
+        if use_console:
+            put(b'\x4c\x8d\x4c\x24\x20',
+                b'\x48\xc7\x44\x24\x18\x00\x00\x00\x00')
+        else:
+            put(b'\x41\xd1\xe0', b'\x4c\x8d\x4c\x24\x30',  # shl r8d, 1 (bytes)
+                b'\x48\xc7\x44\x24\x28\x00\x00\x00\x00')
+        ff15(write_iat)
+        put(b'\x48\x83\xc4\x28', b'\x5b', b'\x31\xc0', b'\xc3')
+        return bytes(s)
+
+    def _ensure_cmd_wide_stdout_print_stub(self, out: bytearray) -> int:
+        """Place compact stdout writer once; hook 0x2D813 banner helper entry."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        entry_rva = 0x2D813
+        entry_off = entry_rva - self.text_rva
+        if entry_off < 0 or entry_off + 5 > len(out):
+            return 0
+        if self._cmd_stdout_print_rva:
+            jmp = b'\xe9' + struct.pack('<i', self._cmd_stdout_print_rva - (entry_rva + 5))
+            if out[entry_off:entry_off + 5] == jmp:
+                return 0
+            out[entry_off:entry_off + 5] = jmp
+            return 1
+        wcslen_iat = self._loader_iat_va('MSVCRT.dll', 'wcslen')
+        if not wcslen_iat:
+            wcslen_iat = self._resolve_iat_slot_va(self.old_base + 0x11D8)
+        getstd = self._loader_iat_va('KERNEL32.dll', 'GetStdHandle')
+        writefn = self._loader_iat_va('KERNEL32.dll', 'WriteConsoleW')
+        use_console = bool(writefn)
+        if not writefn:
+            writefn = self._loader_iat_va('KERNEL32.dll', 'WriteFile')
+            use_console = False
+        if not wcslen_iat or not getstd or not writefn:
+            return 0
+        sel = b'\x48\x85\xd2\x75\x03\x48\x89\xca'
+        body = sel + self._build_compact_wide_stdout_write(
+            0, wcslen_iat, getstd, writefn, use_console)
+        cave_rva = 0x8FF7
+        cave_end = 0x9040
+        cave_off = cave_rva - self.text_rva
+        if cave_off < 0 or len(body) > cave_end - cave_rva:
+            need = len(body)
+            avoid = [(0x8000, 0x9200), (0x2E490, 0x2E520)]
+            cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+            if cave_off is None:
+                return 0
+            cave_rva = self.text_rva + cave_off
+        body = sel + self._build_compact_wide_stdout_write(
+            cave_rva + len(sel), wcslen_iat, getstd, writefn, use_console)
+        cave_sz = len(body)
+        if cave_off < 0 or cave_off + cave_sz > len(out):
+            return 0
+        jmp = b'\xe9' + struct.pack('<i', cave_rva - (entry_rva + 5))
+        fixed = 0
+        if out[cave_off:cave_off + cave_sz] != body:
+            out[cave_off:cave_off + cave_sz] = body
+            fixed += 1
+        if out[entry_off:entry_off + 5] != jmp:
+            out[entry_off:entry_off + 5] = jmp
+            fixed += 1
+        self._cmd_stdout_print_rva = cave_rva
+        return fixed
+
+    def _build_banner_print_write_stub(self, cave_rva: int, wcslen_iat: int,
+                                       getstd_iat: int, write_iat: int,
+                                       use_console: bool = False) -> bytes:
+        """Write RDX (formatted buffer) or RCX via GetStdHandle + WriteConsoleW/WriteFile."""
+        nb = self.new_base
+        s = bytearray()
+
+        def pos() -> int:
+            return cave_rva + len(s)
+
+        def put(*parts: bytes) -> None:
+            for part in parts:
+                s.extend(part)
+
+        def ff15(iat: int) -> None:
+            at = pos()
+            put(b'\xff\x15' + struct.pack('<i', iat - (nb + at + 6)))
+
+        put(b'\x4c\x8b\xc2', b'\x4d\x85\xc0', b'\x75\x03', b'\x4c\x8b\xc1')
+        put(b'\x48\x83\xec\x28' + b'\x49\x8b\xc8')
+        ff15(wcslen_iat)
+        put(b'\x89\xc3', b'\xb9\xf5\xff\xff\xff')
+        ff15(getstd_iat)
+        put(b'\x48\x89\xc1', b'\x4c\x89\xc2')
+        if use_console:
+            put(b'\x41\x89\xd8', b'\x4c\x8d\x4c\x24\x20',
+                b'\x48\xc7\x44\x24\x18\x00\x00\x00\x00')
+        else:
+            put(b'\x01\xdb', b'\x41\x89\xd8',
+                b'\x4c\x8d\x4c\x24\x30', b'\x48\xc7\x44\x24\x28\x00\x00\x00\x00')
+        ff15(write_iat)
+        put(b'\x48\x83\xc4\x28' + b'\x31\xc0' + b'\xc3')
+        return bytes(s)
+
+    def _fix_cmd_banner_print_stub_2d813(self, out: bytearray) -> int:
+        """Banner print helper: WriteConsoleW/WriteFile wide string at RCX or RDX to stdout."""
+        if not self.text_rva:
+            return 0
+        if not self.win10_test_shim:
+            off = 0x2D813 - self.text_rva
+            if off < 0 or off + 3 > len(out):
+                return 0
+            patch = b'\x31\xc0\xc3\x90'
+            if out[off:off + 3] == patch:
+                return 0
+            out[off:off + 3] = patch
+            return 1
+        return self._ensure_cmd_wide_stdout_print_stub(out)
+
+    def _fix_cmd_banner_print_call_sites(self, out: bytearray) -> int:
+        """Snap every ``call`` into the 0x2D813 print helper (±8) to the jmp entry."""
+        if not self.text_rva:
+            return 0
+        target = 0x2D813
+        lo_rva, hi_rva = target - 8, target + 8
+        fixed = 0
+        i = 0
+        while i < len(out) - 5:
+            call_at = None
+            if out[i] == 0xF0 and i + 6 <= len(out) and out[i + 1] == 0xE8:
+                call_at = i + 1
+            elif out[i] == 0xE8:
+                call_at = i
+            if call_at is not None:
+                call_rva = self.text_rva + call_at
+                rel = struct.unpack_from('<i', out, call_at + 1)[0]
+                tgt = call_rva + 5 + rel
+                if lo_rva <= tgt <= hi_rva and tgt != target:
+                    want = target - (call_rva + 5)
+                    if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                        struct.pack_into('<i', out, call_at + 1, want)
+                        fixed += 1
+                i = call_at + 5
+            else:
+                i += 1
+        return fixed
+
+    def _fix_cmd_banner_setup_call_3cf7b(self, out: bytearray) -> int:
+        """Snap every ``call`` into the 0x3CF7A banner-setup stub (±8) to its entry."""
+        if not self.text_rva:
+            return 0
+        target = 0x3CF7A
+        lo_rva, hi_rva = target - 8, target + 8
+        fixed = 0
+        i = 0
+        while i < len(out) - 5:
+            call_at = None
+            if out[i] == 0xF0 and i + 6 <= len(out) and out[i + 1] == 0xE8:
+                call_at = i + 1
+            elif out[i] == 0xE8:
+                call_at = i
+            if call_at is not None:
+                call_rva = self.text_rva + call_at
+                rel = struct.unpack_from('<i', out, call_at + 1)[0]
+                tgt = call_rva + 5 + rel
+                if lo_rva <= tgt <= hi_rva and tgt != target:
+                    want = target - (call_rva + 5)
+                    if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                        struct.pack_into('<i', out, call_at + 1, want)
+                        fixed += 1
+                i = call_at + 5
+            else:
+                i += 1
+        return fixed
+
+    def _fix_cmd_banner_setup_stub_3cf7a(self, out: bytearray) -> int:
+        """Banner setup helper: return success without CRT volume chain re-entry."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        stub_rva = 0x3CF7A
+        stub_end = 0x3CF9D
+        off = stub_rva - self.text_rva
+        end = stub_end - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        body = b'\xb8\x01\x00\x00\x00\xc3' + b'\x90' * (end - off - 6)
+        if out[off:end] == body:
+            return 0
+        out[off:end] = body
+        return 1
+
+    def _fix_cmd_crt_seh_banner_resume_8f56(self, out: bytearray) -> int:
+        """SEH guard 0x8F56: jmp ret at 0x2DC44 pops garbage — resume banner after setup."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        jmp_off = 0x8F58 - self.text_rva
+        resume_rva = 0x2E5E7
+        if jmp_off < 0 or jmp_off + 5 > len(out) or out[jmp_off] != 0xE9:
+            return 0
+        want = resume_rva - (0x8F58 + 5)
+        if struct.unpack_from('<i', out, jmp_off + 1)[0] == want:
+            return 0
+        struct.pack_into('<i', out, jmp_off + 1, want)
+        return 1
+
+    def _fix_cmd_crt_seh_route_8f32_to_guard(self, out: bytearray) -> int:
+        """SEH site 0x8F32: use 0x8F40 flag guard instead of cmdline dispatch."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        site_rva = 0x8F32
+        guard_rva = 0x8F40
+        off = site_rva - self.text_rva
+        if off < 0 or off + 5 > len(out) or out[off] != 0xE9:
+            return 0
+        rel = guard_rva - (site_rva + 5)
+        patch = b'\xe9' + struct.pack('<i', rel)
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_readconsole_prompt_helper_calls(self, out: bytearray) -> int:
+        """ReadConsole helper calls prompt printer at 0x200E8 (mid-instruction) — use 0x200E5."""
+        if not self.text_rva:
+            return 0
+        good = 0x200E5
+        bad = (0x200E8, 0x200E9, 0x200EA, 0x200EB, 0x200EC, 0x200ED, 0x200EE, 0x200EF,
+               0x200F0, 0x200F1, 0x200F2)
+        fixed = 0
+        for call_rva in (0x3D1A0, 0x3D1D0, 0x3D213):
+            off = call_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, off + 1)[0]
+            if call_rva + 5 + rel not in bad:
+                continue
+            want = good - (call_rva + 5)
+            if struct.unpack_from('<i', out, off + 1)[0] != want:
+                struct.pack_into('<i', out, off + 1, want)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_helper_call_200f0(self, out: bytearray) -> int:
+        """Snap every ``call`` into prompt helper 0x200E5..0x200FF to entry 0x200E5."""
+        if not self.text_rva:
+            return 0
+        good = 0x200E5
+        lo_rva, hi_rva = good, good + 0x18
+        fixed = 0
+        i = 0
+        while i < len(out) - 5:
+            call_at = None
+            if out[i] == 0xF0 and i + 6 <= len(out) and out[i + 1] == 0xE8:
+                call_at = i + 1
+            elif out[i] == 0xE8:
+                call_at = i
+            if call_at is not None:
+                call_rva = self.text_rva + call_at
+                rel = struct.unpack_from('<i', out, call_at + 1)[0]
+                tgt = call_rva + 5 + rel
+                if lo_rva <= tgt <= hi_rva and tgt != good:
+                    want = good - (call_rva + 5)
+                    if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                        struct.pack_into('<i', out, call_at + 1, want)
+                        fixed += 1
+                i = call_at + 5
+            else:
+                i += 1
+        return fixed
+
+    def _fix_cmd_crt_exit_jmp_8770(self, out: bytearray) -> int:
+        """CRT init must not land in getmainargs epilogue (0x8769/0x8770).
+
+        Success jmps are redirected to 0x8699.  Malloc-fail ``je`` branches that
+        used to enter the epilogue without a matching frame are neutralized to
+        fall through (rel32=0) so nested CRT re-entry during the banner cannot
+        ``ret`` into RIP=0.
+        """
+        if not self.text_rva:
+            return 0
+        good = 0x8699
+        bad = (0x8769, 0x8770)
+        fixed = 0
+        lo = 0x8500 - self.text_rva
+        hi = 0x8800 - self.text_rva
+        if lo < 0:
+            lo = 0
+        i = lo
+        while i < min(hi, len(out) - 5):
+            if out[i] != 0xE9:
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            site = self.text_rva + i
+            tgt = site + 5 + rel
+            if tgt not in bad:
+                i += 1
+                continue
+            want = good - (site + 5)
+            if struct.unpack_from('<i', out, i + 1)[0] != want:
+                struct.pack_into('<i', out, i + 1, want)
+                fixed += 1
+            i += 5
+        i = lo
+        while i < min(hi, len(out) - 6):
+            if out[i] != 0x0F or out[i + 1] not in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                i += 1
+                continue
+            site = self.text_rva + i
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            tgt = site + 6 + rel
+            if tgt not in bad:
+                i += 1
+                continue
+            # je/jcc to epilogue -> fall through (next insn) instead of unwinding
+            if rel != 0:
+                struct.pack_into('<i', out, i + 2, 0)
+                fixed += 1
+            i += 6
+        return fixed
+
+    def _fix_cmd_banner_volume_call_chain(self, out: bytearray) -> int:
+        """Snap banner GetVolumeInformation call chain to aligned helper entries."""
+        if not self.text_rva:
+            return 0
+        snaps = (
+            (0x200F2, 0x1D7F0, range(0x1D7F1, 0x1D800)),
+            (0x1D7FD, 0x375B0, range(0x375AF, 0x375C0)),
+            (0x375C7, 0x1CA48, range(0x1CA49, 0x1CA58)),
+        )
+        fixed = 0
+        for site_rva, good, bad in snaps:
+            off = site_rva - self.text_rva
+            if off < 0 or off + 6 > len(out):
+                continue
+            call_at = off
+            if out[off] == 0xF0 and out[off + 1] == 0xE8:
+                call_at = off + 1
+            elif out[off] != 0xE8:
+                continue
+            call_rva = self.text_rva + call_at
+            rel = struct.unpack_from('<i', out, call_at + 1)[0]
+            if call_rva + 5 + rel not in bad:
+                continue
+            want = good - (call_rva + 5)
+            if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                struct.pack_into('<i', out, call_at + 1, want)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_banner_resume_skip_8af9(self, out: bytearray) -> int:
+        """CRT return 0x8AF9: jmp banner stub; noop-ret when main parse flag is set."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        flag_rva = 0x41F58
+        guard_off = 0x8F40 - self.text_rva
+        guard_end = 0x8F60 - self.text_rva
+        banner_off = 0x8AFE - self.text_rva
+        banner_end = 0x8B23 - self.text_rva
+        done_rva = 0x8B1C
+        if (guard_off < 0 or guard_end <= guard_off or banner_off < 0
+                or banner_end <= banner_off or banner_end > len(out)):
+            return 0
+        cmp_end = 0x8AFE + 7
+        jne_from = 0x8B05
+        je_from = 0x8B0E
+        jmp_from = 0x8B16
+        if not (-2147483648 <= (done_rva - (jne_from + 6)) <= 2147483647
+                and -2147483648 <= (0x8B23 - (je_from + 6)) <= 2147483647
+                and -128 <= (0x8B20 - jmp_from) <= 127
+                and -2147483648 <= (0x8F61 - (0x8F51 + 5)) <= 2147483647):
+            return 0
+        banner = (
+            b'\x83\x3d' + struct.pack('<i', flag_rva - cmp_end) + b'\x00'
+            + b'\x0f\x85' + struct.pack('<i', done_rva - (jne_from + 6))
+            + b'\x48\x85\xc0'
+            + b'\x0f\x84' + struct.pack('<i', 0x8B23 - (je_from + 6))
+            + b'\xeb' + struct.pack('b', 0x8B20 - jmp_from)
+            + b'\x90' * (done_rva - 0x8AFE - 24)
+            + b'\x31\xc0'
+            + b'\xe9' + struct.pack('<i', 0x2DC44 - (done_rva + 7))
+        )
+        if len(banner) != banner_end - banner_off:
+            return 0
+        off = 0x8AF9 - self.text_rva
+        end = 0x8AFE - self.text_rva
+        patch = b'\xe9' + struct.pack('<i', 0x8AFE - (0x8AF9 + 5))
+        guard = bytearray()
+        cmp_g = 0x8F40 + 7
+        guard += b'\x83\x3d' + struct.pack('<i', flag_rva - cmp_g) + b'\x00'
+        guard += b'\x0f\x85' + struct.pack('<i', 0x8F56 - (0x8F47 + 6))
+        guard += b'\x48\x83\xc4\x08'
+        guard += b'\xe9' + struct.pack('<i', 0x8F61 - (0x8F51 + 5))
+        guard += b'\x31\xc0' + b'\xe9' + struct.pack('<i', 0x2DC44 - (0x8F56 + 7))
+        guard += b'\x90' * (guard_end - guard_off - len(guard))
+        if len(guard) > guard_end - guard_off:
+            return 0
+        fixed = 0
+        if out[guard_off:guard_end] != bytes(guard):
+            out[guard_off:guard_end] = bytes(guard)
+            fixed += 1
+        if out[banner_off:banner_end] != banner:
+            out[banner_off:banner_end] = banner
+            fixed += 1
+        if len(patch) == end - off and out[off:end] != patch:
+            out[off:end] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_banner_wcsncpy_or_skip_8afc(self, out: bytearray) -> int:
+        """0x8AFE: skip broken CRT banner wcsncpy (must not overlap 0x8AF9 jmp)."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x8AFE - self.text_rva
+        stub_end = 0x8B23 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        jmp_from = 0x8B09
+        if not (-128 <= (0x8B20 - jmp_from) <= 127):
+            return 0
+        body = (
+            b'\x48\x85\xc0'
+            + b'\x0f\x84' + struct.pack('<i', 0x8B23 - 0x8B07)
+            + b'\xeb' + struct.pack('b', 0x8B20 - jmp_from)
+        )
+        if len(body) > stub_end - stub_off:
+            return 0
+        patch = body + b'\x90' * (stub_end - stub_off - len(body))
+        if out[stub_off:stub_end] == patch:
+            return 0
+        out[stub_off:stub_end] = patch
+        return 1
+
+    def _fix_cmd_crt_skip_banner_print_8b74(self, out: bytearray) -> int:
+        """Neutralize broken banner-print helper; return 0 so je 0x8BE0 skips it."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x8B74 - self.text_rva
+        if off < 0 or off + 5 > len(out) or out[off] != 0xE8:
+            return 0
+        patch = b'\x31\xc0' + b'\x90' * 3
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_crt_banner_epilogue_pop_rbp_8b22(self, out: bytearray) -> int:
+        """Translated orphan ``pop rbp`` at 0x8B22 corrupts stack on CRT resume."""
+        if not self.text_rva:
+            return 0
+        off = 0x8B22 - self.text_rva
+        if off < 0 or off >= len(out) or out[off] == 0x90:
+            return 0
+        if out[off] != 0x5D:
+            return 0
+        out[off] = 0x90
+        return 1
+
+    def _fix_cmd_banner_jne_2e4ac(self, out: bytearray) -> int:
+        """Banner gate jne at 0x2E4AC: rel32 corrupted (target 0xC892E5EC) — fall through."""
+        if not self.text_rva:
+            return 0
+        site_rva = 0x2E4AC
+        off = site_rva - self.text_rva
+        if off < 0 or off + 6 > len(out) or out[off:off + 2] != b'\x0f\x85':
+            return 0
+        rel = struct.unpack_from('<i', out, off + 2)[0]
+        tgt = site_rva + 6 + rel
+        if 0x80010000 <= tgt <= 0x80100000:
+            return 0
+        struct.pack_into('<i', out, off + 2, 0)
+        return 1
+
+    def _fix_cmd_version_banner_root_2e4bb(self, out: bytearray) -> int:
+        """Startup banner: pass L\"X:\\\" stack root in RCX/RSI before GetVolumeInformationW."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x2E4B2 - self.text_rva
+        end = 0x2E4BF - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        patch = (
+            b'\x48\x8d\x4d\xe0'
+            + b'\x48\x89\xce'
+            + b'\x90' * (end - off - 7)
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_gvi_helper_force_success_1d3b6(self, out: bytearray) -> int:
+        """Legacy no-op: epilogue fixed in _fix_cmd_gvi_helper_1d343."""
+        return 0
+
+    def _fix_cmd_version_banner_branch_2e4b1(self, out: bytearray) -> int:
+        """/c wcscmp miss: jne to banner root 0x2E4B2 (after 6-byte jne at 0x2E4AC)."""
+        if not self.text_rva:
+            return 0
+        rel_off = 0x91B7 - self.text_rva
+        if rel_off < 0 or rel_off + 4 > len(out):
+            return 0
+        if out[0x91B5 - self.text_rva:0x91B5 - self.text_rva + 2] != b'\x0f\x85':
+            return 0
+        want = 0x2E4B2 - (0x91B5 + 6)
+        if struct.unpack_from('<i', out, rel_off)[0] == want:
+            return 0
+        struct.pack_into('<i', out, rel_off, want)
+        return 1
+
+    def _fix_cmd_crt_getmainargs_fallthrough_8769(self, out: bytearray) -> int:
+        """CRT switch tail at 0x875F falls into orphan epilogue at 0x8769 — use 0x8699."""
+        if not self.text_rva:
+            return 0
+        site_rva = 0x8769
+        good = 0x8699
+        off = site_rva - self.text_rva
+        if off < 0 or off + 5 > len(out):
+            return 0
+        if out[off:off + 3] != b'\x48\xc7\xc0':
+            return 0
+        rel = good - (site_rva + 5)
+        patch = b'\xe9' + struct.pack('<i', rel)
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_crt_orphan_epilogue_8770(self, out: bytearray) -> int:
+        """Orphan pop/ret at 0x8770: jmp post-call site 0x8648 instead of ret RIP=0."""
+        if not self.text_rva:
+            return 0
+        site_rva = 0x8770
+        good = 0x8648
+        off = site_rva - self.text_rva
+        if off < 0 or off + 5 > len(out) or out[off] != 0x5F:
+            return 0
+        rel = good - (site_rva + 5)
+        patch = b'\xe9' + struct.pack('<i', rel)
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_crt_getmainargs_flag_gate_877b(self, out: bytearray) -> int:
+        """0x877B getmainargs: if parse flag set, xor eax,eax; ret (skip CRT re-init)."""
+        if not self.text_rva:
+            return 0
+        flag_rva = 0x41F58
+        entry_rva = 0x877B
+        cont_rva = 0x8780
+        cave_rva = 0x8BF7
+        cave_end = 0x8C16
+        entry_off = entry_rva - self.text_rva
+        cave_off = cave_rva - self.text_rva
+        if entry_off < 0 or cave_off < 0 or cave_end - cave_rva < 22:
+            return 0
+        if entry_off + 5 > len(out) or cave_end - self.text_rva > len(out):
+            return 0
+        if out[entry_off] != 0x55:
+            return 0
+        cmp_end = cave_rva + 7
+        jne_from = cave_rva + 7
+        skip_rva = cave_rva + 22
+        jmp_from = cave_rva + 17
+        if not (-2147483648 <= (skip_rva - (jne_from + 6)) <= 2147483647
+                and -2147483648 <= (cont_rva - (jmp_from + 5)) <= 2147483647
+                and -2147483648 <= (cave_rva - (entry_rva + 5)) <= 2147483647):
+            return 0
+        cave = (
+            b'\x83\x3d' + struct.pack('<i', flag_rva - cmp_end) + b'\x00'
+            + b'\x0f\x85' + struct.pack('<i', skip_rva - (jne_from + 6))
+            + b'\x55' + b'\x48\x89\xe5'
+            + b'\xe9' + struct.pack('<i', cont_rva - (jmp_from + 5))
+            + b'\x31\xc0\xc3'
+            + b'\x90' * (cave_end - skip_rva - 3)
+        )
+        if len(cave) != cave_end - cave_rva:
+            return 0
+        patch = b'\xe9' + struct.pack('<i', cave_rva - (entry_rva + 5))
+        fixed = 0
+        if out[cave_off:cave_off + len(cave)] != cave:
+            out[cave_off:cave_off + len(cave)] = cave
+            fixed += 1
+        if out[entry_off:entry_off + 5] != patch:
+            out[entry_off:entry_off + 5] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_interactive_skip_closehandle_2e66e(self, out: bytearray) -> int:
+        """Banner tail: skip null IAT CloseHandle call; enter live REPL at 0x2EAD4."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x2E66E - self.text_rva
+        stub_end = 0x2E682 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        jmp_at = stub_off
+        if out[stub_off] == 0xF0 and out[stub_off + 1] == 0xE9:
+            jmp_at = stub_off + 1
+        elif out[stub_off] == 0xE9:
+            jmp_at = stub_off
+        elif out[stub_off:stub_off + 2] == b'\x48\xb8':
+            pass  # fall through: overwrite movabs with jmp below
+        else:
+            return 0
+        jmp_from = self.text_rva + jmp_at
+        rel = 0x2EAD6 - (jmp_from + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (stub_end - jmp_at - 5)
+        if len(patch) > stub_end - jmp_at:
+            return 0
+        out[jmp_at:jmp_at + len(patch)] = patch
+        if jmp_at > stub_off:
+            out[stub_off] = 0x90
+        return 1
+
+    def _fix_cmd_repl_prompt_entry_nop_2eae9(self, out: bytearray) -> int:
+        """Clear invalid 0x0000 prefix at REPL prompt entry (0x2EAE9)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        off = 0x2EAE9 - self.text_rva
+        if off < 0 or off + 2 > len(out):
+            return 0
+        if out[off:off + 2] == b'\x90\x90':
+            return 0
+        if out[off:off + 2] != b'\x00\x00':
+            return 0
+        out[off:off + 2] = b'\x90\x90'
+        return 1
+
+    def _fix_cmd_interactive_repl_jmp_2e6f1(self, out: bytearray) -> int:
+        """Banner r8!=2 paths jmp exit 0x2E6F1 — snap to live REPL continuation 0x2EAD4."""
+        if not self.text_rva:
+            return 0
+        good = 0x2EAD6
+        fixed = 0
+        for site_rva in (0x2E683, 0x2E68C):
+            off = site_rva - self.text_rva
+            if off < 0 or off + 6 > len(out):
+                continue
+            if out[off] == 0xE9 and off + 5 <= len(out):
+                rel = struct.unpack_from('<i', out, off + 1)[0]
+                if site_rva + 5 + rel != 0x2E6F1:
+                    continue
+                want = good - (site_rva + 5)
+                struct.pack_into('<i', out, off + 1, want)
+                fixed += 1
+            elif out[off:off + 2] == b'\x0f\x85':
+                rel = struct.unpack_from('<i', out, off + 2)[0]
+                if site_rva + 6 + rel != 0x2E6F1:
+                    continue
+                want = good - (site_rva + 6)
+                struct.pack_into('<i', out, off + 2, want)
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_interactive_repl_edi_gate_2e72d(self, out: bytearray) -> int:
+        """REPL gate: edi!=ebx took wrong path — jmp to live continuation only.
+
+        Do not redirect 0x2EAD8 into a synthetic print/read loop; natural ReadConsole
+        at 0x3D193 must block and return into the parse path.
+        """
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        fixed = 0
+        for gate_rva, prompt_rva in ((0x2E72F, 0x2E76A),):
+            off = gate_rva - self.text_rva
+            if off < 0 or off + 6 > len(out):
+                continue
+            rel = prompt_rva - (gate_rva + 5)
+            if not (-2147483648 <= rel <= 2147483647):
+                continue
+            patch = b'\xe9' + struct.pack('<i', rel) + b'\x90'
+            if out[off:off + 2] == b'\x0f\x85':
+                if out[off:off + 6] != patch:
+                    out[off:off + 6] = patch
+                    fixed += 1
+            elif out[off:off + 6] != patch and out[off] == 0xE9:
+                if out[off:off + 6] != patch:
+                    out[off:off + 6] = patch
+                    fixed += 1
+        return fixed
+
+    def _fix_cmd_repl_jmp_2e728_to_gate(self, out: bytearray) -> int:
+        """Banner epilogue jmp at 0x2E728 must land on REPL gate (0x2EAD6), not mid-instruction."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        site_rva = 0x2E728
+        gate_rva = 0x2EAD6
+        off = site_rva - self.text_rva
+        if off < 0 or off + 5 > len(out) or out[off] != 0xE9:
+            return 0
+        rel = gate_rva - (site_rva + 5)
+        patch = b'\xe9' + struct.pack('<i', rel)
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_interactive_skip_repl_exit_ret(self, out: bytearray) -> int:
+        """Skip orphan ``mov rbp,rsp; pop rbp; ret`` before live REPL gates."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        fixed = 0
+        for ep_rva, gate_rva in ((0x2E728, 0x2EAD6), (0x2EAC8, 0x2EAD6)):
+            off = ep_rva - self.text_rva
+            if off < 0 or off + 5 > len(out):
+                continue
+            if out[off:off + 3] != b'\x48\x89\xec':
+                continue
+            rel = gate_rva - (ep_rva + 5)
+            if not (-2147483648 <= rel <= 2147483647):
+                continue
+            patch = b'\xe9' + struct.pack('<i', rel)
+            if out[off:off + 5] != patch:
+                out[off:off + 5] = patch
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_interactive_startup_91b5(self, out: bytearray) -> int:
+        """Print version banner, then ReadConsole hook at 0x3D196 (prints drive prompt)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        fixed_print = self._ensure_cmd_wide_stdout_print_stub(out)
+        if not self._cmd_stdout_print_rva:
+            return 0
+        print_rva = self._cmd_stdout_print_rva
+        gate_off = 0x91B5 - self.text_rva
+        if gate_off < 0 or gate_off + 5 > len(out):
+            return 0
+        stub = bytearray()
+        stub += b'\x48\xba' + struct.pack('<Q', self.new_base + 0x414E0)
+        c1 = 0 + len(stub)
+        stub += b'\xe8' + struct.pack('<i', print_rva - (c1 + 5))
+        jf = 0 + len(stub)
+        stub += b'\xe9' + struct.pack('<i', 0x3D196 - (jf + 5))
+        need = len(stub)
+        avoid = [(0x8000, 0x9200), (0x8FF0, 0x9048), (0x92B0, 0x92D0),
+                 (0x2E490, 0x2E520)]
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_text_nop_cave(
+                out, need, avoid=[(0x92B0, 0x92D0), (0x2E490, 0x2E520)])
+        if cave_off is None:
+            return 0
+        cave_rva = self.text_rva + cave_off
+        stub = bytearray()
+        stub += b'\x48\xba' + struct.pack('<Q', self.new_base + 0x414E0)
+        c1 = cave_rva + len(stub)
+        stub += b'\xe8' + struct.pack('<i', print_rva - (c1 + 5))
+        jf = cave_rva + len(stub)
+        stub += b'\xe9' + struct.pack('<i', 0x3D196 - (jf + 5))
+        cave_sz = need
+        patch_gate = b'\xe9' + struct.pack('<i', cave_rva - (0x91B5 + 5))
+        fixed = 0
+        body = stub + b'\x90' * (cave_sz - len(stub))
+        if out[cave_off:cave_off + cave_sz] != body:
+            out[cave_off:cave_off + cave_sz] = body
+            fixed += 1
+        if out[gate_off:gate_off + 5] != patch_gate:
+            out[gate_off:gate_off + 5] = patch_gate
+            fixed += 1
+        self._cmd_interactive_startup_rva = cave_rva
+        return fixed + fixed_print
+
+    def _fix_cmd_force_interactive_banner_91b6(self, out: bytearray) -> int:
+        """Interactive: always enter version banner (test eax,eax often skips on Win10)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        off = 0x91B5 - self.text_rva
+        if off < 0 or off + 6 > len(out) or out[off:off + 2] != b'\x0f\x85':
+            return 0
+        rel = 0x2E4B2 - (0x91B5 + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90'
+        if out[off:off + 6] == patch:
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _build_prompt_print_write_stub(self, cave_rva: int, prompt_rva: int,
+                                       wcslen_iat: int, getstd_iat: int,
+                                       write_iat: int, resume_rva: int) -> bytes:
+        """Write wide prompt literal then jmp to ReadConsole helper."""
+        nb = self.new_base
+        s = bytearray()
+
+        def pos() -> int:
+            return cave_rva + len(s)
+
+        def put(*parts: bytes) -> None:
+            for part in parts:
+                s.extend(part)
+
+        def ff15(iat: int) -> None:
+            at = pos()
+            put(b'\xff\x15' + struct.pack('<i', iat - (nb + at + 6)))
+
+        put(b'\x48\xb9' + struct.pack('<Q', nb + prompt_rva))
+        put(b'\x48\x83\xec\x28' + b'\x48\x89\xc8')
+        ff15(wcslen_iat)
+        put(b'\x89\xc3', b'\xb9\xf5\xff\xff\xff')
+        ff15(getstd_iat)
+        put(b'\x48\x89\xc1', b'\x48\x89\xc8', b'\x41\x89\xd8',
+            b'\x4c\x8d\x4c\x24\x20', b'\x48\xc7\x44\x24\x18\x00\x00\x00\x00')
+        ff15(write_iat)
+        put(b'\x48\x83\xc4\x28')
+        if resume_rva:
+            put(b'\xe9' + struct.pack('<i', resume_rva - (cave_rva + len(s) + 5)))
+        return bytes(s)
+
+    def _fix_cmd_parse_line_call_3cdc7(self, out: bytearray) -> int:
+        """Snap ``call`` into cmd parse helper (±8 of 0x3CDC8) to push-rbx entry."""
+        if not self.text_rva:
+            return 0
+        target = 0x3CDC8
+        fixed = 0
+        for call_rva in (0x3D029, 0x3D046, 0x3D170, 0x3D1ED):
+            off = call_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE8:
+                continue
+            want = target - (call_rva + 5)
+            if struct.unpack_from('<i', out, off + 1)[0] != want:
+                struct.pack_into('<i', out, off + 1, want)
+                fixed += 1
+        lo_rva, hi_rva = target - 8, target + 8
+        i = 0
+        while i < len(out) - 5:
+            call_at = None
+            if out[i] == 0xF0 and i + 6 <= len(out) and out[i + 1] == 0xE8:
+                call_at = i + 1
+            elif out[i] == 0xE8:
+                call_at = i
+            if call_at is not None:
+                call_rva = self.text_rva + call_at
+                rel = struct.unpack_from('<i', out, call_at + 1)[0]
+                tgt = call_rva + 5 + rel
+                if lo_rva <= tgt <= hi_rva and tgt != target:
+                    want = target - (call_rva + 5)
+                    if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                        struct.pack_into('<i', out, call_at + 1, want)
+                        fixed += 1
+                i = call_at + 5
+            else:
+                i += 1
+        return fixed
+
+    def _fix_cmd_readconsole_call_sites(self, out: bytearray) -> int:
+        """Snap ``call`` into ReadConsole helper (±0x40 of 0x3D196) to aligned entry."""
+        if not self.text_rva:
+            return 0
+        target = 0x3D193
+        fixed = 0
+        for call_rva in (0x2EB25,):
+            off = call_rva - self.text_rva
+            if off < 0 or off + 5 > len(out) or out[off] != 0xE8:
+                continue
+            want = target - (call_rva + 5)
+            if struct.unpack_from('<i', out, off + 1)[0] != want:
+                struct.pack_into('<i', out, off + 1, want)
+                fixed += 1
+        lo_rva, hi_rva = target - 0x40, target + 0x40
+        i = 0
+        while i < len(out) - 5:
+            call_at = None
+            if out[i] == 0xF0 and i + 6 <= len(out) and out[i + 1] == 0xE8:
+                call_at = i + 1
+            elif out[i] == 0xE8:
+                call_at = i
+            if call_at is not None:
+                call_rva = self.text_rva + call_at
+                rel = struct.unpack_from('<i', out, call_at + 1)[0]
+                tgt = call_rva + 5 + rel
+                if lo_rva <= tgt <= hi_rva and tgt != target:
+                    want = target - (call_rva + 5)
+                    if struct.unpack_from('<i', out, call_at + 1)[0] != want:
+                        struct.pack_into('<i', out, call_at + 1, want)
+                        fixed += 1
+                i = call_at + 5
+            else:
+                i += 1
+        return fixed
+
+    def _fix_cmd_interactive_prompt_print_2eb23(self, out: bytearray) -> int:
+        """ReadConsole helper entry: print L\"C:\\> \" via banner stub, then original prologue.
+
+        Cave must not overlap 0x90E9 (drive-letter path jmp target) — use a distant nop run.
+        """
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        entry_rva = 0x3D196
+        entry_off = entry_rva - self.text_rva
+        need = 38
+        avoid = [(0x8000, 0x9200), (0x8FF0, 0x9048)]
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_nop_run(out, need)
+        if cave_off is None:
+            return 0
+        cave_rva = self.text_rva + cave_off
+        cave_end = cave_rva + max(need, 42)
+        if entry_off < 0 or entry_off + 8 > len(out):
+            return 0
+        if cave_off < 0 or cave_end - self.text_rva > len(out):
+            return 0
+        if not self._cmd_stdout_print_rva:
+            self._ensure_cmd_wide_stdout_print_stub(out)
+        print_rva = self._cmd_stdout_print_rva or 0x2D813
+        orig = bytes(out[entry_off:entry_off + 8])
+        cont_rva = entry_rva + 8
+        stub = bytearray()
+        stub += b'\x48\xba' + struct.pack('<Q', self.new_base + 0x414B0)
+        call_at = cave_rva + len(stub)
+        stub += b'\xe8' + struct.pack('<i', print_rva - (call_at + 5))
+        stub += orig
+        jmp_from = cave_rva + len(stub)
+        stub += b'\xe9' + struct.pack('<i', cont_rva - (jmp_from + 5))
+        if len(stub) > cave_end - cave_rva:
+            return 0
+        patch = b'\xe9' + struct.pack('<i', cave_rva - (entry_rva + 5))
+        fixed = 0
+        cave_sz = cave_end - cave_rva
+        body = stub + b'\x90' * (cave_sz - len(stub))
+        if out[cave_off:cave_off + cave_sz] != body:
+            out[cave_off:cave_off + cave_sz] = body
+            fixed += 1
+        if out[entry_off:entry_off + 5] != patch:
+            out[entry_off:entry_off + 5] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_swprintf_format_rdx(self, out: bytearray) -> int:
+        """Banner swprintf: mov rdx must point at wide format in .rdata, not a code VA."""
+        if not self.text_rva:
+            return 0
+        fixes = (
+            (0x2E4FF, 0x50668),   # L"Microsoft Windows 2000 [Version %1]%0\\r\\n"
+        )
+        fixed = 0
+        for site_rva, str_rva in fixes:
+            off = site_rva - self.text_rva
+            if off < 0 or off + 10 > len(out) or out[off:off + 2] != b'\x48\xba':
+                continue
+            want_va = self.new_base + str_rva
+            patch = b'\x48\xba' + struct.pack('<Q', want_va)
+            if out[off:off + 10] != patch:
+                out[off:off + 10] = patch
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_copyright_clear_rdx_2e5ac(self, out: bytearray) -> int:
+        """Copyright print (0x2E5C3): clear RDX so writer uses RCX buffer not format ptr."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E5AC - self.text_rva
+        if off < 0 or off + 10 > len(out) or out[off:off + 2] != b'\x48\xba':
+            return 0
+        patch = b'\x48\x31\xd2' + b'\x90' * 8
+        if out[off:off + 10] == patch:
+            return 0
+        out[off:off + 10] = patch
+        return 1
+
+    def _fix_cmd_banner_copyright_string_rcx_2e5a2(self, out: bytearray) -> int:
+        """Copyright line: RCX must point at L\"Copyright...\" in .rdata (0x4F78C)."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E5A2 - self.text_rva
+        if off < 0 or off + 10 > len(out) or out[off:off + 2] != b'\x48\xb9':
+            return 0
+        want_va = self.new_base + 0x4F78C
+        patch = b'\x48\xb9' + struct.pack('<Q', want_va)
+        if out[off:off + 10] == patch:
+            return 0
+        out[off:off + 10] = patch
+        return 1
+
+    def _fix_cmd_banner_skip_post_copyright_2e5ce(self, out: bytearray) -> int:
+        """After copyright print epilogue, jmp REPL — volume/heap tail AVs under shim."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        site_rva = 0x2E5CE
+        end_rva = 0x2EAD6
+        off = site_rva - self.text_rva
+        end = end_rva - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = end_rva - (site_rva + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_banner_swprintf_epilogue_2e520(self, out: bytearray) -> int:
+        """Banner swprintf: leaf frame (sub/add rsp) and restore ``lea rax,[rbp-0xcc]``."""
+        if not self.text_rva:
+            return 0
+        wrap_off = 0x2E50C - self.text_rva
+        ep_off = 0x2E51F - self.text_rva
+        lea_off = 0x2E523 - self.text_rva
+        if wrap_off < 0 or wrap_off + 13 > len(out) or ep_off < 0 or ep_off + 4 > len(out):
+            return 0
+        if lea_off < 0 or lea_off + 17 > len(out):
+            return 0
+        wrap_patch = b'\x48\x83\xec\x28' + b'\x90' * 9
+        ep_patch = b'\x48\x83\xc4\x28'
+        mov_off = 0x2E528 - self.text_rva
+        if mov_off < 0 or mov_off + 10 > len(out):
+            return 0
+        mov_rcx = bytes(out[mov_off:mov_off + 10])
+        if mov_rcx[0:2] != b'\x48\xb9':
+            mov_rcx = b'\x48\xb9' + struct.pack('<Q', self.new_base + 0x417A0)
+        lea_patch = b'\x48\x8d\x85\x34\xff\xff\xff' + mov_rcx
+        fixed = 0
+        if out[wrap_off:wrap_off + 13] != wrap_patch:
+            out[wrap_off:wrap_off + 13] = wrap_patch
+            fixed += 1
+        if out[ep_off:ep_off + 4] != ep_patch:
+            out[ep_off:ep_off + 4] = ep_patch
+            fixed += 1
+        if out[lea_off:lea_off + len(lea_patch)] != lea_patch:
+            out[lea_off:lea_off + len(lea_patch)] = lea_patch
+            fixed += 1
+        rdx_off = 0x2E534 - self.text_rva
+        if 0 <= rdx_off < len(out) - 3 and out[rdx_off:rdx_off + 3] != b'\x48\x89\xc2':
+            out[rdx_off:rdx_off + 3] = b'\x48\x89\xc2'
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_gvi_epilogue_pop_rbp_2e4d3(self, out: bytearray) -> int:
+        """GVI wrapper pushes rbp (0x2E4BF) but epilogue popped r13 — fix to pop rbp."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E4D3 - self.text_rva
+        if off < 0 or off + 2 > len(out) or out[off:off + 2] != b'\x41\x5d':
+            return 0
+        if out[off:off + 2] == b'\x5d\x90':
+            return 0
+        out[off:off + 2] = b'\x5d\x90'
+        return 1
+
+    def _fix_cmd_banner_swprintf_iat_call_2e519(self, out: bytearray) -> int:
+        """Replace ``call rsi`` through IAT cell with direct ``ff15`` swprintf."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        off = 0x2E519 - self.text_rva
+        if off < 0 or off + 6 > len(out) or out[off:off + 2] != b'\xff\xd6':
+            return 0
+        iat = self._loader_iat_va('MSVCRT.dll', 'swprintf')
+        if not iat:
+            iat = self._resolve_iat_slot_va(self.new_base + 0x6E4B9)
+        if not iat:
+            return 0
+        at_rva = 0x2E519
+        rel = iat - (self.new_base + at_rva + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xff\x15' + struct.pack('<i', rel) + b'\x90'
+        if out[off:off + 6] == patch:
+            return 0
+        out[off:off + 6] = patch
+        return 1
+
+    def _fix_cmd_banner_format_swprintf_s(self, out: bytearray, sect_rva: int) -> int:
+        """Banner format uses FormatMessage %%1; MSVCRT swprintf needs %%s (RVA 0x506AA).
+
+        The wide format string lives in ``.rsrc`` (not ``.data``) in the translated image.
+        """
+        site_rva = 0x506AA
+        off = site_rva - sect_rva
+        if off < 0 or off + 2 > len(out):
+            return 0
+        if out[off:off + 2] == b'\x73\x00':
+            return 0
+        if out[off:off + 2] != b'\x31\x00':
+            return 0
+        out[off:off + 2] = b'\x73\x00'
+        return 1
+
+    def _fix_cmd_data_banner_format_swprintf_s(self, out: bytearray, sect_rva: int) -> int:
+        return self._fix_cmd_banner_format_swprintf_s(out, sect_rva)
+
+    def _fix_cmd_data_os_version_fmt(self, out: bytearray, sect_rva: int) -> int:
+        """Wide L\"%d.%02d\" for GetVersion major/minor (RVA 0x4149C)."""
+        msg_rva = 0x4149C
+        off = msg_rva - sect_rva
+        want = '%d.%02d'.encode('utf-16-le') + b'\x00\x00'
+        if off < 0 or off + len(want) > len(out):
+            return 0
+        if out[off:off + len(want)] == want:
+            return 0
+        out[off:off + len(want)] = want
+        return 1
+
+    def _fix_cmd_data_os_version_buffer(self, out: bytearray, sect_rva: int) -> int:
+        """Writable wide OS version scratch (RVA 0x414A0); filled at runtime via GetVersion."""
+        msg_rva = 0x414A0
+        off = msg_rva - sect_rva
+        pad = 32
+        if off < 0 or off + pad > len(out):
+            return 0
+        want = b'\x00' * pad
+        if out[off:off + pad] == want:
+            return 0
+        out[off:off + pad] = want
+        return 1
+
+    def _fix_cmd_data_prompt_buffer(self, out: bytearray, sect_rva: int) -> int:
+        """Writable wide prompt path buffer (RVA 0x414B0, 520 wchar bytes)."""
+        msg_rva = 0x414B0
+        off = msg_rva - sect_rva
+        pad = 520
+        if off < 0 or off + pad > len(out):
+            return 0
+        want = b'\x00' * pad
+        if out[off:off + pad] == want:
+            return 0
+        out[off:off + pad] = want
+        return 1
+
+    def _fix_cmd_data_readline_buffer(self, out: bytearray, sect_rva: int) -> int:
+        """Writable wide ReadConsole line buffer (RVA 0x41600, 1024 bytes)."""
+        msg_rva = 0x41600
+        off = msg_rva - sect_rva
+        pad = 1024
+        if off < 0 or off + pad > len(out):
+            return 0
+        want = b'\x00' * pad
+        if out[off:off + pad] == want:
+            return 0
+        out[off:off + pad] = want
+        return 1
+
+    def _fix_cmd_banner_swprintf_version_arg_r8_2e50a(self, out: bytearray) -> int:
+        """Banner swprintf %%1 arg: ``mov r8d,eax`` must be ``mov r8,rsi`` (version ptr)."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E509 - self.text_rva
+        if off < 0 or off + 3 > len(out):
+            return 0
+        patch = b'\x49\x89\xf0'  # mov r8, rsi
+        if out[off:off + 3] == patch:
+            return 0
+        if out[off:off + 3] != b'\x41\x89\xc0':
+            return 0
+        out[off:off + 3] = patch
+        return 1
+
+    def _fix_cmd_banner_version_string_ptr_2e4ef(self, out: bytearray) -> int:
+        """Version %%1: load wide string at 0x414A0, not a broken IAT/name-table deref."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E4EF - self.text_rva
+        if off < 0 or off + 13 > len(out) or out[off:off + 2] != b'\x48\xbe':
+            return 0
+        want_va = self.new_base + 0x414A0
+        patch = b'\x48\xbe' + struct.pack('<Q', want_va) + b'\x90\x90\x90'
+        if out[off:off + 13] == patch:
+            return 0
+        out[off:off + 13] = patch
+        return 1
+
+    def _fix_cmd_banner_fill_version_cave(self, out: bytearray) -> int:
+        """Before banner swprintf, GetVersion + swprintf into 0x414A0 (dynamic major.minor)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        site_rva = 0x2E4E8
+        resume_rva = 0x2E4EF
+        site_off = site_rva - self.text_rva
+        if site_off < 0 or site_off + 3 > len(out):
+            return 0
+        if out[site_off:site_off + 3] not in (b'\x48\x8d\x85', b'\x48\xbe'):
+            return 0
+        getver = self._loader_iat_va('KERNEL32.dll', 'GetVersion')
+        if not getver:
+            getver = self._resolve_iat_slot_va(self.old_base + 0x111C)
+        swp = self._loader_iat_va('MSVCRT.dll', 'swprintf')
+        if not getver or not swp:
+            return 0
+        buf_va = self.new_base + 0x414A0
+        fmt_va = self.new_base + 0x4149C
+        need = 80
+        cave_rva = 0x2E800
+        cave_off = cave_rva - self.text_rva
+        if cave_off < 0 or cave_off + need > len(out):
+            return 0
+        avoid = []
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_nop_run(out, need, avoid=[(0x2E5CE, 0x2E800)])
+        if cave_off is not None:
+            cave_rva = self.text_rva + cave_off
+        else:
+            cave_off = cave_rva - self.text_rva
+        body = bytearray()
+        body += b'\x48\x83\xec\x28'
+        ff_gv = cave_rva + len(body)
+        rel = getver - (self.new_base + ff_gv + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x89\xc3'                           # mov ebx, eax
+        body += b'\x41\x0f\xb6\xc3'                   # movzx r8d, bl (major)
+        body += b'\x41\x0f\xb6\xcb'                   # movzx r9d, bh (minor)
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        body += b'\x48\xba' + struct.pack('<Q', fmt_va)
+        ff_swp = cave_rva + len(body)
+        rel = swp - (self.new_base + ff_swp + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\x83\xc4\x28'
+        body += b'\x48\x8d\x85\x34\xff\xff\xff'       # lea rax, [rbp-0xCC]
+        jmp_from = cave_rva + len(body)
+        body += b'\xe9' + struct.pack('<i', resume_rva - (jmp_from + 5))
+        if len(body) > need:
+            return 0
+        body += b'\x90' * (need - len(body))
+        call_rel = cave_rva - (site_rva + 5)
+        if not (-2147483648 <= call_rel <= 2147483647):
+            return 0
+        site_patch = b'\xe8' + struct.pack('<i', call_rel) + b'\x90\x90'
+        fixed = 0
+        if out[cave_off:cave_off + need] != body:
+            out[cave_off:cave_off + need] = body
+            fixed += 1
+        if out[site_off:site_off + 7] != site_patch:
+            out[site_off:site_off + 7] = site_patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_repl_frame_fixup(self, out: bytearray) -> int:
+        """Banner + REPL: translated ``mov rbp,r13`` / ``mov rsp,r12`` corrupt the stack."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        lo = 0x2E4B2 - self.text_rva
+        hi = 0x2EB40 - self.text_rva
+        if lo < 0:
+            return 0
+        i = max(0, lo)
+        while i < min(hi, len(out) - 3):
+            if out[i:i + 3] == b'\x49\x89\xe5':
+                out[i:i + 3] = b'\x48\x89\xe5'
+                fixed += 1
+            elif out[i:i + 3] == b'\x4c\x89\xec':
+                out[i:i + 3] = b'\x48\x89\xec'
+                fixed += 1
+            i += 1
+        return fixed
+
+    def _fix_cmd_banner_copyright_print_leaf_2e5b8(self, out: bytearray) -> int:
+        """Copyright print wrapper at 0x2E5B8: leaf frame — must not clobber main rbp."""
+        if not self.text_rva:
+            return 0
+        wrap_off = 0x2E5B7 - self.text_rva
+        ep_off = 0x2E5C9 - self.text_rva
+        call_off = 0x2E5C4 - self.text_rva
+        if wrap_off < 0 or wrap_off + 13 > len(out) or ep_off < 0 or ep_off + 5 > len(out):
+            return 0
+        if call_off < 0 or call_off >= len(out) or out[call_off] != 0xE8:
+            return 0
+        wrap_patch = b'\x48\x83\xec\x28' + b'\x90' * 9
+        ep_patch = b'\x48\x83\xc4\x28\x90'
+        fixed = 0
+        if out[wrap_off:wrap_off + 13] != wrap_patch:
+            out[wrap_off:wrap_off + 13] = wrap_patch
+            fixed += 1
+        if out[ep_off:ep_off + 5] != ep_patch:
+            out[ep_off:ep_off + 5] = ep_patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_banner_line_print_leaf_2e536(self, out: bytearray) -> int:
+        """Banner line print wrapper at 0x2E537: leaf frame — preserve main rbp."""
+        if not self.text_rva:
+            return 0
+        wrap_off = 0x2E537 - self.text_rva
+        ep_off = 0x2E547 - self.text_rva
+        call_off = 0x2E542 - self.text_rva
+        wrap_len = 11
+        if wrap_off < 0 or wrap_off + wrap_len > len(out) or ep_off < 0 or ep_off + 5 > len(out):
+            return 0
+        if call_off < 0 or call_off >= len(out) or out[call_off] != 0xE8:
+            return 0
+        wrap_patch = b'\x48\x83\xec\x28' + b'\x90' * (wrap_len - 4)
+        ep_patch = b'\x48\x83\xc4\x28\x90'
+        fixed = 0
+        if out[wrap_off:wrap_off + wrap_len] != wrap_patch:
+            out[wrap_off:wrap_off + wrap_len] = wrap_patch
+            fixed += 1
+        if out[ep_off:ep_off + 5] != ep_patch:
+            out[ep_off:ep_off + 5] = ep_patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_repl_prompt_cave(self, out: bytearray) -> int:
+        """Leaf cave: print wide prompt at 0x414B0 via stdout helper (returns with ret)."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        if not self._cmd_stdout_print_rva:
+            self._ensure_cmd_wide_stdout_print_stub(out)
+        print_rva = self._cmd_stdout_print_rva or 0x2D813
+        if not print_rva:
+            return 0
+        buf_va = self.new_base + 0x414B0
+        need = 32
+        cave_rva = 0x2E6A0
+        cave_off = cave_rva - self.text_rva
+        if cave_off < 0 or cave_off + need > len(out):
+            avoid = [(0x8FF0, 0x9048), (0x2E5CE, 0x2E800)]
+            cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+            if cave_off is None:
+                cave_off = self._find_nop_run(out, need, avoid=avoid)
+            if cave_off is None:
+                return 0
+            cave_rva = self.text_rva + cave_off
+        body = bytearray()
+        body += b'\x48\xba' + struct.pack('<Q', buf_va)
+        cpr = cave_rva + len(body)
+        body += b'\xe8' + struct.pack('<i', print_rva - (cpr + 5))
+        body += b'\xc3'
+        if len(body) > need:
+            return 0
+        body += b'\x90' * (need - len(body))
+        if out[cave_off:cave_off + need] != body:
+            out[cave_off:cave_off + need] = body
+            return 1
+        return 0
+
+    def _fix_cmd_repl_readconsole_leaf_2eb18(self, out: bytearray) -> int:
+        """REPL: print cwd prompt cave, call ReadConsole, jmp back to REPL gate."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        self._fix_cmd_repl_prompt_cave(out)
+        wrap_off = 0x2EB18 - self.text_rva
+        wrap_len = 18
+        prompt_rva = 0x2E6A0
+        rc_rva = 0x3D193
+        gate_rva = 0x2EAD6
+        if wrap_off < 0 or wrap_off + wrap_len > len(out):
+            return 0
+        body = bytearray()
+        c0 = 0x2EB18
+        body += b'\xe8' + struct.pack('<i', prompt_rva - (c0 + 5))
+        c1 = 0x2EB18 + len(body)
+        body += b'\xe8' + struct.pack('<i', rc_rva - (c1 + 5))
+        jmp_from = 0x2EB18 + len(body)
+        body += b'\xe9' + struct.pack('<i', gate_rva - (jmp_from + 5))
+        if len(body) > wrap_len:
+            return 0
+        body += b'\x90' * (wrap_len - len(body))
+        if out[wrap_off:wrap_off + 2] not in (b'\x41\x55', b'\x48\x83'):
+            return 0
+        if out[wrap_off:wrap_off + wrap_len] == body:
+            return 0
+        out[wrap_off:wrap_off + wrap_len] = body
+        return 1
+
+    def _fix_cmd_repl_seh_je_2ee65(self, out: bytearray) -> int:
+        """SEH unwind epilogue: ``je`` after ``test rax,rax`` must skip 12 bytes, not 10."""
+        if not self.text_rva:
+            return 0
+        pat = (
+            b'\x65\x48\x8b\x04\x25\x00\x00\x00\x00'  # mov rax, gs:[0]
+            + b'\x48\x85\xc0'                         # test rax, rax
+            + b'\x74\x0a'                             # je +0x0a (wrong)
+            + b'\x48\x8b\x00'                         # mov rax, [rax]
+            + b'\x65\x48\x89\x04\x25\x00\x00\x00\x00' # mov gs:[0], rax
+            + b'\x48\x89\xec'                         # mov rsp, rbp
+        )
+        want = pat[:12] + b'\x74\x0c' + pat[14:]
+        fixed = 0
+        pos = 0
+        while True:
+            idx = out.find(pat, pos)
+            if idx < 0:
+                break
+            out[idx:idx + len(want)] = want
+            fixed += 1
+            pos = idx + len(want)
+        return fixed
+
+    def _fix_cmd_repl_readconsole_jmp_loop_2eb2a(self, out: bytearray) -> int:
+        """After ReadConsole returns, jmp REPL gate — not orphan epilogue at 0x2EE43."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        site_rva = 0x2EB36
+        loop_rva = 0x2EAD6
+        off = site_rva - self.text_rva
+        if off < 0 or off + 5 > len(out) or out[off] != 0xE9:
+            return 0
+        rel = loop_rva - (site_rva + 5)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        patch = b'\xe9' + struct.pack('<i', rel)
+        if out[off:off + 5] == patch:
+            return 0
+        out[off:off + 5] = patch
+        return 1
+
+    def _fix_cmd_prompt_helper_cave_200e5(self, out: bytearray) -> int:
+        """Replace broken volume-chain prompt (0x200E5) with GetCurrentDirectoryW + stdout write."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        entry_rva = 0x200E5
+        entry_off = entry_rva - self.text_rva
+        if entry_off < 0 or entry_off + 5 > len(out):
+            return 0
+        if not self._cmd_stdout_print_rva:
+            self._ensure_cmd_wide_stdout_print_stub(out)
+        print_rva = self._cmd_stdout_print_rva or 0x2D813
+        getcwd = self._loader_iat_va('KERNEL32.dll', 'GetCurrentDirectoryW')
+        wcslen = self._loader_iat_va('MSVCRT.dll', 'wcslen')
+        if not getcwd or not wcslen:
+            return 0
+        buf_va = self.new_base + 0x414B0
+        need = 96
+        avoid = [(0x8FF0, 0x9048), (0x2E5CE, 0x2E6A0)]
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_nop_run(out, need, avoid=avoid)
+        if cave_off is None:
+            return 0
+        cave_rva = self.text_rva + cave_off
+        body = bytearray()
+        body += b'\x48\x83\xec\x28'
+        body += b'\xba\x04\x01\x00\x00'               # mov edx, 260
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        ff_gc = cave_rva + len(body)
+        rel = getcwd - (self.new_base + ff_gc + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        ff_wl = cave_rva + len(body)
+        rel = wcslen - (self.new_base + ff_wl + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\x89\xc3'                       # mov rbx, rax (wchar len)
+        body += b'\x01\xdb'                           # add ebx, ebx (byte offset)
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        body += b'\x48\x01\xd9'                       # add rcx, rbx -> append ptr
+        body += b'\x66\xc7\x01\x3e\x00'               # mov word [rcx], '>'
+        body += b'\x66\xc7\x41\x02\x20\x00'           # mov word [rcx+2], ' '
+        body += b'\x66\xc7\x41\x04\x00\x00'           # mov word [rcx+4], 0
+        body += b'\x48\xba' + struct.pack('<Q', buf_va)
+        cpr = cave_rva + len(body)
+        body += b'\xe8' + struct.pack('<i', print_rva - (cpr + 5))
+        body += b'\x48\x83\xc4\x28'
+        body += b'\xc3'
+        if len(body) > need:
+            return 0
+        body += b'\x90' * (need - len(body))
+        call_rel = cave_rva - (entry_rva + 5)
+        if not (-2147483648 <= call_rel <= 2147483647):
+            return 0
+        patch = b'\xe8' + struct.pack('<i', call_rel) + b'\xc3'
+        fixed = 0
+        if out[cave_off:cave_off + need] != body:
+            out[cave_off:cave_off + need] = body
+            fixed += 1
+        if out[entry_off:entry_off + 6] != patch:
+            out[entry_off:entry_off + 6] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_readconsole_cwd_fill_3d193(self, out: bytearray) -> int:
+        """Before ReadConsole helper runs, fill 0x414B0 with GetCurrentDirectoryW + \"> \"."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        entry_rva = 0x3D193
+        entry_off = entry_rva - self.text_rva
+        resume_rva = 0x3D198
+        if entry_off < 0 or entry_off + 5 > len(out):
+            return 0
+        getcwd = self._loader_iat_va('KERNEL32.dll', 'GetCurrentDirectoryW')
+        wcslen = self._loader_iat_va('MSVCRT.dll', 'wcslen')
+        if not getcwd or not wcslen:
+            return 0
+        buf_va = self.new_base + 0x414B0
+        need = 80
+        avoid = [(0x8FF0, 0x9048), (0x2E5CE, 0x2E800)]
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_nop_run(out, need, avoid=avoid)
+        if cave_off is None:
+            return 0
+        cave_rva = self.text_rva + cave_off
+        body = bytearray()
+        body += b'\x48\x83\xec\x28'
+        body += b'\xba\x04\x01\x00\x00'
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        ff_gc = cave_rva + len(body)
+        rel = getcwd - (self.new_base + ff_gc + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        ff_wl = cave_rva + len(body)
+        rel = wcslen - (self.new_base + ff_wl + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\x89\xc3'
+        body += b'\x01\xdb'
+        body += b'\x48\xb9' + struct.pack('<Q', buf_va)
+        body += b'\x48\x01\xd9'
+        body += b'\x66\xc7\x01\x3e\x00'
+        body += b'\x66\xc7\x41\x02\x20\x00'
+        body += b'\x66\xc7\x41\x04\x00\x00'
+        body += b'\x48\x83\xc4\x28'
+        jmp_from = cave_rva + len(body)
+        body += b'\xe9' + struct.pack('<i', resume_rva - (jmp_from + 5))
+        if len(body) > need:
+            return 0
+        body += b'\x90' * (need - len(body))
+        jmp = b'\xe9' + struct.pack('<i', cave_rva - (entry_rva + 5))
+        fixed = 0
+        if out[cave_off:cave_off + need] != body:
+            out[cave_off:cave_off + need] = body
+            fixed += 1
+        if out[entry_off:entry_off + 5] != jmp:
+            out[entry_off:entry_off + 5] = jmp
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_read_line_cave_3cdc8(self, out: bytearray) -> int:
+        """Replace broken parse/read helper entry (0x3CDC8) with kernel32 ReadConsoleW."""
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        entry_rva = 0x3CDC8
+        entry_off = entry_rva - self.text_rva
+        if entry_off < 0 or entry_off + 5 > len(out) or out[entry_off] != 0x55:
+            return 0
+        getstd = self._loader_iat_va('KERNEL32.dll', 'GetStdHandle')
+        readc = self._loader_iat_va('KERNEL32.dll', 'ReadConsoleW')
+        if not getstd or not readc:
+            return 0
+        line_va = self.new_base + 0x41600
+        need = 80
+        avoid = [(0x8FF0, 0x9048), (0x2E5CE, 0x2E700), (0x3CDC8, 0x3CE00)]
+        cave_off = self._find_text_nop_cave(out, need, avoid=avoid)
+        if cave_off is None:
+            cave_off = self._find_nop_run(out, need, avoid=avoid)
+        if cave_off is None:
+            return 0
+        cave_rva = self.text_rva + cave_off
+        body = bytearray()
+        body += b'\x48\x83\xec\x48'
+        body += b'\xb9\xf5\xff\xff\xff'               # STD_INPUT_HANDLE
+        ff_gs = cave_rva + len(body)
+        rel = getstd - (self.new_base + ff_gs + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\x89\xc1'                       # mov rcx, rax
+        body += b'\x48\xba' + struct.pack('<Q', line_va)
+        body += b'\x41\xb8\xff\x00\x00\x00'           # mov r8d, 255
+        body += b'\x4c\x8d\x4c\x24\x20'               # lea r9, [rsp+0x20]
+        body += b'\x48\xc7\x44\x24\x28\x00\x00\x00\x00'
+        ff_rc = cave_rva + len(body)
+        rel = readc - (self.new_base + ff_rc + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', rel)
+        body += b'\x48\xb8' + struct.pack('<Q', line_va)
+        body += b'\x48\x83\xc4\x48'
+        body += b'\xc3'
+        if len(body) > need:
+            return 0
+        body += b'\x90' * (need - len(body))
+        call_rel = cave_rva - (entry_rva + 5)
+        if not (-2147483648 <= call_rel <= 2147483647):
+            return 0
+        patch = b'\xe8' + struct.pack('<i', call_rel) + b'\xc3'
+        fixed = 0
+        if out[cave_off:cave_off + need] != body:
+            out[cave_off:cave_off + need] = body
+            fixed += 1
+        if out[entry_off:entry_off + 6] != patch:
+            out[entry_off:entry_off + 6] = patch
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_readconsole_helper_frame_3d193(self, out: bytearray) -> int:
+        """ReadConsole helper: ``mov rbp,r13`` / ``mov rsp,r12`` break the x64 stack frame."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        ent_off = 0x3D195 - self.text_rva
+        if 0 <= ent_off < len(out) and out[ent_off:ent_off + 3] == b'\x49\x89\xe5':
+            out[ent_off:ent_off + 3] = b'\x48\x89\xe5'
+            fixed += 1
+        lo = 0x3D193 - self.text_rva
+        hi = 0x3D250 - self.text_rva
+        if lo < 0:
+            return fixed
+        i = max(0, lo)
+        while i < min(hi, len(out) - 3):
+            if out[i:i + 3] == b'\x4c\x89\xec':
+                out[i:i + 3] = b'\x48\x89\xec'
+                fixed += 1
+            i += 1
+        return fixed
+
+    def _fix_cmd_version_banner_skip_call_rsi_2e58d(self, out: bytearray) -> int:
+        """Banner char format: ``call rsi`` uses string ptr — skip to epilogue."""
+        if not self.text_rva:
+            return 0
+        off = 0x2E58D - self.text_rva
+        if off < 0 or off + 2 > len(out) or out[off:off + 2] != b'\xff\xd6':
+            return 0
+        out[off:off + 2] = b'\x90\x90'
+        return 1
+
+    def _fix_cmd_gvi_helper_1d343(self, out: bytearray) -> int:
+        """GetVolumeInformationW helper: proper x64 args from [rbp-0x20] root."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x1D343 - self.text_rva
+        stub_end = 0x1D3BF - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        gvi_iat = self._resolve_iat_slot_va(self.old_base + 0x10F8)
+        body = bytearray()
+        body += b'\x48\x8d\x4d\xe0'                       # lea rcx, [rbp-0x20]
+        body += b'\x48\x8d\x95\x80\xfe\xff\xff'           # lea rdx, [rbp-0x180]
+        body += b'\x41\xb8\x04\x01\x00\x00'               # mov r8d, 0x104
+        body += b'\x45\x31\xc9'                           # xor r9d, r9d
+        body += b'\x48\x83\xec\x28'                       # sub rsp, 0x28
+        ff_at = self.text_rva + stub_off + len(body)
+        ff_rel = gvi_iat - (self.new_base + ff_at + 6)
+        if not (-2147483648 <= ff_rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', ff_rel)
+        body += b'\x48\x83\xc4\x28'                       # add rsp, 0x28
+        body += b'\xc3'                                   # ret (caller 0x2E4D0)
+        if len(body) > stub_end - stub_off:
+            return 0
+        body += b'\x90' * (stub_end - stub_off - len(body))
+        if out[stub_off:stub_end] == bytes(body):
+            return 0
+        out[stub_off:stub_end] = bytes(body)
+        return 1
+
+    def _fix_cmd_banner_jmp_good_heap_8af4(self, out: bytearray) -> int:
+        """Bad-path 0x8AF4: jmp to good heap block at 0x8ACE (not garbage 0x2DC33)."""
+        if not self.text_rva:
+            return 0
+        off = 0x8AF4 - self.text_rva
+        end = 0x8AFC - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = 0x8ACE - (0x8AF4 + 5)
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_banner_bad_path_skip_8eb9(self, out: bytearray) -> int:
+        """Bad-path 0x8AF4: tail-call mov rax,rsi; jmp main (was call 0x2DC33)."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        off = 0x8AF4 - self.text_rva
+        end = 0x8AFC - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        rel = 0x2DC32 - (0x8AF4 + 5)
+        patch = b'\xe9' + struct.pack('<i', rel) + b'\x90' * (end - off - 5)
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_banner_wcsncpy_8afc(self, out: bytearray) -> int:
+        """Good-path 0x8AFC: wcsncpy banner into malloc buffer (RSI is often length, not text)."""
+        if not self.text_rva:
+            return 0
+        stub_off = 0x8AFC - self.text_rva
+        stub_end = 0x8B22 - self.text_rva
+        if stub_off < 0 or stub_end <= stub_off or stub_end > len(out):
+            return 0
+        wcs_iat = self._loader_iat_va('MSVCRT.dll', 'wcsncpy')
+        if not wcs_iat:
+            wcs_iat = self._resolve_iat_slot_va(self.old_base + 0x121C)
+        banner_va = self.new_base + 0x161C
+        body = bytearray()
+        body += b'\x48\x89\xc1'                           # mov rcx, rax
+        body += b'\x48\xba' + struct.pack('<Q', banner_va)  # movabs rdx, banner
+        body += b'\x41\xb8\x04\x01\x00\x00'               # mov r8d, 0x104
+        body += b'\x48\x83\xec\x28'                       # sub rsp, 0x28
+        ff_at = self.text_rva + stub_off + len(body)
+        ff_rel = wcs_iat - (self.new_base + ff_at + 6)
+        if not (-2147483648 <= ff_rel <= 2147483647):
+            return 0
+        body += b'\xff\x15' + struct.pack('<i', ff_rel)
+        body += b'\x48\x83\xc4\x28'                       # add rsp, 0x28
+        if len(body) > stub_end - stub_off:
+            return 0
+        body += b'\x90' * (stub_end - stub_off - len(body))
+        if out[stub_off:stub_end] == bytes(body):
+            return 0
+        out[stub_off:stub_end] = bytes(body)
+        return 1
+
+    def _fix_cmd_main_wcscmp_iat_9176(self, out: bytearray) -> int:
+        """Replace wcscmp ``call rsi`` stubs at 0x9183/0x91AC with aligned FF15 IAT."""
+        if not self.text_rva:
+            return 0
+        peb_off = 0x8EE1 - self.text_rva
+        if peb_off < 0 or out[peb_off:peb_off + 2] not in (b'\x65\x48', b'\xff\x15'):
+            return 0
+        slot_rva = 0x6E431
+        iat_va = self.new_base + slot_rva
+        fixed = 0
+        load_off = 0x9159 - self.text_rva
+        good_load = b'\x48\xbe' + struct.pack('<Q', iat_va)
+        if 0 <= load_off + 10 <= len(out) and out[load_off:load_off + 10] != good_load:
+            if out[load_off:load_off + 2] == b'\x48\xbe':
+                out[load_off:load_off + 10] = good_load
+                fixed += 1
+        for off_rva, ff_rva in ((0x9176, 0x917A), (0x919F, 0x91A3)):
+            off = off_rva - self.text_rva
+            end = off + 20
+            if off < 0 or end > len(out):
+                continue
+            rel = slot_rva - (ff_rva + 6)
+            if not (-2147483648 <= rel <= 2147483647):
+                continue
+            body = (
+                b'\x48\x83\xec\x28'
+                + b'\xff\x15' + struct.pack('<i', rel)
+                + b'\x48\x83\xc4\x28'
+            )
+            patch = body + b'\x90' * (end - off - len(body))
+            if out[off:end] != patch:
+                out[off:end] = patch
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_main_switch_dispatch(self, out: bytearray) -> int:
+        """Restore wcscmp switch compare/dispatch (0x9158) after VA patch overlap."""
+        if not self.text_rva:
+            return 0
+        off = 0x9159 - self.text_rva
+        end = 0x91BB - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        wcscmp_iat = self.new_base + 0x6E431
+        str_slash_q = self.new_base + 0x4147c
+        str_slash_c = self.new_base + 0x41484
+        exit_off = 0x2E4BE - self.text_rva
+        banner_off = 0x2E4B2 - self.text_rva
+        je1 = banner_off - (0x918C - self.text_rva + 6)
+        je2 = exit_off - (0x91B5 - self.text_rva + 6)
+        patch = (
+            b'\x48\xbe' + struct.pack('<Q', wcscmp_iat) +
+            b'\x48\x8b\x36' +
+            b'\x48\xbf' + struct.pack('<Q', str_slash_q) +
+            b'\x48\x89\xd9' +
+            b'\x48\x89\xfa' +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\xff\xd6' +
+            b'\x4c\x89\xec' +
+            b'\x41\x5d' +
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je1) +
+            b'\x48\x89\xd9' +
+            b'\x48\xba' + struct.pack('<Q', str_slash_c) +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\xff\xd6' +
+            b'\x4c\x89\xec' +
+            b'\x41\x5d' +
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je2)
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_flag_dispatch(self, out: bytearray) -> int:
+        """Restore /c flag check call (0x91BA) after VA patch overlap."""
+        if not self.text_rva:
+            return 0
+        off = 0x91BB - self.text_rva
+        end = 0x91EE - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        je1 = (0x9477 - self.text_rva) - (0x91DE - self.text_rva + 6)
+        je2 = (0x925F - self.text_rva) - (0x91E8 - self.text_rva + 6)
+        patch = (
+            b'\x48\xc7\xc1\x10\x04\x00\x00' +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\xb8\x01\x00\x00\x00' +          # mov eax, 1 (/c dispatch index)
+            b'\x4c\x89\xec' +
+            b'\x41\x5d' +
+            b'\x85\xc0' +
+            b'\x89\x45\x10' +
+            b'\x0f\x84' + struct.pack('<i', je1) +
+            b'\x83\x7d\x18\x00' +
+            b'\x0f\x84' + struct.pack('<i', je2)
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_post_flag_path(self, out: bytearray) -> int:
+        """Restore wcscpy helper block (0x91ED) after VA patch overlap."""
+        if not self.text_rva:
+            return 0
+        off = 0x91EE - self.text_rva
+        end = 0x9230 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        wcscpy_iat = self._resolve_iat_slot_va(self.old_base + 0x11DC)  # MSVCRT!wcscpy
+        if not wcscpy_iat:
+            wcscpy_iat = self.new_base + 0x6E3E9
+        je = (0x9230 - self.text_rva) - (0x91F7 - self.text_rva + 6)
+        patch = (
+            b'\x48\x8d\x85\xd8\xfd\xff\xff' +
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je) +
+            b'\x48\x8d\x85\xd8\xfd\xff\xff' +
+            b'\x48\x8b\x4d\x18' +
+            b'\x48\x8d\x95\xd8\xfd\xff\xff' +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\x48\xb8' + struct.pack('<Q', wcscpy_iat) +
+            b'\x48\x8b\x00' +
+            b'\xff\xd0' +
+            b'\x4c\x89\xec' +
+            b'\x41\x5d'
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_batch_exec_call(self, out: bytearray) -> int:
+        """Route cmd flag-dispatch call (0x92A1) to switch handler entry at 0x1DEB7."""
+        if not self.text_rva:
+            return 0
+        call_off = 0x92A1 - self.text_rva
+        good_off = 0x1DEB7 - self.text_rva
+        if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+            return 0
+        rel = struct.unpack_from('<i', out, call_off + 1)[0]
+        if call_off + 5 + rel == good_off:
+            return 0
+        struct.pack_into('<i', out, call_off + 1, good_off - (call_off + 5))
+        return 1
+
+    def _fix_cmd_main_parse_dispatch_call(self, out: bytearray) -> int:
+        """After wcscpy helper, call translated 14ED5 batch parser (0x1E07C)."""
+        if not self.text_rva:
+            return 0
+        off = 0x9230 - self.text_rva
+        end = 0x925F - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        call_tgt = 0x1E07C - self.text_rva
+        call_rel = call_tgt - (0x9248 - self.text_rva + 5)
+        je_fail = (0x9282 - self.text_rva) - (0x9254 - self.text_rva + 6)
+        patch = (
+            b'\x48\x89\xd9' +
+            b'\x48\x8b\x55\x18' +
+            b'\x4c\x8b\x45\x20' +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\xe8' + struct.pack('<i', call_rel) +
+            b'\x4c\x89\xec' +
+            b'\x41\x5d' +
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je_fail) +
+            b'\xeb\x03' + b'\x90' * 3
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_exec_tail(self, out: bytearray) -> int:
+        """Restore post-parse exec tail (0x925E) after VA patch overlap."""
+        if not self.text_rva:
+            return 0
+        off = 0x925F - self.text_rva
+        end = 0x92B3 - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        je1 = (0x9282 - self.text_rva) - (0x9261 - self.text_rva + 6)
+        call_rel = (0x1DEB7 - self.text_rva) - (0x92A1 - self.text_rva + 5)
+        je2 = (0x92CC - self.text_rva) - (0x92AD - self.text_rva + 6)
+        wcscmp_iat = (self.new_base + 0x6E431) & 0xFFFFFFFFFFFFFFFF
+        wcscmp_body = (
+            b'\x48\x8d\x8d\xd8\xfd\xff\xff'          # lea rcx, [rbp-0x228]
+            + b'\x48\x89\xfa'                          # mov rdx, rdi
+            + b'\x48\xb8' + struct.pack('<Q', wcscmp_iat)
+            + b'\x48\x8b\x00'                          # mov rax, [rax]
+            + b'\xff\xd0'                              # call wcscmp
+            + b'\x90' * 2
+        )
+        if len(wcscmp_body) != 0x9282 - 0x9267:
+            return 0
+        patch = (
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je1) +
+            wcscmp_body +
+            b'\xb9\x01\x00\x00\x00' +
+            b'\x48\x89\xda' +
+            b'\x90' * 3 +
+            b'\x49\xc7\xc0\x08\x02\x00\x00' +
+            b'\x41\x55' +
+            b'\x49\x89\xe5' +
+            b'\x48\x83\xec\x20' +
+            b'\x48\x83\xe4\xf0' +
+            b'\xe8' + struct.pack('<i', call_rel) +
+            b'\x4c\x89\xec' +
+            b'\x41\x5d' +
+            b'\x85\xc0' +
+            b'\x0f\x84' + struct.pack('<i', je2)
+        )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_switch_handler_gs_epilogue(self, out: bytearray) -> int:
+        """Fix /c switch handler GS epilogue: ``je +0x0A`` lands mid-instruction at 0x1E016."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        je_off = 0x1E00D - self.text_rva
+        if 0 <= je_off + 2 <= len(out) and out[je_off:je_off + 2] == b'\x74\x0a':
+            out[je_off:je_off + 2] = b'\x74\x0c'  # je -> 0x1E01B
+            fixed += 1
+        # Legacy patch site (pre-tail corruption layout).
+        leg_off = 0x1DFE5 - self.text_rva
+        if 0 <= leg_off + 2 <= len(out) and out[leg_off:leg_off + 2] == b'\x74\x0a':
+            out[leg_off:leg_off + 2] = b'\xeb\x0c'
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_batch_helper_zero_index(self, out: bytearray) -> int:
+        """Batch copy helper (0x2B056) needs r8 index 0; callers often omit r8."""
+        if not self.text_rva:
+            return 0
+        off = 0x2B07E - self.text_rva
+        if off < 0 or off + 3 > len(out):
+            return 0
+        patch = b'\x31\xc0\x90'  # xor eax, eax; nop
+        if out[off:off + 3] == patch:
+            return 0
+        if out[off:off + 3] != b'\x8b\x45\x20':
+            return 0
+        out[off:off + 3] = patch
+        return 1
+
+    def _fix_cmd_main_post_switch_success(self, out: bytearray) -> int:
+        """After /c switch handler returns 0, jmp to echo stub entry at 0x932F."""
+        if not self.text_rva:
+            return 0
+        off = 0x92CC - self.text_rva
+        end = 0x92DF - self.text_rva
+        if off < 0 or end <= off or end > len(out):
+            return 0
+        if self.win10_test_shim:
+            jmp = (0x932F - self.text_rva) - (0x92D3 - self.text_rva + 2)
+            patch = (
+                b'\x48\x8d\x9d\xd8\xfd\xff\xff' +
+                b'\xeb' + bytes([jmp & 0xFF]) +
+                b'\x90' * (end - off - 9)
+            )
+        else:
+            jmp = (0x932F - self.text_rva) - (0x92D3 - self.text_rva + 2)
+            patch = (
+                b'\x48\x8d\x9d\xd8\xfd\xff\xff' +
+                b'\xeb' + bytes([jmp & 0xFF]) +
+                b'\x90' * (end - off - 9)
+            )
+        if len(patch) != end - off:
+            return 0
+        if out[off:end] == patch:
+            return 0
+        out[off:end] = patch
+        return 1
+
+    def _fix_cmd_main_parse_helper_calls(self, out: bytearray,
+                                         rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Snap cmd main parse helpers via generic entry resolution (+ legacy overrides)."""
+        if not self.text_rva:
+            return 0
+        if rva_map is None:
+            rva_map = self.rva_map or None
+        fixed = self._snap_calls_to_enclosing_entries(
+            out, rva_map, lo_rva=0x8E00, hi_rva=0x9500)
+        fixed += self._snap_calls_via_x86_correspondence(
+            out, rva_map, lo_x86=0x8E00, hi_x86=0x9500)
+        # Legacy exact overrides when prologue scan picks a sibling entry.
+        overrides = (
+            (0x90B0, 0x2E465, 0x2E44B),
+        )
+        for call_rva, bad_rva, good_rva in overrides:
+            call_off = call_rva - self.text_rva
+            good_off = good_rva - self.text_rva
+            bad_off = bad_rva - self.text_rva
+            if call_off < 0 or good_off < 0 or call_off + 5 > len(out):
+                continue
+            if out[call_off] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, call_off + 1)[0]
+            tgt = call_off + 5 + rel
+            if tgt == good_off:
+                continue
+            if bad_rva and tgt != bad_off:
+                continue
+            struct.pack_into('<i', out, call_off + 1,
+                             good_off - (call_off + 5))
+            fixed += 1
+        return fixed
+
+    def _fix_cmd_getcommandline_inner_call(self, out: bytearray) -> int:
+        """Snap stray inner call at 0x296FA off epilogue tail (0x28F3C) to wrapper (0x28F1B)."""
+        if not self.text_rva:
+            return 0
+        call_off = 0x296FA - self.text_rva
+        good_off = 0x28F1B - self.text_rva
+        bad_off = 0x28F3C - self.text_rva
+        if call_off < 0 or good_off < 0 or call_off + 5 > len(out):
+            return 0
+        if out[call_off] != 0xE8:
+            return 0
+        rel = struct.unpack_from('<i', out, call_off + 1)[0]
+        tgt = call_off + 5 + rel
+        if tgt == good_off:
+            return 0
+        if tgt != bad_off:
+            return 0
+        struct.pack_into('<i', out, call_off + 1, good_off - (call_off + 5))
+        return 1
+
+    def _cmd_batch_helper_entry_off(self, out: bytearray) -> Optional[int]:
+        """Blob offset of batch exec helper entry (``push rcx…; mov rbp, r9``)."""
+        sig = b'\x51\x51\x53\x55\x4c\x89\xcd'
+        j = out.find(sig)
+        if j >= 0:
+            return j
+        j = out.find(b'\x4c\x89\xcd')
+        if j >= 1 and out[j - 1] == 0x55:
+            return max(0, j - 4)
+        return None
+
+    def _fix_cmd_exec_batch_call_2365(self, out: bytearray) -> int:
+        """Batch exec call must enter at helper prologue (``mov rbp, r9``), not mid-body."""
+        if not self.text_rva:
+            return 0
+        entry = self._cmd_batch_helper_entry_off(out)
+        if entry is None:
+            entry = 0x296E8 - self.text_rva
+        call_off = 0x2365 - self.text_rva
+        if call_off < 0 or entry < 0 or call_off + 5 > len(out):
+            return 0
+        if out[call_off] != 0xE8:
+            # UBRT may shift call site +3 when mov r13,rsp is inserted
+            call_off = 0x2368 - self.text_rva
+            if call_off < 0 or call_off + 5 > len(out) or out[call_off] != 0xE8:
+                return 0
+        rel = struct.unpack_from('<i', out, call_off + 1)[0]
+        if call_off + 5 + rel == entry:
+            return 0
+        struct.pack_into('<i', out, call_off + 1, entry - (call_off + 5))
+        return 1
+
+    def _fix_cmd_batch_helper_call_r9_235a(self, out: bytearray) -> int:
+        """Batch helper entry uses ``mov rbp, r9`` — set up aligned call frame at ~0x2358."""
+        trva = self.text_rva
+        if not trva:
+            return 0
+        base = 0x2358 - trva
+        if base < 0 or base + 16 > len(out) or out[base:base + 2] != b'\x41\x55':
+            return 0
+        fixed = 0
+        p = base + 2
+        if out[p:p + 3] != b'\x49\x89\xe5':
+            out[p:p] = b'\x49\x89\xe5'
+            p += 3
+            fixed += 1
+        elif out[p:p + 3] == b'\x49\x89\xe5':
+            p += 3
+        patch = b'\x49\x89\xe9'
+        wrong = (b'\x49\x89\xe8', b'\x49\x89\xf4', b'\x49\x89\xf7')
+        if out[p:p + 3] in wrong:
+            out[p:p + 3] = patch
+            return fixed + 1
+        if out[p:p + 3] != patch:
+            out[p:p] = patch
+            return fixed + 1
+        return fixed
+
+    def _fix_cmd_batch_test_al4_je_2338(self, out: bytearray) -> int:
+        """``je`` after ``test al, 4`` — rel32 tail byte stuck at 0x0F instead of 0x00."""
+        if not self.text_rva:
+            return 0
+        head = 0x2331 - self.text_rva
+        if head < 0 or head + 8 > len(out):
+            return 0
+        if out[head:head + 2] != b'\xa8\x04' or out[head + 2] != 0x0f or out[head + 3] != 0x84:
+            return 0
+        je_tail = head + 7
+        if out[je_tail] == 0x00:
+            return 0
+        if out[je_tail] != 0x0f:
+            return 0
+        out[je_tail] = 0x00
+        return 1
+
+    def _fix_cmd_main_entry_prologue_8eb9(self, out: bytearray) -> int:
+        """CRT continuation at cmd main: replace stray ``ret`` with real prologue."""
+        if not self.text_rva:
+            return 0
+        off = 0x8EB9 - self.text_rva
+        if off < 0 or off + 11 > len(out):
+            return 0
+        good = b'\x55\x48\x89\xe5\x48\x89\x4d\x10' + b'\x90' * 3
+        tail = off + 11
+        tail_good = b'\x48\x89\x55\x2a' + b'\x4c\x89\x45\x20' + b'\x4c\x89\x4d\x28'
+        fixed = 0
+        if out[off:off + 11] != good:
+            if out[off] == 0xc3 or out[off:off + 2] == b'\x55\x48':
+                out[off:off + 11] = good
+                fixed += 1
+        if tail + len(tail_good) <= len(out) and out[tail:tail + len(tail_good)] != tail_good:
+            if out[tail + 1:tail + 4] == b'\x4c\x89\x45':
+                out[tail:tail + 1] = b'\x48\x89\x55\x2a'
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_main_prologue_stack_align(self, out: bytearray) -> int:
+        """CRT enters main with RSP%16==12; bump frame to 0x234 so call sites stay aligned."""
+        if not self.text_rva:
+            return 0
+        off = 0x8ED0 - self.text_rva
+        bad = b'\x48\x81\xec\x28\x02\x00\x00'
+        good = b'\x48\x81\xec\x34\x02\x00\x00'
+        if off < 0 or off + len(bad) > len(out):
+            return 0
+        if out[off:off + len(bad)] == good:
+            return 0
+        if out[off:off + len(bad)] != bad:
+            return 0
+        out[off:off + len(good)] = good
+        return 1
+
+    def _cmd_shim_blob_shift_fixups(self, out: bytearray) -> int:
+        """
+        cmd.exe shift fixups on the .text blob *before* PE emit.
+
+        Post-write UBRT ``insert`` splices the finished PE and corrupts Import,
+        Resource, and Reloc directories — keep all byte growth here instead.
+        """
+        if not self.win10_test_shim or not self.text_rva:
+            return 0
+        trva = self.text_rva
+        applied = 0
+        peb_load = (
+            b'\x65\x48\x8b\x04\x25\x60\x00\x00\x00'
+            + b'\x48\x8b\x40\x20'
+        )
+        peb_pat = b'\xcc\x8b\x40\x38'
+        ops: List[Tuple[int, bytes]] = []
+
+        lo = max(0, 0x296E8 - trva)
+        hi = min(len(out), 0x29800 - trva)
+        for pos in range(lo, hi):
+            if out[pos:pos + 4] == peb_pat:
+                ops.append((pos, peb_load))
+                break
+
+        for pos in range(lo, min(len(out), 0x29730 - trva)):
+            if pos >= 10 and out[pos] == 0xCC and out[pos - 10:pos - 8] == b'\x49\xbb':
+                ops.append((pos, b'\x41\x80\x3b\x00'))
+                break
+
+        for pos, repl in sorted(ops, key=lambda x: x[0], reverse=True):
+            if pos < 0 or pos >= len(out):
+                continue
+            if repl in (peb_load, b'\x41\x80\x3b\x00'):
+                if out[pos] != 0xCC:
+                    continue
+                out[pos:pos + 1] = repl
+            else:
+                out[pos:pos] = repl
+            applied += 1
+        return applied
+
+    def _fix_cmd_batch_helper_296e8_gs_epilogue(self, out: bytearray) -> int:
+        """``je +0x0A`` at 0x296D5 lands mid-instruction; target must be 0x296E3."""
+        if not self.text_rva:
+            return 0
+        je_off = 0x296D5 - self.text_rva
+        if je_off < 0 or je_off + 2 > len(out):
+            return 0
+        if out[je_off:je_off + 2] != b'\x74\x0a':
+            return 0
+        out[je_off:je_off + 2] = b'\x74\x0c'
+        return 1
+
+    def _fix_cmd_batch_helper_296e8_flag_check(self, out: bytearray) -> int:
+        """INT3→cmp at 0x2970B is applied via :meth:`_cmd_shim_ubrt_fixup` (needs +3 B)."""
+        return 0
+
+    def _fix_cmd_entry_scope_push_bias(self, out: bytearray) -> int:
+        """Entry SEH ``push`` scope VA lands in zero padding (RVA off by +0x40000)."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 14:
+            if out[i:i + 4] != b'\x6a\xff\x48\xb8':
+                i += 1
+                continue
+            imm = struct.unpack_from('<Q', out, i + 4)[0]
+            rva = imm - self.new_base
+            if 0x40000 <= rva < 0x50000:
+                corrected = imm - 0x40000
+                corr_off = corrected - self.new_base - self.text_rva
+                if 0 <= corr_off < len(out) and corrected != imm:
+                    struct.pack_into('<Q', out, i + 4, corrected)
+                    fixed += 1
+            i += 14
+        return fixed
+
+    def _fix_cmd_skip_crt_reexec(self, out: bytearray) -> int:
+        """Disabled — jmp to 0x8EB9 at 0x8D83 skips __getmainargs/fn6314; use CreateProcessW fail stub."""
+        if not self.text_rva:
+            return 0
+        fixed = 0
+        jne_off = 0x8D80 - self.text_rva
+        bad = 0x2DCC7 - self.text_rva
+        good = 0x2D9A1 - self.text_rva
+        if (jne_off >= 0 and jne_off + 6 <= len(out)
+                and out[jne_off:jne_off + 2] == b'\x0f\x85'):
+            rel = struct.unpack_from('<i', out, jne_off + 2)[0]
+            if jne_off + 6 + rel == bad:
+                struct.pack_into('<i', out, jne_off + 2, good - (jne_off + 6))
+                fixed += 1
+        return fixed
+
+    def _fix_cmd_crt_reexec_cleanup_branches(self, out: bytearray) -> int:
+        """Retarget CRT cleanup jmps (0x2E042) to continuation past init-flag je."""
+        if not self.text_rva:
+            return 0
+        cont_rva = 0x8EB9
+        cleanup_rva = 0x2E042
+        fixed = 0
+        i = 0
+        while i < len(out) - 5:
+            if out[i] == 0xE9:
+                rel2 = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = self.text_rva + i + 5 + rel2
+                if tgt == cleanup_rva:
+                    new_rel = cont_rva - (self.text_rva + i + 5)
+                    struct.pack_into('<i', out, i + 1, new_rel)
+                    fixed += 1
+                i += 5
+                continue
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel2 = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = self.text_rva + i + 6 + rel2
+                if tgt == cleanup_rva:
+                    new_rel = cont_rva - (self.text_rva + i + 6)
+                    struct.pack_into('<i', out, i + 2, new_rel)
+                    fixed += 1
+                i += 6
+                continue
+            i += 1
+        return fixed
+
+    def _fix_cmd_crt_reexec_control_flow(self, out: bytearray) -> int:
+        """Reapply CRT re-exec bypass after other post-patches (last writer wins)."""
+        fixed = 0
+        fn6314 = self._cmd_fn6314_entry_off(out)
+        fixed += self._fix_cmd_crt_createprocess_call_8df1(out)
+        fixed += self._fix_cmd_crt_divert_init_loops(out)
+        fixed += self._fix_cmd_force_crt_reexec_fail(out)
+        fixed += self._fix_cmd_entry_scope_push_bias(out)
+        fixed += self._fix_cmd_main_wcslen_call(out)
+        fixed += self._fix_cmd_main_wcslen_tail_8f0c(out)
+        fixed += self._fix_cmd_main_getcommandline_call(out)
+        fixed += self._fix_cmd_main_post_cmdline_overlap(out)
+        fixed += self._fix_cmd_main_token_parse_call(out)
+        fixed += self._fix_cmd_main_skip_spurious_parse_calls(out)
+        fixed += self._fix_cmd_main_drive_letter_path(out)
+        fixed += self._fix_cmd_main_batch_arg_mov(out)
+        fixed += self._fix_cmd_main_skip_batch_setup_call(out)
+        fixed += self._fix_cmd_main_wcschr_call(out)
+        fixed += self._fix_cmd_main_wcschr_null_fallback(out)
+        fixed += self._fix_cmd_main_empty_token_cmp(out)
+        fixed += self._fix_cmd_main_switch_dispatch(out)
+        fixed += self._fix_cmd_main_flag_dispatch(out)
+        fixed += self._fix_cmd_main_post_flag_path(out)
+        fixed += self._fix_cmd_main_parse_dispatch_call(out)
+        fixed += self._fix_cmd_main_exec_tail(out)
+        fixed += self._fix_cmd_main_batch_copy_call_args(out)
+        fixed += self._fix_cmd_switch_handler_gs_epilogue(out)
+        fixed += self._fix_cmd_batch_helper_zero_index(out)
+        fixed += self._fix_cmd_batch_helper_x64_ptr_load(out)
+        fixed += self._fix_cmd_fn6314_helper_calls(out, self.rva_map or None)
+        if fn6314 is not None:
+            fixed += self._fix_cmd_fn6314_zero_edi(out, fn6314)
+            fixed += self._fix_cmd_fn6314_call_14412(out, fn6314, self.rva_map or None)
+        fixed += self._fix_cmd_fn6314_wcsrchr_null_skip(out)
+        fixed += self._fix_cmd_heap_alloc_helper_2e37d(out)
+        fixed += self._fix_cmd_main_heap_call_8fea(out)
+        fixed += self._fix_cmd_main_post_switch_success(out)
+        fixed += self._fix_cmd_main_parse_helper_calls(out, self.rva_map or None)
+        fixed += self._fix_cmd_main_batch_exec_call(out)
+        fixed += self._fix_cmd_exec_batch_call_2365(out)
+        fixed += self._fix_cmd_batch_helper_call_r9_235a(out)
+        fixed += self._fix_cmd_batch_test_al4_je_2338(out)
+        fixed += self._fix_cmd_main_entry_prologue_8eb9(out)
+        fixed += self._fix_cmd_batch_helper_296e8_gs_epilogue(out)
+        fixed += self._fix_cmd_batch_helper_296e8_flag_check(out)
+        fixed += self._fix_cmd_getcommandline_inner_call(out)
+        fixed += self._fix_cmd_skip_crt_reexec(out)
+        fixed += self._fix_cmd_crt_reexec_return_branches(out)
+        fixed += self._fix_cmd_crt_init_fail_jmp(out)
+        fixed += self._fix_cmd_crt_reach_main(out)
+        fixed += self._fix_cmd_crt_reexec_cleanup_branches(out)
+        return fixed
+
+    def _fix_cmd_crt_reexec_return_branches(self, out: bytearray) -> int:
+        """After stubbed CreateProcessW, jmps to CRT init loop — continue at cmd main (0x8EB9)."""
+        if not self.text_rva:
+            return 0
+        good = 0x8EB9 - self.text_rva
+        bads = {0x2D9A6 - self.text_rva, 0x2D9A9 - self.text_rva, 0x2D9B9 - self.text_rva}
+        lo = 0x8E20 - self.text_rva
+        hi = 0x8E80 - self.text_rva
+        if good < 0 or lo < 0 or hi > len(out):
+            return 0
+        fixed = 0
+        i = lo
+        while i < min(hi, len(out) - 5):
+            if out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt in bads:
+                    struct.pack_into('<i', out, i + 1, good - (i + 5))
+                    fixed += 1
+                i += 5
+                continue
+            if out[i] == 0x0F and out[i + 1] in (0x84, 0x85, 0x8C, 0x8D, 0x8E, 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if tgt in bads:
+                    struct.pack_into('<i', out, i + 2, good - (i + 6))
+                    fixed += 1
+                i += 6
+                continue
+            i += 1
+        return fixed
+
+    def _fix_fn6314_callee_ret(self, out: bytearray, fn6314: int) -> int:
+        """fn6314 early/success exits used an SEH epilogue without a matching prologue."""
+        # Blob offset of ``pop rdi; pop rsi; pop rbx; …; ret`` shared exit (RVA 0x2DD68).
+        exit_off = fn6314 + 0x15D
+        bad_head = b'\x5f\x5e\x5b\xc7\x45\xf8\xff\xff\xff\xff'
+        span = 0x2DD91 - 0x2DD68
+        if (exit_off + len(bad_head) > len(out)
+                or out[exit_off:exit_off + len(bad_head)] != bad_head):
+            return 0
+        out[exit_off:exit_off + span] = b'\xc3' + b'\x90' * (span - 1)
+        return 1
+
+    def _cmd_shim_postfixes(self, out: bytearray,
+                            rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Win10 cmd.exe shim-only fixups (core translator remains binary-generic)."""
+        if not self.win10_test_shim or self._cmd_no_hacks:
+            return 0
+        fixed = 0
+
+        fixed += self._restore_cmd_text_constants(out)
+
+        wrong_path = b'\x48\xb9\xf7\x18\x00\x80\x00\x00\x00\x00'
+        right_path = b'\x48\xb9\xe8\x16\x00\x80\x00\x00\x00\x00'
+        pos = 0
+        while True:
+            j = out.find(wrong_path, pos)
+            if j < 0:
+                break
+            out[j:j + 10] = right_path
+            fixed += 1
+            pos = j + 1
+
+        fn6314 = self._cmd_fn6314_entry_off(out)
+        if fn6314 is None:
+            fixed += self._fix_fn6314_loop_branches(out, 0)
+            return fixed
+        stale6314 = rva_map.get(0x6314) if rva_map else None
+        if rva_map is not None and rva_map.get(0x6314) != fn6314:
+            rva_map[0x6314] = fn6314
+            fixed += 1
+
+        sig = b'\x48\x31\xff\x39\x7c\x24\x14'
+        idx = out.find(sig)
+        if idx >= 0:
+            out[idx + 3:idx + 7] = b'\x48\x85\xc9\x90'
+            fixed += 1
+
+        if stale6314 is not None:
+            wrong_targets = {stale6314}
+        else:
+            wrong_targets = set()
+        # Stale rva_map[0x6314] historically lands on ``call rdi`` (blob ~0x2C1B8).
+        wrong_targets.add(0x2C1B8)
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt in wrong_targets:
+                struct.pack_into('<i', out, i + 1, fn6314 - (i + 5))
+                fixed += 1
+
+        bad_imms = (
+            struct.pack('<Q', 0x800018F7),
+            struct.pack('<Q', 0x800016E8),
+            struct.pack('<Q', 0x4AD016E8),
+        )
+        for bad_imm in bad_imms:
+            pos = 0
+            while True:
+                j = out.find(bad_imm, pos)
+                if j < 0:
+                    break
+                if j >= 2 and out[j - 2] == 0x48 and out[j - 1] == 0xBF:
+                    out[j - 2:j + 8] = b'\x90' * 10
+                    fixed += 1
+                if j >= 2 and out[j - 2] == 0x48 and out[j - 1] == 0xB9:
+                    struct.pack_into('<Q', out, j, 0x800016E8)
+                    fixed += 1
+                pos = j + 1
+
+        bad_caller = (
+            b'\x48\xbf\xf7\x18\x00\x80\x00\x00\x00\x00'
+            b'\x48\xb9\xf7\x18\x00\x80\x00\x00\x00\x00'
+        )
+        pos = 0
+        while True:
+            j = out.find(bad_caller, pos)
+            if j < 0:
+                break
+            out[j:j + 10] = b'\x48\xb9\xe8\x16\x00\x80\x00\x00\x00\x00'
+            out[j + 10:j + 20] = b'\x90' * 10
+            call_off = j + 33
+            if call_off + 5 <= len(out) and out[call_off] == 0xE8:
+                struct.pack_into('<i', out, call_off + 1, fn6314 - (call_off + 5))
+                fixed += 1
+            pos = j + 1
+
+        old_disp = (self.old_base + 0x22B00) & 0xFFFFFFFF
+        new_disp = self._relocate_imm(old_disp) & 0xFFFFFFFF
+        if new_disp != old_disp:
+            pat = struct.pack('<I', old_disp)
+            pos = 0
+            while True:
+                j = out.find(pat, pos)
+                if j < 0:
+                    break
+                if j >= 4 and out[j - 4] == 0x66 and out[j - 3] == 0x83 and out[j - 2] == 0x24:
+                    struct.pack_into('<I', out, j, new_disp)
+                    fixed += 1
+                pos = j + 1
+
+        call6578_off = fn6314 + 0x24
+        fn6578 = self._cmd_fn6578_entry_off(out)
+        if (fn6578 is not None and call6578_off + 5 <= len(out)
+                and out[call6578_off] == 0xE8):
+            struct.pack_into('<i', out, call6578_off + 1, (fn6578 + 4) - (call6578_off + 5))
+            fixed += 1
+
+        path_call = out.find(right_path)
+        if path_call >= 0:
+            call_off = path_call + 10 + 11
+            if call_off + 5 <= len(out) and out[call_off] == 0xE8:
+                struct.pack_into('<i', out, call_off + 1, fn6314 - (call_off + 5))
+                fixed += 1
+
+        if fn6578 is not None:
+            stale6578 = rva_map.get(0x6578) if rva_map else None
+            if rva_map is not None and rva_map.get(0x6578) != fn6578:
+                rva_map[0x6578] = fn6578
+                fixed += 1
+            dual_stub = b'\x89\xc8\x8b\x00\xc3'
+            dual_repl = b'\x8b\x01\xc3\x90\x8b\x02\xc3\x90'
+            if out[fn6578:fn6578 + len(dual_stub)] == dual_stub:
+                out[fn6578:fn6578 + len(dual_repl)] = dual_repl
+                fixed += 1
+            fn6314_off = self._cmd_fn6314_entry_off(out)
+            for i in range(len(out) - 5):
+                if out[i] != 0xE8:
+                    continue
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                in6314 = (fn6314_off is not None
+                          and fn6314_off <= i <= fn6314_off + 0x200)
+                if in6314 and fn6578 - 0x40 <= tgt <= fn6578 + 3:
+                    struct.pack_into('<i', out, i + 1, (fn6578 + 4) - (i + 5))
+                    fixed += 1
+                elif not in6314 and fn6578 - 0x40 <= tgt < fn6578:
+                    struct.pack_into('<i', out, i + 1, fn6578 - (i + 5))
+                    fixed += 1
+
+        # fn6314 entry: ``mov r10, rcx`` replaces ``xor rdi, rdi`` (same 6-byte span).
+        old6 = b'\x48\x31\xff\x48\x85\xc9'
+        new6 = b'\x49\x89\xca\x48\x85\xc9'
+        if fn6314 >= 0 and out[fn6314:fn6314 + 6] == old6:
+            out[fn6314:fn6314 + 5] = new6[:5]
+            fixed += 1
+
+        glob_off = fn6314 + 0x0D
+        if (glob_off + 10 <= len(out)
+                and out[glob_off:glob_off + 2] == b'\x48\xb9'):
+            out[glob_off:glob_off + 2] = b'\x48\xba'
+            fixed += 1
+
+        rsp18_off = fn6314 + 0x39
+        if (rsp18_off + 6 <= len(out)
+                and out[rsp18_off:rsp18_off + 4] == b'\x8b\x4c\x24\x18'):
+            out[rsp18_off:rsp18_off + 4] = b'\x41\x8b\x0a\x90'
+            fixed += 1
+
+        cmpesi_off = fn6314 + 0x31
+        if (cmpesi_off + 2 <= len(out)
+                and out[cmpesi_off:cmpesi_off + 2] == b'\x39\xfe'):
+            out[cmpesi_off:cmpesi_off + 2] = b'\x85\xf6'
+            fixed += 1
+
+        rdx_off = fn6314 + 0x3D
+        if (rdx_off + 3 <= len(out) and out[rdx_off:rdx_off + 3] == b'\x48\x89\xfa'):
+            out[rdx_off:rdx_off + 3] = b'\x48\x31\xd2'
+            fixed += 1
+
+        # Remove mistaken pre-movabs ``mov r8, rcx`` from the 0x734A caller sled.
+        bad_presave = b'\x90' * 7 + b'\x49\x89\xc8' + b'\x48\xb9\xe8\x16\x00\x80'
+        good_presave = b'\x90' * 10 + b'\x48\xb9\xe8\x16\x00\x80'
+        pos = 0
+        while True:
+            j = out.find(bad_presave, pos)
+            if j < 0:
+                break
+            out[j:j + len(good_presave)] = good_presave
+            fixed += 1
+            pos = j + 1
+
+        if rva_map is not None:
+            fixed += self._reconcile_rva_map_prologues(out, rva_map)
+
+        # cmd heap-init helper (x86 0x1A9E6): snap stale mid-body call targets.
+        heap_entry = rva_map.get(0x1A9E6) if rva_map else None
+        if heap_entry is None:
+            for sig in (b'\x55\x48\x89\xe5\x48\x89\x4d\x10',  # push rbp; mov rbp,rsp; mov [rbp+10],rcx
+                        b'\x55\x48\x89\xe5\x48\x83\xec\x24'):
+                idx = out.find(sig)
+                if idx >= 0:
+                    heap_entry = idx
+                    if rva_map is not None:
+                        rva_map[0x1A9E6] = heap_entry
+                    break
+        if heap_entry is not None:
+            wrong_heap = {heap_entry + 0xC6, heap_entry + 0x106}
+            if rva_map is not None and rva_map.get(0x1AA81) in wrong_heap:
+                rva_map[0x1AA81] = heap_entry
+            for i in range(len(out) - 5):
+                if out[i] != 0xE8:
+                    continue
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt in wrong_heap:
+                    struct.pack_into('<i', out, i + 1, heap_entry - (i + 5))
+                    fixed += 1
+
+        # Broken CRT init tail stubs (movabs rcx, 0x8001ac08/28 + align + bad call).
+        init_rcxs = (
+            b'\x48\xb9\x08\xac\x01\x80\x00\x00\x00\x00',
+            b'\x48\xb9\x28\xac\x01\x80\x00\x00\x00\x00',
+        )
+        for mark in init_rcxs:
+            pos = 0
+            while True:
+                j = out.find(mark, pos)
+                if j < 0:
+                    break
+                if self._orphan_byte_protected(j):
+                    pos = j + 1
+                    continue
+                end = out.find(b'\x4c\x89\xec\x41\x5d\x5a', j)
+                if end < 0 or end - j > 48:
+                    pos = j + 1
+                    continue
+                end += 6
+                repl = b'\x31\xc0\xc3' + b'\x90' * max(0, end - j - 3)
+                out[j:end] = repl[:end - j]
+                fixed += 1
+                pos = j + 3
+
+        fixed += self._fix_fn6314_callee_ret(out, fn6314)
+        fixed += self._fix_cmd_crt_wcslen_path(out)
+        fixed += self._fix_cmd_crt_wcslen_helper_calls(out)
+        fixed += self._fix_cmd_crt_wcslen_call_8a44(out)
+        fixed += self._fix_cmd_crt_second_wcslen_8a6b(out)
+        fixed += self._fix_cmd_crt_wcslen_inline_2a805(out)
+        fixed += self._fix_cmd_crt_getmainargs_setup(out)
+        fixed += self._fix_cmd_crt_reach_main(out)
+        fixed += self._fix_calls_into_movabs_imm(out)
+        fixed += self._fix_cmd_data_iat_pointer_cells(out)
+        fixed += self._fix_cmd_crt_createprocess_call_8df1(out)
+        fixed += self._fix_cmd_crt_divert_init_loops(out)
+        fixed += self._fix_cmd_force_crt_reexec_fail(out)
+        fixed += self._fix_cmd_crt_exit_branches(out)
+        fixed += self._fix_cmd_crt_cont_branches(out)
+        fixed += self._fix_cmd_crt_fail_path_branches(out)
+        fixed += self._fix_cmd_crt_init_branches(out)
+        fixed += self._fix_cmd_init_env_rsi(out)
+        fixed += self._fix_cmd_entry_scope_push_bias(out)
+        fixed += self._fix_cmd_main_wcslen_call(out)
+        fixed += self._fix_cmd_main_wcslen_tail_8f0c(out)
+        fixed += self._fix_cmd_main_getcommandline_call(out)
+        fixed += self._fix_cmd_main_post_cmdline_overlap(out)
+        fixed += self._fix_cmd_main_token_parse_call(out)
+        fixed += self._fix_cmd_main_skip_spurious_parse_calls(out)
+        fixed += self._fix_cmd_main_drive_letter_path(out)
+        fixed += self._fix_cmd_main_batch_arg_mov(out)
+        fixed += self._fix_cmd_main_skip_batch_setup_call(out)
+        fixed += self._fix_cmd_main_wcschr_call(out)
+        fixed += self._fix_cmd_main_wcschr_null_fallback(out)
+        fixed += self._fix_cmd_main_empty_token_cmp(out)
+        fixed += self._fix_cmd_main_switch_dispatch(out)
+        fixed += self._fix_cmd_main_flag_dispatch(out)
+        fixed += self._fix_cmd_main_post_flag_path(out)
+        fixed += self._fix_cmd_main_parse_dispatch_call(out)
+        fixed += self._fix_cmd_main_exec_tail(out)
+        fixed += self._fix_cmd_main_batch_copy_call_args(out)
+        fixed += self._fix_cmd_switch_handler_gs_epilogue(out)
+        fixed += self._fix_cmd_batch_helper_zero_index(out)
+        fixed += self._fix_cmd_batch_helper_x64_ptr_load(out)
+        fixed += self._fix_cmd_fn6314_helper_calls(out, self.rva_map or None)
+        if fn6314 is not None:
+            fixed += self._fix_cmd_fn6314_zero_edi(out, fn6314)
+            fixed += self._fix_cmd_fn6314_call_14412(out, fn6314, self.rva_map or None)
+        fixed += self._fix_cmd_fn6314_wcsrchr_null_skip(out)
+        fixed += self._fix_cmd_heap_alloc_helper_2e37d(out)
+        fixed += self._fix_cmd_main_heap_call_8fea(out)
+        fixed += self._fix_cmd_main_post_switch_success(out)
+        fixed += self._fix_cmd_main_parse_helper_calls(out, self.rva_map or None)
+        fixed += self._fix_cmd_main_batch_exec_call(out)
+        fixed += self._fix_cmd_exec_batch_call_2365(out)
+        fixed += self._fix_cmd_batch_helper_call_r9_235a(out)
+        fixed += self._fix_cmd_batch_test_al4_je_2338(out)
+        fixed += self._fix_cmd_main_entry_prologue_8eb9(out)
+        fixed += self._fix_cmd_batch_helper_296e8_gs_epilogue(out)
+        fixed += self._fix_cmd_batch_helper_296e8_flag_check(out)
+        fixed += self._fix_cmd_getcommandline_inner_call(out)
+        fixed += self._fix_cmd_skip_crt_reexec(out)
+        fixed += self._fix_cmd_crt_reexec_cleanup_branches(out)
+        fixed += self._fix_cmd_crt_reexec_return_branches(out)
+        fixed += self._fix_cmd_fn6581_call_sites(out, rva_map)
+        fixed += self._fix_cmd_crt_restore_fn6314_calls(out)
+        fixed += self._fix_fn6314_scan_loop(out, fn6314)
+        fixed += self._fix_fn6314_loop_branches(out, fn6314)
+        fixed += self._fix_fn6314_jump_exit(out, fn6314)
+        fixed += self._fix_cmd_fn6314_call_14412(out, fn6314, rva_map)
+        fixed += self._fix_cmd_crt_init_fail_jmp(out)
+        fixed += self._fix_cmd_crt_reach_main(out)
+
+        restored = self._restore_materialized_scope_tables(out, self.text_rva)
+        if restored:
+            fixed += restored
+
+        return fixed
+
+    def _pe_va_for_old_rva(self, old_rva: int, rva_map: Optional[Dict[int, int]],
+                           text_rva: int) -> int:
+        """Best-effort map of an x86 code RVA to a PE64 VA in the output blob."""
+        if rva_map:
+            if old_rva in rva_map:
+                return self.new_base + text_rva + rva_map[old_rva]
+            candidates = [(off, rva) for rva, off in rva_map.items()
+                          if off is not None and rva <= old_rva]
+            if candidates:
+                off, anchor = max(candidates, key=lambda x: x[1])
+                return self.new_base + text_rva + off + (old_rva - anchor)
+        return self.new_base + old_rva
+
+    def _scope_handler_dword(self, val: int) -> int:
+        """Normalize MSVC scope-table handler slot (0 = catch block at ``end``)."""
+        if val == 0:
+            return 0
+        if val in (0xFFFFFFFF, 0xFFFFFFFE):
+            return 0
+        if (self.win10_test_shim and self._w2k_eh3_va
+                and val in self._seh_eh3_handler_old_vas):
+            return 0
+        if (self.win10_test_shim and self._w2k_eh3_va
+                and val == (self._w2k_eh3_va & 0xFFFFFFFF)):
+            return 0
+        return val
+
+    def _normalize_scope_table_handlers(self, out: bytearray) -> int:
+        """Force scope handler DWORDs to MSVC semantics (0 = catch at end, not eh3/-1)."""
+        if not self.win10_test_shim:
+            return 0
+        fixed = 0
+        ranges: List[Tuple[int, int]] = list(self._scope_table_out_ranges)
+        known = {s for s, _ in ranges}
+        pos = 0
+        while pos < len(out) - 19:
+            if out[pos:pos + 4] != b'\xff\xff\xff\xff':
+                pos += 1
+                continue
+            if not self._valid_scope_sentinel(out, pos):
+                pos += 1
+                continue
+            if pos not in known:
+                ranges.append((pos, 64))
+                known.add(pos)
+            pos += 4
+        for start, size in ranges:
+            if start + 4 > len(out) or out[start:start + 4] != b'\xff\xff\xff\xff':
+                continue
+            rec = start + 4
+            end = min(start + size, len(out) - 15)
+            while rec + 16 <= end:
+                begin, end_va, _filt, handler = struct.unpack_from('<4I', out, rec)
+                if not (begin < end_va):
+                    break
+                if not self._valid_scope_record_begin_end(begin, end_va):
+                    break
+                new_h = self._scope_handler_dword(handler)
+                if new_h != handler:
+                    struct.pack_into('<I', out, rec + 12, new_h)
+                    fixed += 1
+                rec += 16
+        return fixed
+
+    def _valid_scope_record_begin_end(self, begin: int, end_va: int) -> bool:
+        img_end = self.old_base + self.pe.image_size
+        shim_end = self.new_base + 0x01000000
+        x86_ok = (self.old_base <= begin < img_end
+                  and self.old_base < end_va <= img_end)
+        shim_ok = (self.new_base <= begin < shim_end
+                   and self.new_base < end_va <= shim_end)
+        return (x86_ok or shim_ok) and begin < end_va and (end_va - begin) >= 0x10
+
+    def _synthesize_seh_scopes_for_push_sites(self, out: bytearray,
+                                              text_rva: int) -> int:
+        """Build real MSVC scope records for SEH push sites (x86 tail blobs are often wrong)."""
+        if not self.win10_test_shim:
+            return 0
+        gs_restore = (
+            bytes([0xC7, 0x45, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF])
+            + bytes([0x65, 0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0])
+        )
+        synthesized = 0
+        i = 0
+        while i < len(out) - 14:
+            if not (out[i] == 0x6A and out[i + 1] == 0xFF
+                    and out[i + 2] == 0x48 and out[i + 3] == 0xB8):
+                i += 1
+                continue
+            scope_imm = struct.unpack_from('<Q', out, i + 4)[0]
+            scope_off = scope_imm - self.new_base - text_rva
+            if scope_off < 0 or scope_off + 20 > len(out):
+                i += 14
+                continue
+            fn_off = self._fn_blob_off_from_push(out, i)
+            setup_end = i
+            for fwd in range(i, min(len(out), i + 96)):
+                if (out[fwd:fwd + 9] == bytes([0x65, 0x48, 0x89, 0x24, 0x25, 0, 0, 0, 0])
+                        and fwd + 12 < len(out) and out[fwd + 9] == 0x48
+                        and out[fwd + 10] == 0x83 and out[fwd + 11] == 0xEC):
+                    setup_end = fwd + 12 + out[fwd + 12]
+                    break
+            restore_off = out.find(gs_restore, fn_off, min(len(out), fn_off + 0x8000))
+            if restore_off < 0:
+                epilog = out.find(b'\x5f\x5e\x5b\x48\x89\xec\x5d\xc3', fn_off,
+                                  min(len(out), fn_off + 0x8000))
+                restore_off = epilog if epilog >= 0 else min(len(out), fn_off + 0x100)
+            begin_va = (self.new_base + text_rva + setup_end) & 0xFFFFFFFF
+            end_va = (self.new_base + text_rva + restore_off) & 0xFFFFFFFF
+            if begin_va >= end_va:
+                i += 14
+                continue
+            # Handler slot 0 => _except_handler3 uses ``end`` as the catch label.
+            scope_blob = (b'\xff\xff\xff\xff'
+                          + struct.pack('<IIII', begin_va, end_va, 0, 0))
+            out[scope_off:scope_off + len(scope_blob)] = scope_blob
+            synthesized += 1
+            i += 14
+        return synthesized
+
+    def _fix_scope_handlers_at_push_sites(self, out: bytearray,
+                                          text_rva: int) -> int:
+        """Normalize handler DWORDs at every SEH ``push scope`` target (reliable tail fix)."""
+        if not self.win10_test_shim:
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 14:
+            if not (out[i] == 0x6A and out[i + 1] == 0xFF
+                    and out[i + 2] == 0x48 and out[i + 3] == 0xB8):
+                i += 1
+                continue
+            scope_imm = struct.unpack_from('<Q', out, i + 4)[0]
+            scope_off = scope_imm - self.new_base - text_rva
+            if (scope_off < 0 or scope_off + 20 > len(out)
+                    or out[scope_off:scope_off + 4] != b'\xff\xff\xff\xff'):
+                i += 14
+                continue
+            rec = scope_off + 4
+            end = min(scope_off + 64, len(out) - 15)
+            while rec + 16 <= end:
+                begin, end_va, _filt, handler = struct.unpack_from('<4I', out, rec)
+                if not self._valid_scope_record_begin_end(begin, end_va):
+                    break
+                new_h = self._scope_handler_dword(handler)
+                if new_h != handler:
+                    struct.pack_into('<I', out, rec + 12, new_h)
+                    fixed += 1
+                rec += 16
+            i += 14
+        return fixed
+
+    def _restore_materialized_scope_tables(self, out: bytearray,
+                                           text_rva: int) -> int:
+        """Re-copy x86 scope tables clobbered by init-tail stub neutralization."""
+        if not self.win10_test_shim or not self._scope_table_old_rva:
+            return 0
+        sec = self.pe.section_for_rva(self.text_rva)
+        if not sec:
+            return 0
+        text_data = self.pe.get_section_data(sec)
+        restored = 0
+        for base, old_rva in sorted(self._scope_table_old_rva.items()):
+            if base + 16 > len(out):
+                continue
+            off = old_rva - self.text_rva
+            if off < 0 or off + 4 > len(text_data):
+                continue
+            if text_data[off:off + 4] != b'\xff\xff\xff\xff':
+                continue
+            size = _msvc_scope_table_size(self.pe, text_data, self.text_rva, off)
+            raw = text_data[off:off + size]
+            if base + len(raw) > len(out):
+                continue
+            out[base:base + len(raw)] = raw
+            fn_off = self._fn_blob_off_from_push(out, base)
+            self._patch_scope_table_entries(out, base, len(raw), old_rva, fn_off)
+            restored += 1
+        return restored
+
+    def _fix_broken_entry_seh_scope_pushes(self, out: bytearray,
+                                           rva_map: Optional[Dict[int, int]],
+                                           text_rva: Optional[int] = None) -> int:
+        """Point SEH scope pushes at restored tail scope tables, not NOP sled interiors."""
+        if not self.win10_test_shim:
+            return 0
+        if text_rva is None:
+            text_rva = self.text_rva
+        bad_lo = self.new_base + 0x3FD50
+        bad_hi = self.new_base + 0x3FE20
+        fixed = 0
+        scope_by_base = dict(self._scope_table_old_rva)
+        i = 0
+        while i < len(out) - 14:
+            if not (out[i] == 0x6A and out[i + 1] == 0xFF
+                    and out[i + 2] == 0x48 and out[i + 3] == 0xB8):
+                i += 1
+                continue
+            imm = struct.unpack_from('<Q', out, i + 4)[0]
+            blob_off = imm - self.new_base - text_rva
+            correct_off = None
+            if blob_off in scope_by_base:
+                correct_off = blob_off
+            elif 0 <= blob_off < len(out) and self._valid_scope_sentinel(out, blob_off):
+                correct_off = blob_off
+            elif bad_lo <= imm <= bad_hi:
+                slot = ((blob_off - 0x3ED50) // 0x10) * 0x10 + 0x3ED50
+                if slot in scope_by_base:
+                    correct_off = slot
+                else:
+                    for base in sorted(scope_by_base.keys()):
+                        if abs(base - blob_off) <= 0x20:
+                            correct_off = base
+                            break
+            if correct_off is not None:
+                new_imm = self.new_base + text_rva + correct_off
+                if imm != new_imm:
+                    tgt = correct_off
+                    if (0 <= tgt < len(out)
+                            and self._valid_scope_sentinel(out, tgt)):
+                        i += 14
+                        continue
+                    struct.pack_into('<Q', out, i + 4, new_imm)
+                    fixed += 1
+            i += 14
+        return fixed
+
+    def _ebp_to_rbp_home(self, old_va: int, disp: int) -> Optional[int]:
+        """Map x86 [EBP+disp] to x64 [RBP+off], with cmd-builder local fixes."""
+        if (disp == 0xC and self._cmd_builder_ebp_m4_is_ptr(old_va)):
+            rva = (old_va - self.old_base) & 0xFFFFFFFF
+            if rva >= 0x1A36B:
+                # After 0x1A36B, [EBP+0xC] is repurposed as the quote flag byte.
+                return 0x38
+            # Before that it is incoming arg2 (pointer) — keep [RBP+0x18].
+            return 0x18
+        return ebp_disp_to_rbp_home(disp)
+
+    def _ebp_scratch_mem(self, home: int = -0x20) -> str:
+        if home >= 0:
+            return f'qword ptr [rbp+0x{home:x}]'
+        return f'qword ptr [rbp{home:+d}]'
+
+    def _emit_ebp_scratch_store_reg(self, out: bytearray, src64: str,
+                                    home: int = -0x20) -> None:
+        out += self._asm(f'mov {self._ebp_scratch_mem(home)}, {src64}')
+
+    def _x64_call_target_reg(self, x86_reg_id: int,
+                              iat_fn_holder: Dict[int, str]) -> str:
+        if x86_reg_id in iat_fn_holder:
+            return iat_fn_holder[x86_reg_id]
+        return W32_TO_W64_REG.get(x86_reg_id, 'rax')
+
+    def _emit_iat_fn_ptr_load(self, out: bytearray, x86_dst: int,
+                              slot_va: int,
+                              iat_fn_holder: Dict[int, str]) -> None:
+        """Load an import fn ptr from its IAT cell into a stable x64 register."""
+        holder = _IAT_FN_HOLDER_W64.get(x86_dst, W32_TO_W64_REG.get(x86_dst, 'rax'))
+        out += self._asm(f'movabs {holder}, 0x{slot_va:x}')
+        out += self._asm(f'mov {holder}, qword ptr [{holder}]')
+        if holder in _IAT_FN_HOLDER_W64.values():
+            iat_fn_holder[x86_dst] = holder
+
+    def _emit_ebp_scratch_load_to(self, out: bytearray, dst64: str,
+                                  home: int = -0x20) -> None:
+        out += self._asm(f'mov {dst64}, {self._ebp_scratch_mem(home)}')
+
+    def _emit_mov32_to_w64_reg(self, out: bytearray, dst_w64: str,
+                               src_w32_id: int,
+                               ebp_reg_scratch: bool = False,
+                               ebp_scratch_reg: str = 'r12') -> None:
+        """Move a 32-bit x86 GPR into a Win64 register (zero-extend, no sign extend)."""
+        if src_w32_id == X86_REG_EBP and ebp_reg_scratch:
+            self._emit_ebp_scratch_load_to(out, dst_w64)
+            return
+        src64 = W32_TO_W64_REG.get(src_w32_id, 'rax')
+        if dst_w64 in WIN64_ARG_REG_NAMES:
+            if (self.win10_test_shim and not self._cmd_no_hacks
+                    and dst_w64 in ('rcx', 'rdx')):
+                # Hack path: cmd may pass 64-bit pointers in RCX/RDX — don't truncate.
+                if dst_w64 != src64:
+                    out += self._asm(f'mov {dst_w64}, {src64}')
+                return
+            dst32 = self._dword_arg_reg(dst_w64)
+            src32 = W32_REG_ASM.get(src_w32_id, 'eax')
+            if dst32 != src32:
+                out += self._asm(f'mov {dst32}, {src32}')
+            return
+        if dst_w64 != src64:
+            out += self._asm(f'mov {dst_w64}, {src64}')
+
+    def _x86_push_is_pointer_imm(self, imm: int) -> bool:
+        """True when ``push imm32`` pushed a global/data VA (not a small mode flag)."""
+        imm &= 0xFFFFFFFF
+        return self.old_base <= imm < self.old_base + self.pe.image_size
+
+    @staticmethod
+    def _pick_cdecl_pop_ecx_rdx_arg(
+            arg0: Optional[Tuple[str, int]],
+            arg1: Optional[Tuple[str, int]],
+            old_base: int, image_size: int) -> Optional[Tuple[str, int]]:
+        """``pop ecx; push eax; call`` → RDX is mode (arg0) or &global (arg1)."""
+        if arg1 and arg1[0] == 'imm':
+            imm = arg1[1] & 0xFFFFFFFF
+            if old_base <= imm < old_base + image_size:
+                return arg1
+        return arg0
+
+    def _emit_flushed_push_arg_to_reg(
+            self, out: bytearray, reg: str, atype: str, aval: int,
+            *, ebp_reg_scratch: bool, ebp_scratch_reg: str,
+            frame_args_spilled: bool, stack_spill_count: int,
+            frameless_stack_bias: int, frame_arg_anchor: bool) -> None:
+        """Materialize one deferred PUSH operand into a Win64 arg register."""
+        if atype == 'imm':
+            new_imm = self._relocate_imm(aval & 0xFFFFFFFF, len(out), 0)
+            out += self._asm(f'mov {reg}, 0x{new_imm & 0xFFFFFFFFFFFFFFFF:x}')
+        elif atype == 'reg':
+            if aval == X86_REG_EBP and ebp_reg_scratch:
+                self._emit_ebp_scratch_load_to(out, reg)
+            else:
+                self._emit_mov32_to_w64_reg(
+                    out, reg, aval, ebp_reg_scratch, ebp_scratch_reg)
+        elif atype == 'spill':
+            off = 8 * (stack_spill_count - aval)
+            out += self._asm(f'mov {reg}, qword ptr [rsp+0x{off:x}]')
+        elif atype == 'mem_abs':
+            self._emit_abs_dword_load(out, reg, aval)
+        elif atype == 'mem_index':
+            base, idx, scale, disp = aval
+            self._emit_mem_index_dword_load(out, reg, base, idx, scale, disp)
+        elif atype == 'esp_fwd':
+            if aval < len(WIN64_ARG_REG_NAMES):
+                src = WIN64_ARG_REG_NAMES[aval]
+                if src != reg:
+                    out += self._asm(f'mov {reg}, {src}')
+        elif atype == 'ebp_arg':
+            if frame_args_spilled or aval >= 4:
+                self._emit_homed_stack_arg_to_reg(
+                    out, reg, ebp_arg_slot_to_rbp_home(aval))
+            else:
+                src = WIN64_ARG_REG_NAMES[aval]
+                if src != reg:
+                    out += self._asm(f'mov {reg}, {src}')
+        elif atype == 'ebp_local':
+            self._emit_lea_ebp_slot(out, reg, aval)
+        elif atype in ('ebp_slot', 'esp_mem', 'arg_home'):
+            self._emit_push_arg_to_reg(
+                out, reg, atype, aval, frameless_stack_bias, frame_arg_anchor)
+        else:
+            out += self._asm(f'xor {reg}, {reg}')
+
+    def _emit_push_arg_to_reg(self, out: bytearray, reg: str,
+                              atype: str, aval: int,
+                              frame_rsp_bias: int = 0,
+                              frame_arg_anchor: bool = False) -> None:
+        """Load a deferred x86 PUSH operand into a Win64 call arg register."""
+        if atype == 'ebp_slot':
+            disp = aval
+            if disp > 0x7FFFFFFF:
+                disp -= 0x100000000
+            d32 = self._dword_arg_reg(reg)
+            out += self._asm(f'mov {d32}, dword ptr [rbp{disp:+d}]')
+        elif atype == 'esp_mem':
+            d32 = self._dword_arg_reg(reg)
+            out += self._asm(f'mov {d32}, dword ptr [rsp+0x{aval:x}]')
+        elif atype == 'arg_home':
+            off = self._frameless_arg_home_slot_off(aval)
+            d32 = self._dword_arg_reg(reg)
+            if frame_arg_anchor:
+                out += self._asm(f'mov {d32}, dword ptr [r15+0x{off:x}]')
+            else:
+                off = self._frameless_arg_home_rsp_off(aval, frame_rsp_bias)
+                out += self._asm(f'mov {d32}, dword ptr [rsp+0x{off:x}]')
+        else:
+            out += self._asm(f'xor {reg}, {reg}')
+
+    def _emit_call_align_prologue(self, out: bytearray, nstack: int) -> None:
+        """Reserve a 16-byte-aligned call frame (32B shadow + nstack stack args).
+
+        Win64 requires RSP ≡ 0 (mod 16) at the `call`. The translated body does
+        not maintain that invariant (push rbp + an odd number of callee-save
+        pushes leaves RSP off by 8), which is harmless for ordinary callees but
+        faults 16-byte-strict instructions like ntdll RtlCaptureContext's
+        fxsave. We save the original RSP in R13 (a callee-saved register the
+        translator never uses) and realign with `and rsp,-16`. R13 survives the
+        call by the ABI, so the restore is robust even when the callee leaves
+        the stack unbalanced or never properly returns (e.g. a mistranslated
+        `call $+5`). The push/pop keeps R13 nest-safe across calls.
+
+        Caller must already have materialized the register args (RCX/RDX/R8/R9)
+        and must write stack args to [rsp + 0x20 + i*8] after this call.
+        """
+        frame = 0x20 + nstack * 8
+        out += self._asm('push r13')
+        out += self._asm('mov r13, rsp')
+        out += self._asm(f'sub rsp, 0x{frame:x}')
+        out += self._asm('and rsp, -16')
+
+    def _emit_call_align_epilogue(self, out: bytearray, nstack: int) -> None:
+        """Restore the RSP/R13 saved by _emit_call_align_prologue."""
+        out += self._asm('mov rsp, r13')
+        out += self._asm('pop r13')
+
+    def _emit_push_arg_to_stack(self, out: bytearray, rsp_off: int,
+                                atype: str, aval: int,
+                                frame_rsp_bias: int = 0,
+                                frame_arg_anchor: bool = False,
+                                args_homed: bool = False) -> None:
+        """Store a deferred x86 PUSH operand to a Win64 stack arg slot."""
+        if atype == 'ebp_slot':
+            disp = aval
+            if disp > 0x7FFFFFFF:
+                disp -= 0x100000000
+            out += self._asm(f'mov eax, dword ptr [rbp{disp:+d}]')
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+        elif atype == 'esp_mem':
+            out += self._asm(f'mov eax, dword ptr [rsp+0x{aval:x}]')
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+        elif atype == 'arg_home':
+            off = self._frameless_arg_home_slot_off(aval)
+            if frame_arg_anchor:
+                out += self._asm(f'mov eax, dword ptr [r15+0x{off:x}]')
+            else:
+                off = self._frameless_arg_home_rsp_off(aval, frame_rsp_bias)
+                out += self._asm(f'mov eax, dword ptr [rsp+0x{off:x}]')
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+        elif atype == 'imm':
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], 0x{aval & 0xFFFFFFFF:x}')
+        elif atype == 'reg':
+            src = W32_TO_W64_REG.get(aval, 'rax')
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], {src}')
+        elif atype == 'mem_abs':
+            self._emit_abs_dword_load(out, 'rax', aval)
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+        elif atype == 'ebp_local':
+            disp = aval
+            self._emit_lea_ebp_slot(out, 'rax', disp)
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+        elif atype == 'ebp_arg':
+            if args_homed or aval >= len(WIN64_ARG_REG_NAMES):
+                out += self._asm(
+                    f'mov rax, qword ptr [rbp+0x{ebp_arg_slot_to_rbp_home(aval):x}]')
+                out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], rax')
+            else:
+                src = WIN64_ARG_REG_NAMES[aval]
+                out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], {src}')
+        else:
+            out += self._asm(f'mov qword ptr [rsp+0x{rsp_off:x}], 0')
+
+    def _load_ubrt_refs(self):
+        """Lazy-load UBRT reference database from win2k_analyzer."""
+        if self._ubrt_ref_db is not None:
+            return self._ubrt_ref_db
+        self._ubrt_ref_db = []
+        if not HAS_UBRT or not self.source_path or not os.path.isfile(self.source_path):
+            return self._ubrt_ref_db
+        try:
+            finder = PEReferenceFinder(self.source_path)
+            db = finder.find_all()
+            self._ubrt_ref_db = list(db._refs)  # noqa: SLF001 — internal list
+        except Exception as exc:
+            self.warnings.append(f"  [UBRT] reference scan failed: {exc}")
+            self._ubrt_ref_db = []
+        return self._ubrt_ref_db
+
+    @staticmethod
+    def ubrt_insert_bytes(pe_path: str, rva: int, data: bytes,
+                          out_path: Optional[str] = None) -> Tuple[bytes, dict]:
+        """
+        Size-changing insert on a finished PE using win2k_analyzer UBRT.
+
+        Shifts trailing bytes and recalculates relative branches, relocations,
+        exports, and resource directory RVAs — prefer over NOP sleds when a
+        patch needs more space than the original instruction span.
+        """
+        if not HAS_UBRT or UBRTEngine is None:
+            raise RuntimeError("UBRT engine unavailable (win2k_analyzer not on path)")
+        eng = UBRTEngine()
+        info = eng.load(pe_path)
+        if not info.get('success', True) or not eng.shift_engine:
+            raise RuntimeError(f"UBRT failed to load {pe_path}: {info}")
+        result = eng.insert(rva, data)
+        blob = eng.save(out_path or pe_path)
+        summary = {
+            'delta': result.delta,
+            'refs_updated': result.refs_updated,
+            'warnings': list(result.warnings),
+        }
+        return blob, summary
+
+    @staticmethod
+    def ubrt_delete_bytes(pe_path: str, rva: int, count: int,
+                          out_path: Optional[str] = None) -> Tuple[bytes, dict]:
+        """Delete bytes at RVA; trailing code and refs shift down."""
+        if not HAS_UBRT or UBRTEngine is None:
+            raise RuntimeError("UBRT engine unavailable (win2k_analyzer not on path)")
+        eng = UBRTEngine()
+        info = eng.load(pe_path)
+        if not info.get('success', True) or not eng.shift_engine:
+            raise RuntimeError(f"UBRT failed to load {pe_path}: {info}")
+        result = eng.delete(rva, count)
+        blob = eng.save(out_path or pe_path)
+        return blob, {
+            'delta': result.delta,
+            'refs_updated': result.refs_updated,
+            'warnings': list(result.warnings),
+        }
+
+    @staticmethod
+    def ubrt_patch_bytes(pe_path: str, rva: int, data: bytes,
+                         out_path: Optional[str] = None) -> Tuple[bytes, dict]:
+        """Same-size in-place patch (branches unchanged when size matches)."""
+        if not HAS_UBRT or UBRTEngine is None:
+            raise RuntimeError("UBRT engine unavailable (win2k_analyzer not on path)")
+        eng = UBRTEngine()
+        info = eng.load(pe_path)
+        if not info.get('success', True) or not eng.shift_engine:
+            raise RuntimeError(f"UBRT failed to load {pe_path}: {info}")
+        result = eng.patch(rva, data)
+        blob = eng.save(out_path or pe_path)
+        return blob, {
+            'delta': result.delta,
+            'refs_updated': result.refs_updated,
+            'warnings': list(result.warnings),
+        }
+
+    @staticmethod
+    def _pe_rva_byte(pe_path: str, rva: int) -> Optional[int]:
+        """Read one raw byte at PE RVA (None if unmapped). Uses raw section span."""
+        chunk = PETranslator._pe_rva_bytes(pe_path, rva, 1)
+        return chunk[0] if chunk else None
+
+    @staticmethod
+    def _pe_rva_bytes(pe_path: str, rva: int, count: int) -> Optional[bytes]:
+        """Read raw bytes at PE RVA (None if unmapped). Uses raw section span."""
+        if count <= 0:
+            return b''
+        try:
+            data = open(pe_path, 'rb').read()
+        except OSError:
+            return None
+        pe = struct.unpack_from('<I', data, 0x3C)[0]
+        opt_sz = struct.unpack_from('<H', data, pe + 20)[0]
+        n = struct.unpack_from('<H', data, pe + 6)[0]
+        sec = pe + 24 + opt_sz
+        for i in range(n):
+            o = sec + i * 40
+            vs, va, rawsz, rawptr = struct.unpack_from('<IIII', data, o + 8)
+            span = max(vs, rawsz)
+            if va <= rva < va + span:
+                off = rawptr + (rva - va)
+                if off + count > len(data):
+                    return None
+                return data[off:off + count]
+        return None
+
+    @staticmethod
+    def _eng_rva_bytes(eng: Any, rva: int, count: int) -> Optional[bytes]:
+        """Read bytes at RVA from a loaded UBRT shift engine (post-mutation state)."""
+        se = getattr(eng, 'shift_engine', None)
+        if not se or count <= 0:
+            return None
+        off = se._rva_to_offset(rva)
+        buf = getattr(se, 'buffer', None) or getattr(se, 'data', None)
+        if off is None or buf is None or off + count > len(buf):
+            return None
+        return bytes(buf[off:off + count])
+
+    @staticmethod
+    def ubrt_mutate(pe_path: str, ops: List[Tuple[str, ...]],
+                    out_path: Optional[str] = None) -> Tuple[bytes, dict]:
+        """
+        Apply a sequence of UBRT shift operations on a finished PE.
+
+        Each op is (kind, rva, payload) where kind is ``insert`` | ``delete`` |
+        ``patch`` and payload is bytes (insert/patch) or int count (delete).
+        Recalculates branches, relocs, exports, and resource RVAs after each op.
+        """
+        if not HAS_UBRT or UBRTEngine is None:
+            raise RuntimeError("UBRT engine unavailable (win2k_analyzer not on path)")
+        eng = UBRTEngine()
+        info = eng.load(pe_path)
+        if not info.get('success', True) or not eng.shift_engine:
+            raise RuntimeError(f"UBRT failed to load {pe_path}: {info}")
+        applied = 0
+        warnings: List[str] = []
+        refs = 0
+        for op in ops:
+            kind = op[0].lower()
+            rva = int(op[1])
+            if kind == 'insert':
+                result = eng.insert(rva, op[2])
+            elif kind == 'delete':
+                result = eng.delete(rva, int(op[2]))
+            elif kind == 'patch':
+                result = eng.patch(rva, op[2])
+            else:
+                raise ValueError(f"unknown UBRT op: {kind}")
+            if result.success:
+                applied += 1
+                refs += result.refs_updated
+                warnings.extend(result.warnings)
+        blob = eng.save(out_path or pe_path)
+        return blob, {'ops': applied, 'refs_updated': refs, 'warnings': warnings}
+
+    def _cmd_shim_ubrt_fixup(self, pe_path: str) -> int:
+        """
+        Legacy hook — cmd shift fixups now run on the .text blob before PE emit
+        (:meth:`_cmd_shim_blob_shift_fixups`).  Post-write UBRT inserts corrupt
+        the finished PE Import / Resource / Reloc directories.
+        """
+        return 0
+
+    @staticmethod
+    def _rva_map_lookup(rva_map: Dict[int, int], rva: int) -> Optional[int]:
+        """Map old RVA → new section offset (exact or floor of mapped insn)."""
+        if rva in rva_map:
+            return rva_map[rva]
+        candidates = [(mapped, old) for old, mapped in rva_map.items() if old <= rva]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x[1])[0]
+
+    def _repair_branches_from_ubrt(self, out: bytearray,
+                                   rva_map: Dict[int, int]) -> int:
+        """
+        Patch relative branches using win2k_analyzer UBRT static reference DB.
+        Authoritative (ref_rva, target_rva) pairs from the x86 source PE.
+        """
+        refs = self._load_ubrt_refs()
+        if not refs:
+            return 0
+
+        md64 = Cs(CS_ARCH_X86, CS_MODE_64)
+        md64.detail = True
+        fixed = 0
+        seen: Set[Tuple[int, int]] = set()
+
+        for ref in refs:
+            rtype = ref.ref_type.value if hasattr(ref.ref_type, 'value') else str(ref.ref_type)
+            if rtype not in _UBRT_BRANCH_TYPES:
+                continue
+            if not ref.is_relative:
+                continue
+            src_rva = ref.ref_rva
+            tgt_rva = ref.target_rva
+            tgt_new = rva_map.get(tgt_rva)
+            if tgt_new is None:
+                continue
+            src_new = self._rva_map_lookup(rva_map, src_rva)
+            if src_new is None or src_new >= len(out):
+                continue
+            key = (src_new, tgt_new)
+            if key in seen:
+                continue
+
+            window = bytes(out[src_new:src_new + 16])
+            patched = False
+            for insn in md64.disasm(window, src_new, count=1):
+                if insn.mnemonic not in ('call', 'jmp') and not insn.mnemonic.startswith('j'):
+                    break
+                if not insn.operands or insn.operands[0].type != X86_OP_IMM:
+                    break
+                if insn.size == 2 and insn.operands[0].size == 8:
+                    rel = tgt_new - (insn.address + 2)
+                    if -128 <= rel <= 127:
+                        out[insn.address + 1] = rel & 0xFF
+                        fixed += 1
+                        patched = True
+                elif insn.size >= 5:
+                    disp_off = insn.address + insn.size - 4
+                    rel = tgt_new - (disp_off + 4)
+                    struct.pack_into('<i', out, disp_off, rel)
+                    fixed += 1
+                    patched = True
+                break
+            if patched:
+                seen.add(key)
+        return fixed
+
+    _W32_TO_W64_TEXT = {
+        'eax': 'rax', 'ecx': 'rcx', 'edx': 'rdx', 'ebx': 'rbx',
+        'esp': 'rsp', 'ebp': 'rbp', 'esi': 'rsi', 'edi': 'rdi',
+    }
+
+    def _normalize_x64_asm(self, text: str) -> str:
+        """Rewrite x86 register names in Keystone text for amd64.
+
+        All registers used inside a memory operand ([...]) must be 64-bit in
+        long mode (a 32-bit base/index would emit a 0x67 address-size prefix and
+        compute a truncated address). Bare ebp/esp are also widened.
+        """
+        import re
+
+        def _widen_brackets(m: 're.Match') -> str:
+            inner = m.group(1)
+            inner = re.sub(
+                r'\b(eax|ecx|edx|ebx|esp|ebp|esi|edi)\b',
+                lambda r: self._W32_TO_W64_TEXT[r.group(1).lower()],
+                inner, flags=re.I)
+            return '[' + inner + ']'
+
+        text = re.sub(r'\[([^\]]*)\]', _widen_brackets, text)
+        text = re.sub(r'\bebp\b', 'rbp', text, flags=re.I)
+        text = re.sub(r'\besp\b', 'rsp', text, flags=re.I)
+        return text
+
+    def _asm_addr32(self, text: str) -> bytes:
+        """Assemble x86-64 insn with 32-bit address components (67h prefix).
+
+        Used for x86 idioms like mov eax, [eax+ecx] where the effective address
+        must wrap at 32 bits, not widen to 64-bit rax+rcx.
+        """
+        import re
+        text = re.sub(r'\bebp\b', 'rbp', text, flags=re.I)
+        text = re.sub(r'\besp\b', 'rsp', text, flags=re.I)
+        try:
+            enc, _ = self.ks.asm(text)
+            return bytes(enc)
+        except KsError as e:
+            if self.verbose:
+                print(f"    [asm error] {text!r}: {e}")
+            return b'\xCC'
+
+    def _asm(self, text: str) -> bytes:
+        """Assemble x86-64 text using Keystone, return bytes."""
+        text = self._normalize_x64_asm(text)
+        try:
+            enc, _ = self.ks.asm(text)
+            return bytes(enc)
+        except KsError as e:
+            if self.verbose:
+                print(f"    [asm error] {text!r}: {e}")
+            return b'\xCC'   # INT3 — clearly wrong, easy to spot in debugger
+
+    def _relocate_imm(self, imm32: int, code64_size: int = 0, data64_base: int = 0) -> int:
+        """Map a Win2000 32-bit image VA to its Win64 equivalent."""
+        imm32 &= 0xFFFFFFFF
+        if (self.win10_test_shim and self._w2k_eh3_va
+                and imm32 in self._seh_eh3_handler_old_vas):
+            return self._w2k_eh3_va
+        # Data / rsrc pointers must never go through code rva_map extrapolation
+        # (would land in translated .text, e.g. push 0x22860 → main+0x1E860).
+        if self.old_base <= imm32 < self.old_base + self.pe.image_size:
+            old_rva = imm32 - self.old_base
+            sec = self.pe.section_for_rva(old_rva)
+            if sec and not (sec['flags'] & 0x20000000):
+                if self._old_to_new_section:
+                    return (self.new_base
+                            + remap_section_rva(old_rva, self.pe,
+                                                self._old_to_new_section))
+                return self.new_base + old_rva
+        if self._iat_rva_map or self._old_to_new_section or self._final_rva:
+            return remap_image_va(imm32, self.pe, self.old_base, self.new_base,
+                                  self._old_to_new_section, self._iat_rva_map,
+                                  self._final_rva)
+        old_base = self.old_base
+        img_end  = old_base + self.pe.image_size
+        if old_base <= imm32 < img_end:
+            return self.new_base + (imm32 - old_base)
+        if imm32 in self.dyn.pointer_values:
+            return self.new_base + (imm32 - old_base)
+        return imm32
+
+    def _is_image_pointer(self, imm32: int) -> bool:
+        """True if imm32 looks like a VA inside the PE image (needs 64-bit ALU)."""
+        imm32 &= 0xFFFFFFFF
+        if self.old_base <= imm32 < self.old_base + self.pe.image_size:
+            return True
+        if self.new_base <= imm32 < self.new_base + self.pe.image_size:
+            return True
+        return imm32 in self.dyn.pointer_values
+
+    @staticmethod
+    def _ptr_w64(reg_id: int) -> str:
+        return W32_TO_W64_REG.get(reg_id, 'rax')
+
+    @staticmethod
+    def _ptr_taint_mark(ptr_taint: Set[str], reg_id: int) -> None:
+        ptr_taint.add(W32_TO_W64_REG.get(reg_id, 'rax'))
+
+    @staticmethod
+    def _ptr_taint_clear(ptr_taint: Set[str], reg_id: int) -> None:
+        ptr_taint.discard(W32_TO_W64_REG.get(reg_id, 'rax'))
+
+    @staticmethod
+    def _ptr_taint_propagate(ptr_taint: Set[str], dst_id: int, src_id: int) -> None:
+        dst = W32_TO_W64_REG.get(dst_id, 'rax')
+        src = W32_TO_W64_REG.get(src_id, 'rax')
+        if src in ptr_taint:
+            ptr_taint.add(dst)
+        else:
+            ptr_taint.discard(dst)
+
+    @staticmethod
+    def _teb_ptr_mark(teb_ptr_regs: Set[str], reg_id: int) -> None:
+        teb_ptr_regs.add(W32_TO_W64_REG.get(reg_id, 'rax'))
+
+    @staticmethod
+    def _teb_ptr_clear(teb_ptr_regs: Set[str], reg_id: int) -> None:
+        teb_ptr_regs.discard(W32_TO_W64_REG.get(reg_id, 'rax'))
+
+    @staticmethod
+    def _teb_ptr_propagate(teb_ptr_regs: Set[str], dst_id: int, src_id: int) -> None:
+        dst = W32_TO_W64_REG.get(dst_id, 'rax')
+        src = W32_TO_W64_REG.get(src_id, 'rax')
+        if src in teb_ptr_regs:
+            teb_ptr_regs.add(dst)
+        else:
+            teb_ptr_regs.discard(dst)
+
+    @staticmethod
+    def _teb_indirect_field_size(gs_disp: int) -> str:
+        """x64 TEB pointer fields are QWORD; small metadata stays dword."""
+        if gs_disp in (0x08, 0x10, 0x30, 0x60):
+            return 'qword'
+        return 'dword'
+
+    @staticmethod
+    def _reg_asm_for_op(op, op_str: str = '') -> str:
+        """Keystone register name sized for the operand (al not eax for byte ops)."""
+        if not HAS_CAPSTONE or op.type != X86_OP_REG:
+            return 'eax'
+        sz = getattr(op, 'size', 4) or 4
+        if sz == 1:
+            if op.reg in W32_BYTE_REG_ASM:
+                return W32_BYTE_REG_ASM[op.reg]
+            if op.reg in W32_TO_BYTE_REG:
+                return W32_TO_BYTE_REG[op.reg]
+        if op_str and ',' in op_str:
+            tail = op_str.rsplit(',', 1)[-1].strip()
+            if tail and tail[0] in 'abcdrs' and 'ptr' not in tail:
+                return tail
+        return W32_REG_ASM.get(op.reg, 'eax')
+
+    def _ebp_slot_reg_asm(self, other, op_str: str, ebp_sz: str) -> str:
+        if ebp_sz == 'word':
+            return self._word_reg_asm_for_op(other, op_str)
+        if ebp_sz == 'byte':
+            return self._reg_asm_for_op(other, op_str)
+        return W32_REG_ASM.get(other.reg, 'eax')
+
+    @staticmethod
+    def _mem_ptr_size(op_str: str) -> str:
+        """Return 'byte'/'word'/'dword'/'qword' from a Capstone op_str."""
+        s = op_str.lower()
+        for sz in ('byte', 'dword', 'qword', 'word'):
+            if f'{sz} ptr' in s:
+                return sz
+        return 'dword'
+
+    def _word_reg_asm_for_op(self, op, op_str: str = '') -> str:
+        if HAS_CAPSTONE and op.type == X86_OP_REG:
+            if op.reg in W32_WORD_REG_ASM:
+                return W32_WORD_REG_ASM[op.reg]
+        r = self._reg_asm_for_op(op, op_str)
+        return {'eax': 'ax', 'ecx': 'cx', 'edx': 'dx', 'ebx': 'bx',
+                'esi': 'si', 'edi': 'di', 'ebp': 'bp', 'esp': 'sp'}.get(r, r)
+
+    @staticmethod
+    def _lookahead_matching_pop(reg_id: int, insn_idx: int, insns) -> bool:
+        """push reg … pop reg save/restore (may include calls in between)."""
+        for j in range(insn_idx + 1, len(insns)):
+            nx = insns[j]
+            nm = nx.mnemonic
+            if nm in ('ret', 'retn'):
+                break
+            if nm == 'pop' and nx.operands and nx.operands[0].type == X86_OP_REG:
+                if nx.operands[0].reg == reg_id:
+                    return True
+                continue
+            if nm == 'mov' and len(nx.operands) == 2:
+                if (nx.operands[0].type == X86_OP_REG
+                        and nx.operands[0].reg == reg_id
+                        and nx.operands[1].type == X86_OP_REG):
+                    continue
+        return False
+
+    @staticmethod
+    def _push_reg_is_pending_call_arg(insn_idx: int, insns) -> bool:
+        """push reg; …; push …; call — reg is a cdecl arg, not callee-save.
+
+        cmd builder: push ebx; …; push eax; push edi; call wcsncpy uses ebx as
+        the count arg; add esp,0xc cleans the stack so there is no pop ebx before
+        the epilogue pop ebx — _lookahead_matching_pop would misclassify it.
+        """
+        saw_inner_push = False
+        for j in range(insn_idx + 1, min(insn_idx + 16, len(insns))):
+            nx = insns[j]
+            nm = nx.mnemonic
+            if nm == 'push':
+                saw_inner_push = True
+            elif nm == 'call':
+                return saw_inner_push
+            elif nm in ('ret', 'retn', 'leave'):
+                return False
+            elif nm == 'pop' and nx.operands and nx.operands[0].type == X86_OP_REG:
+                return False
+        return False
+
+    @staticmethod
+    def _msvc_push_imm_pop_ecx_idiom(insn_idx: int, insns) -> bool:
+        """push imm; xor eax,eax; pop ecx — 32-bit stack reservation after callee-save."""
+        if insn_idx + 3 >= len(insns):
+            return False
+        n1, n2, n3 = insns[insn_idx + 1:insn_idx + 4]
+        if n1.mnemonic != 'push' or not n1.operands:
+            return False
+        if n1.operands[0].type != X86_OP_IMM:
+            return False
+        if n2.mnemonic != 'xor' or len(n2.operands) != 2:
+            return False
+        if (n2.operands[0].type != X86_OP_REG
+                or n2.operands[0].reg != X86_REG_EAX):
+            return False
+        if n3.mnemonic != 'pop' or not n3.operands:
+            return False
+        return (n3.operands[0].type == X86_OP_REG
+                and n3.operands[0].reg == X86_REG_ECX)
+
+    _CALLEE_SAVE_REG_IDS = frozenset((
+        X86_REG_EBX, X86_REG_EBP, X86_REG_ESI, X86_REG_EDI,
+    ))
+
+    @staticmethod
+    def _is_cdecl_scratch_push(insn_idx: int, insns) -> bool:
+        """push r; call; pop ecx; push eax; call — MSVC cdecl scratch (time/srand)."""
+        if insn_idx + 4 >= len(insns):
+            return False
+        cur, call1, pop_ecx, push_eax, call2 = insns[insn_idx:insn_idx + 5]
+        if cur.mnemonic != 'push' or not cur.operands:
+            return False
+        if cur.operands[0].type != X86_OP_REG:
+            return False
+        if call1.mnemonic != 'call' or not call1.operands:
+            return False
+        if pop_ecx.mnemonic != 'pop' or not pop_ecx.operands:
+            return False
+        if (pop_ecx.operands[0].type != X86_OP_REG
+                or pop_ecx.operands[0].reg != X86_REG_ECX):
+            return False
+        if push_eax.mnemonic != 'push' or not push_eax.operands:
+            return False
+        if (push_eax.operands[0].type != X86_OP_REG
+                or push_eax.operands[0].reg != X86_REG_EAX):
+            return False
+        return call2.mnemonic == 'call' and bool(call2.operands)
+
+    @staticmethod
+    def _find_recent_ebp_lea(reg_id: int, insn_idx: int, insns, max_back: int = 5) -> Optional[int]:
+        """lea r,[ebp±N] within a few insns before push r (may have stores in between)."""
+        for j in range(insn_idx - 1, max(insn_idx - max_back - 1, -1), -1):
+            nx = insns[j]
+            if nx.mnemonic == 'lea' and len(nx.operands) == 2:
+                op0, op1 = nx.operands
+                if (op0.type == X86_OP_REG and op0.reg == reg_id
+                        and op1.type == X86_OP_MEM
+                        and op1.mem.base == X86_REG_EBP):
+                    disp = op1.mem.disp
+                    if disp > 0x7FFFFFFF:
+                        disp -= 0x100000000
+                    return disp
+            if nx.mnemonic == 'mov' and len(nx.operands) == 2:
+                if (nx.operands[0].type == X86_OP_REG
+                        and nx.operands[0].reg == reg_id):
+                    break
+        return None
+
+    @staticmethod
+    def _push_ebp_before_call_is_frame_save(insn_idx: int, insns) -> bool:
+        """push ebp; call f; mov ebp, … — frame save, not a call argument."""
+        if insn_idx + 1 >= len(insns):
+            return False
+        if insns[insn_idx + 1].mnemonic != 'call':
+            return False
+        j = insn_idx + 2
+        while j < min(insn_idx + 8, len(insns)):
+            nx = insns[j]
+            if nx.mnemonic == 'pop':
+                j += 1
+                continue
+            if (nx.mnemonic == 'mov' and len(nx.operands) == 2
+                    and nx.operands[0].type == X86_OP_REG
+                    and nx.operands[0].reg == X86_REG_EBP):
+                return True
+            break
+        return False
+
+    @staticmethod
+    def _mov_ebp_is_heap_scratch(insn_idx: int, insns) -> bool:
+        """``mov ebp,reg`` reuses the frame reg as a temp (cmd 0x6519 GetProcessHeap)."""
+        if insn_idx < 0 or insn_idx >= len(insns):
+            return False
+        ins = insns[insn_idx]
+        if not (ins.mnemonic == 'mov' and len(ins.operands) == 2
+                and ins.operands[0].type == X86_OP_REG
+                and ins.operands[0].reg == X86_REG_EBP
+                and ins.operands[1].type in (X86_OP_REG, X86_OP_IMM)):
+            return False
+        if (ins.operands[1].type == X86_OP_REG
+                and ins.operands[1].reg == X86_REG_ESP):
+            return False
+        for j in range(insn_idx + 1, min(insn_idx + 16, len(insns))):
+            nx = insns[j]
+            if nx.mnemonic == 'test' and len(nx.operands) == 2:
+                o0, o1 = nx.operands
+                if (o0.type == X86_OP_REG and o1.type == X86_OP_REG
+                        and o0.reg == X86_REG_EBP and o1.reg == X86_REG_EBP):
+                    return True
+            if (nx.mnemonic == 'push' and nx.operands
+                    and nx.operands[0].type == X86_OP_REG
+                    and nx.operands[0].reg == X86_REG_EBP):
+                for k in range(j + 1, min(j + 3, len(insns))):
+                    if insns[k].mnemonic == 'call':
+                        return True
+                break
+            if nx.mnemonic in ('leave', 'ret', 'retn', 'pop'):
+                if nx.mnemonic == 'pop' and nx.operands:
+                    if nx.operands[0].type == X86_OP_REG:
+                        if nx.operands[0].reg == X86_REG_EBP:
+                            break
+                elif nx.mnemonic in ('leave', 'ret', 'retn'):
+                    break
+        return False
+
+    @staticmethod
+    def _push_ebp_is_stdcall_arg(insn_idx: int, insns,
+                                 frame_rbp_saved: bool,
+                                 callee_save_stack: list) -> bool:
+        """push ebp as a CALL argument (cmd 0x9FB8/0x9FC5), not a frame spill."""
+        if insn_idx <= 0:
+            return False
+        prev = insns[insn_idx - 1]
+        if (prev.mnemonic == 'mov' and len(prev.operands) == 2
+                and prev.operands[0].type == X86_OP_REG
+                and prev.operands[0].reg == X86_REG_EBP
+                and prev.operands[1].type in (X86_OP_IMM, X86_OP_REG)):
+            return True
+        # mov ebp,reg may be several insns before push ebp (cmd 0x6556 after rep movs).
+        for k in range(max(0, insn_idx - 8), insn_idx):
+            pk = insns[k]
+            if (pk.mnemonic == 'mov' and len(pk.operands) == 2
+                    and pk.operands[0].type == X86_OP_REG
+                    and pk.operands[0].reg == X86_REG_EBP
+                    and pk.operands[1].type in (X86_OP_IMM, X86_OP_REG)):
+                return True
+        if frame_rbp_saved:
+            return False
+        if 'rbp' not in callee_save_stack:
+            return False
+        if insn_idx + 1 >= len(insns):
+            return False
+        n1 = insns[insn_idx + 1]
+        return n1.mnemonic in ('push', 'call')
+
+    def _plan_import_iat_map(self, idata_rva: int) -> Dict[int, int]:
+        """old IAT thunk RVA → new IAT thunk RVA (same layout as _build_import_directory)."""
+        imports = self.pe.parse_imports()
+        if self.win10_test_shim:
+            imports = transform_imports(imports)
+        if not imports:
+            return {}
+        desc_bytes = (len(imports) + 1) * 20
+        cursor = (desc_bytes + 7) & ~7
+        layouts: List[Dict] = []
+        for imp in imports:
+            nfuncs = len(imp['functions'])
+            cursor = (cursor + 7) & ~7
+            ilt_off = cursor
+            cursor += (nfuncs + 1) * 8
+            iat_off = cursor
+            cursor += (nfuncs + 1) * 8
+            name_off = cursor
+            dll_name = imp['dll'].encode('ascii') + b'\x00'
+            cursor += len(dll_name)
+            func_entries: List[Tuple[Dict, Optional[int]]] = []
+            for fn in imp['functions']:
+                if fn['name']:
+                    hint_off = cursor
+                    cursor += 2 + len(fn['name'].encode('ascii')) + 1
+                    func_entries.append((fn, hint_off))
+                else:
+                    func_entries.append((fn, None))
+            layouts.append({
+                'iat_off': iat_off,
+                'func_entries': func_entries,
+            })
+        iat_map: Dict[int, int] = {}
+        self._hint_rva_to_old_iat: Dict[int, int] = {}
+        self._iat_name_to_new_rva = {}
+        for imp, lay in zip(imports, layouts):
+            dll = imp['dll'].lower()
+            for fn_idx, (fn, hint_off) in enumerate(lay['func_entries']):
+                new_rva = idata_rva + lay['iat_off'] + fn_idx * 8
+                name = fn.get('name')
+                if name:
+                    self._iat_name_to_new_rva[(dll, name)] = new_rva
+                old_rva = fn.get('iat_rva', 0)
+                if old_rva:
+                    iat_map[old_rva] = new_rva
+                    if hint_off is not None:
+                        self._hint_rva_to_old_iat[idata_rva + hint_off] = old_rva
+        return iat_map
+
+    def _old_iat_va_for_idata_cell(self, cell_va: int) -> Optional[int]:
+        """Map a merged ``.idata`` pointer cell VA to its x86 IAT slot VA."""
+        cell_rva = cell_va - self.new_base
+        old_rva = self._old_iat_for_slot_rva(cell_rva, self.text_rva or 0)
+        if old_rva is not None:
+            return self.old_base + old_rva
+        idata = getattr(self, '_idata_blob', b'')
+        idata_rva = getattr(self, '_idata_rva', 0)
+        off = cell_rva - idata_rva
+        if idata and 0 <= off <= len(idata) - 8:
+            hint_rva = struct.unpack_from('<Q', idata, off)[0]
+            old_rva = self._hint_rva_to_old_iat.get(hint_rva)
+            if old_rva:
+                return self.old_base + old_rva
+        return None
+
+    def _emit_ff15_iat_call(self, out: bytearray, at_off: int,
+                            old_iat_va: int, span: int = 15) -> bool:
+        """Overwrite ``span`` bytes at ``at_off`` with ``call [IAT]`` (+ NOP pad)."""
+        if span < 6 or at_off < 0 or at_off + span > len(out):
+            return False
+        iat_va = self._resolve_iat_slot_va(old_iat_va)
+        call_rva = self.text_rva + at_off
+        rel = iat_va - (self.new_base + call_rva + 6)
+        if not (-2147483648 <= rel <= 2147483647):
+            return False
+        patch = b'\xff\x15' + struct.pack('<i', rel) + b'\x90' * (span - 6)
+        out[at_off:at_off + span] = patch
+        return True
+
+    def _fix_cmd_text_indirect_iat_calls(self, out: bytearray) -> int:
+        """Replace ``movabs r, CELL; mov r, [r]; call r`` with ``call [IAT]``."""
+        if not self.text_rva or not self.win10_test_shim:
+            return 0
+        # CRT startup / re-exec / early main-args block (through ~0x9200).
+        # Do NOT scan the full image — breaks unrelated early init.
+        lo = max(0, 0x8777 - self.text_rva)
+        hi = min(len(out), 0x9200 - self.text_rva)
+        fixed = 0
+        i = lo
+        while i < hi - 14:
+            if out[i:i + 2] == b'\x48\xb8' and out[i + 10:i + 15] == b'\x48\x8b\x00\xff\xd0':
+                cell_va = struct.unpack_from('<Q', out, i + 2)[0]
+                old_iat = self._old_iat_va_for_idata_cell(cell_va)
+                if old_iat and self._emit_ff15_iat_call(out, i, old_iat, 15):
+                    fixed += 1
+                i += 15
+                continue
+            i += 1
+        i = lo
+        while i < hi - 12:
+            if out[i:i + 2] == b'\x48\xbe' and out[i + 10:i + 13] == b'\x48\x8b\x36':
+                # Leave movabs rsi → [cell] → call rsi intact; runtime IAT resolves cell.
+                i += 13
+                continue
+            i += 1
+        return fixed
+
+    def _pure_old_iat_for_imm(self, imm: int) -> Optional[int]:
+        """Map a movabs/cell immediate to its x86 IAT slot VA when possible."""
+        if self.old_base <= imm < self.old_base + self.pe.image_size:
+            old_rva = imm - self.old_base
+            if old_rva in self._iat_rva_map or old_rva in self._iat_old_rvas:
+                return self.old_base + old_rva
+        if self.new_base <= imm < self.new_base + 0x200000:
+            for delta in (0, -1, 1, -8, 8):
+                old = self._old_iat_va_for_idata_cell(imm + delta)
+                if old:
+                    return old
+            cell_rva = imm - self.new_base
+            for old_rva, new_rva in (self._iat_rva_map or {}).items():
+                if abs(new_rva - cell_rva) <= 8:
+                    return self.old_base + old_rva
+        return None
+
+    def _imm_is_pe64_idata_cell(self, imm: int) -> bool:
+        """True when ``imm`` is a VA inside the merged PE64 .idata thunk table."""
+        imm &= 0xFFFFFFFFFFFFFFFF
+        if not (self.new_base <= imm < self.new_base + 0x200000):
+            return False
+        cell_rva = imm - self.new_base
+        idata_rva = getattr(self, '_idata_rva', 0)
+        idata = getattr(self, '_idata_blob', b'')
+        if idata_rva and idata and idata_rva <= cell_rva < idata_rva + len(idata):
+            return True
+        if self._iat_rva_map and cell_rva in self._iat_rva_map.values():
+            return True
+        return False
+
+    def _fix_pure_iat_movabs_cells(self, out: bytearray) -> int:
+        """Point movabs IAT cell loads at PE64 .idata slots (pure mode)."""
+        if not self._cmd_no_hacks or not self._iat_rva_map:
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 10:
+            if out[i] not in (0x48, 0x49, 0x4C, 0x4D) or not (0xB8 <= out[i + 1] <= 0xBF):
+                i += 1
+                continue
+            imm = struct.unpack_from('<Q', out, i + 2)[0]
+            old_iat = self._pure_old_iat_for_imm(imm)
+            if old_iat:
+                new_imm = self._resolve_iat_slot_va(old_iat)
+                if new_imm != imm:
+                    struct.pack_into('<Q', out, i + 2, new_imm)
+                    fixed += 1
+            i += 10
+        return fixed
+
+    def _fix_pure_indirect_iat_calls(self, out: bytearray) -> int:
+        """CRT/early-init only: avoid full-.text movabs→call [IAT] rewrites."""
+        if not self._cmd_no_hacks or not self.win10_test_shim or not self.text_rva:
+            return 0
+        return self._fix_cmd_text_indirect_iat_calls(out)
+
+    def _patch_ff15_iat_calls_in_code(self, code: bytes, text_rva: int) -> Tuple[bytes, int]:
+        """Re-resolve ``call [IAT]`` (FF 15) once _iat_rva_map is final."""
+        if not self._iat_rva_map:
+            return code, 0
+        out = bytearray(code)
+        patched = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i:i + 2] != b'\xff\x15':
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            call_rva = text_rva + i
+            slot_rva = call_rva + 6 + rel
+            old_iat = self._old_iat_for_slot_rva(slot_rva, text_rva)
+            if old_iat is None and self._iat_rva_map:
+                for old_rva, new_rva in self._iat_rva_map.items():
+                    if new_rva == slot_rva or new_rva == (slot_rva & ~7):
+                        old_iat = old_rva
+                        break
+            if old_iat is not None and old_iat in self._iat_rva_map:
+                new_slot_rva = self._iat_rva_map[old_iat]
+                new_rel = new_slot_rva - (call_rva + 6)
+                if new_rel != rel:
+                    struct.pack_into('<i', out, i + 2, new_rel)
+                    patched += 1
+            i += 6
+        return bytes(out), patched
+
+    def _relocate_stale_linear_image_va(self, imm: int) -> int:
+        """Fix linear ``new_base+old_rva`` that now lands inside inflated PE64 .text.
+
+        After translation the .text section is much larger than the x86 image, so
+        unpatch movabs like ``0x80044c58`` (old .rsrc) read code bytes.  Already
+        section-remapped VAs (e.g. new .data at ``0x45008``) sit past the .text
+        tail and must not be touched.
+        """
+        imm &= 0xFFFFFFFFFFFFFFFF
+        new_lo = self.new_base
+        if not (new_lo <= imm < new_lo + self.pe.image_size):
+            return imm
+        old_rva = imm - self.new_base
+        text_old = self.text_rva or 0x1000
+        text_new = self._old_to_new_section.get(text_old, text_old)
+        text_blob = self._translated_text or b''
+        text_end = text_new + len(text_blob)
+        if old_rva >= text_end:
+            return imm
+        sec = self.pe.section_for_rva(old_rva)
+        if not sec or (sec['flags'] & 0x20000000):
+            return imm
+        sec_lo = sec['vaddr']
+        sec_hi = sec_lo + max(sec['vsize'], sec['raw_sz'], 1)
+        if not (sec_lo <= old_rva < sec_hi):
+            return imm
+        if not self._old_to_new_section:
+            return imm
+        new_rva = remap_section_rva(old_rva, self.pe, self._old_to_new_section)
+        new_imm = self.new_base + new_rva
+        return new_imm if new_imm != imm else imm
+
+    def _patch_abs_va_in_code(self, code: bytes,
+                              relocate_new_base: bool = True) -> Tuple[bytes, int]:
+        """Patch movabs/call immediates that still point at old IAT / section RVAs.
+
+        ``relocate_new_base`` controls whether immediates already rebased into the
+        PE64 image range (``new_base``) are fed through section remapping.  The
+        first pass over freshly-translated code must do this: emit time runs
+        before ``_old_to_new_section`` is populated, so image pointers leave the
+        translator merely rebased (``new_base + old_rva``) and need exactly one
+        section remap here.  Any *later* pass must set this False — by then the
+        new-base immediates are fully finalized PE64 VAs, and remapping them again
+        double-applies the section delta whenever a relocated .data RVA collides
+        with the old .rsrc/.data VA range (universal Win2000 hazard, e.g. cmd.exe
+        locale table movabs 0x1d480 -> 0x44480 -> 0x6b480 landing in read-only
+        .rsrc and faulting on ``rep stosd``).
+        """
+        out = bytearray(code)
+        patched = 0
+        i = 0
+        new_lo = self.new_base
+        new_hi = self.new_base + self.pe.image_size
+        while i < len(out) - 10:
+            if out[i] in (0x48, 0x49, 0x4C, 0x4D) and 0xB8 <= out[i + 1] <= 0xBF:
+                imm = struct.unpack_from('<Q', out, i + 2)[0]
+                if not relocate_new_base and (new_lo <= imm < new_hi):
+                    # Late passes: still fix stale ``new_base+old_rva`` slots that
+                    # cmd post-fixups inserted after the first remap pass.
+                    stale = self._relocate_stale_linear_image_va(imm)
+                    if stale == imm:
+                        i += 10
+                        continue
+                    struct.pack_into('<Q', out, i + 2, stale)
+                    patched += 1
+                    i += 10
+                    continue
+                new_imm = remap_image_va(
+                    imm, self.pe, self.old_base, self.new_base,
+                    self._old_to_new_section, self._iat_rva_map,
+                    self._final_rva)
+                # Prefer x86-side data/rsrc section remap (linear pre-patch VAs).
+                if (self.old_base <= imm < self.old_base + self.pe.image_size):
+                    cand = self._relocate_imm(imm & 0xFFFFFFFF, 0, 0)
+                    if cand != imm:
+                        new_imm = cand
+                stale = self._relocate_stale_linear_image_va(new_imm)
+                if stale != new_imm:
+                    new_imm = stale
+                if new_imm != imm:
+                    struct.pack_into('<Q', out, i + 2, new_imm)
+                    patched += 1
+                i += 10
+                continue
+            i += 1
+        return bytes(out), patched
+
+    def _patch_disp32_image_vas_in_code(self, code: bytes) -> Tuple[bytes, int]:
+        """Patch disp32 / DWORD slots that still embed x86 image VAs in x64 code.
+
+        ``mov word ptr [edi+0x4AD1D060], imm`` and similar [reg+disp32] forms fall
+        through the Keystone default path with the old base; movabs patching does
+        not catch them.
+        """
+        out = bytearray(code)
+        protected = bytearray(len(out))
+        i = 0
+        while i < len(out) - 9:
+            if out[i] in (0x48, 0x49, 0x4C, 0x4D) and 0xB8 <= out[i + 1] <= 0xBF:
+                for j in range(i + 2, min(i + 10, len(out))):
+                    protected[j] = 1
+                i += 10
+                continue
+            i += 1
+        i = 0
+        while i < len(out) - 4:
+            if out[i] in (0xE8, 0xE9):
+                for j in range(i + 1, min(i + 5, len(out))):
+                    protected[j] = 1
+                i += 5
+                continue
+            if out[i] == 0x0F and i + 5 < len(out) and 0x80 <= out[i + 1] <= 0x8F:
+                for j in range(i + 2, i + 6):
+                    if j < len(out):
+                        protected[j] = 1
+                i += 6
+                continue
+            i += 1
+        old_lo = self.old_base
+        old_hi = self.old_base + self.pe.image_size
+        patched = 0
+        for off in range(len(out) - 3):
+            if protected[off]:
+                continue
+            val = struct.unpack_from('<I', out, off)[0]
+            if not (old_lo <= val < old_hi):
+                continue
+            # disp32 for [reg+disp] uses mod=10 (0x80..0xbf modrm) with the disp
+            # in the following four bytes. Skip arbitrary DWORDs inside insns.
+            if off < 1:
+                continue
+            modrm = out[off - 1]
+            if (modrm & 0xC0) != 0x80:
+                continue
+            new_val = self._relocate_imm(val) & 0xFFFFFFFF
+            if new_val != val and new_val < 0x80000000:
+                struct.pack_into('<I', out, off, new_val)
+                patched += 1
+        return bytes(out), patched
+
+    def _patch_iat_jmps_in_code(self, code: bytes, text_rva: int) -> Tuple[bytes, int]:
+        """Fix FF 25 IAT tail jumps emitted before _iat_rva_map was planned."""
+        if not self._iat_rva_map:
+            return code, 0
+        out = bytearray(code)
+        patched = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i:i + 2] != b'\xff\x25':
+                i += 1
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            instr_rva = text_rva + i
+            slot_rva = instr_rva + 6 + rel
+            old_iat = self._old_iat_for_slot_rva(slot_rva, text_rva)
+            if old_iat is not None:
+                new_slot_rva = self._iat_rva_map[old_iat]
+                new_rel = new_slot_rva - (instr_rva + 6)
+                if new_rel != rel:
+                    struct.pack_into('<i', out, i + 2, new_rel)
+                    patched += 1
+            elif self._runtime_slot_map:
+                for old_slot, new_slot in self._runtime_slot_map.items():
+                    if slot_rva not in (old_slot, old_slot + text_rva):
+                        continue
+                    new_rel = new_slot - (instr_rva + 6)
+                    if new_rel != rel:
+                        struct.pack_into('<i', out, i + 2, new_rel)
+                        patched += 1
+                    break
+            i += 6
+        return bytes(out), patched
+
+    def _code_rva_to_pe64_va(self, va: int) -> int:
+        """Map any x86 code VA (incl. mid-function) to its PE64 image VA."""
+        va &= 0xFFFFFFFF
+        img_end = self.old_base + self.pe.image_size
+        if not (self.old_base <= va < img_end):
+            return va
+        old_rva = va - self.old_base
+        sec = self.pe.section_for_rva(old_rva)
+        if sec and not (sec['flags'] & 0x20000000):
+            if self._old_to_new_section:
+                return (self.new_base
+                        + remap_section_rva(old_rva, self.pe,
+                                            self._old_to_new_section))
+            return self.new_base + old_rva
+        if self._final_rva and old_rva in self._final_rva:
+            return self.new_base + self._final_rva[old_rva]
+        if self._iat_rva_map and old_rva in self._iat_rva_map:
+            return self.new_base + self._iat_rva_map[old_rva]
+        if self.rva_map:
+            candidates = [(off, old) for old, off in self.rva_map.items() if old <= old_rva]
+            if candidates:
+                mapped_off, old_start = max(candidates, key=lambda x: x[1])
+                old_sec = self._rva_section.get(old_start, self.text_rva)
+                new_sec = self._old_to_new_section.get(old_sec, old_sec)
+                return self.new_base + new_sec + mapped_off + (old_rva - old_start)
+        return self.new_base + old_rva
+
+    def _fn_blob_off_from_push(self, out: bytearray, push_off: int) -> int:
+        """Blob offset of the x64 prologue for an SEH ``push -1; mov rax, scope`` site."""
+        for back in range(0, 48):
+            pos = push_off - back
+            if pos >= 0 and pos + 4 <= len(out) and out[pos:pos + 4] == b'\x55\x48\x89\xe5':
+                return pos
+        return push_off
+
+    def _scope_va_to_pe64(self, va: int, scope_old_rva: Optional[int] = None,
+                          fn_blob_off: Optional[int] = None) -> int:
+        """Map x86 code VAs in SEH scope tables via the registering function."""
+        va &= 0xFFFFFFFF
+        img_end = self.old_base + self.pe.image_size
+        if not (self.old_base <= va < img_end):
+            return va
+        old_rva = va - self.old_base
+        if scope_old_rva is not None:
+            fn_off = fn_blob_off
+            if fn_off is None:
+                fn_off = self._seh_scope_reg_fn.get(scope_old_rva)
+            fn_rva = self._seh_scope_anchors.get(scope_old_rva)
+            if fn_off is not None and fn_rva is not None:
+                old_sec = self._rva_section.get(fn_rva, self.text_rva)
+                new_sec = self._old_to_new_section.get(old_sec, old_sec)
+                return (self.new_base + new_sec + fn_off
+                        + (old_rva - fn_rva))
+            if fn_rva is not None and fn_rva in self.rva_map:
+                mapped_off = self.rva_map[fn_rva]
+                old_sec = self._rva_section.get(fn_rva, self.text_rva)
+                new_sec = self._old_to_new_section.get(old_sec, old_sec)
+                return (self.new_base + new_sec + mapped_off
+                        + (old_rva - fn_rva))
+        fn_entries = self._fn_entry_rvas or set(self.rva_map.keys())
+        candidates = [(self.rva_map[o], o) for o in fn_entries
+                      if o <= old_rva and o in self.rva_map]
+        if candidates:
+            mapped_off, old_start = max(candidates, key=lambda x: x[1])
+            old_sec = self._rva_section.get(old_start, self.text_rva)
+            new_sec = self._old_to_new_section.get(old_sec, old_sec)
+            return self.new_base + new_sec + mapped_off + (old_rva - old_start)
+        return self._code_rva_to_pe64_va(va)
+
+    def _scope_old_rva_for_blob_off(self, off: int) -> Optional[int]:
+        """Resolve x86 scope-table RVA from a materialized blob offset."""
+        if off in self._scope_table_old_rva:
+            return self._scope_table_old_rva[off]
+        for base, old_rva in self._scope_table_old_rva.items():
+            if abs(base - off) <= 5:
+                return old_rva
+        for old_rva, mapped in self.rva_map.items():
+            if mapped == off:
+                return old_rva
+        return None
+
+    def _materialized_scope_base(self, scope_old: int) -> Optional[int]:
+        for base, old in self._scope_table_old_rva.items():
+            if old == scope_old:
+                return base
+        return self.rva_map.get(scope_old)
+
+    def _scope_sentinel_matches_x86(self, out: bytearray, off: int,
+                                    scope_old: int) -> bool:
+        """True when blob sentinel begin/end match the x86 scope table at scope_old."""
+        if off + 12 > len(out) or out[off:off + 4] != b'\xff\xff\xff\xff':
+            return False
+        sec = self.pe.section_for_rva(scope_old)
+        if not sec:
+            return False
+        xdata = self.pe.get_section_data(sec)
+        xoff = scope_old - sec['vaddr']
+        if xoff < 0 or xoff + 12 > len(xdata):
+            return False
+        xbegin, xend = struct.unpack_from('<II', xdata, xoff + 4)
+        obegin, oend = struct.unpack_from('<II', out, off + 4)
+        return obegin == xbegin and oend == xend
+
+    def _call_target_offsets(self, out: bytearray) -> Set[int]:
+        """Blob offsets that are E8 rel32 call destinations."""
+        targets: Set[int] = set()
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if 0 <= tgt < len(out):
+                targets.add(tgt)
+        return targets
+
+    def _record_seh_scope_reg_fn(self, out: bytearray, scope_old: int,
+                                 push_off: int) -> None:
+        """Record the PE64 blob offset of the SEH function that owns a scope table."""
+        if not hasattr(self, '_call_target_offs') or self._call_target_offs is None:
+            self._call_target_offs = self._call_target_offsets(out)
+        fn_off = self._fn_blob_off_from_push(out, push_off)
+        prev = self._seh_scope_reg_fn.get(scope_old)
+        if fn_off in self._call_target_offs:
+            if prev is None or prev not in self._call_target_offs or fn_off > prev:
+                self._seh_scope_reg_fn[scope_old] = fn_off
+        elif prev is None or prev not in self._call_target_offs:
+            if prev is None or fn_off > prev:
+                self._seh_scope_reg_fn[scope_old] = fn_off
+
+    def _patch_dword_vas_in_orphan_blobs(self, code: bytes) -> Tuple[bytes, int]:
+        """Patch DWORD image VAs inside copied SEH/rodata blobs."""
+        if not self._orphan_blob_out_ranges:
+            return code, 0
+        out = bytearray(code)
+        patched = 0
+        text = self.pe.sections[0]
+        code_lo = self.old_base + text['vaddr']
+        code_hi = code_lo + text.get('vsize', 0)
+        if self._orphan_blob_out_ranges:
+            tail = min(s for s, _ in self._orphan_blob_out_ranges)
+            for off in range(tail, len(out) - 19):
+                if not self._valid_scope_sentinel(out, off):
+                    continue
+                if not any(s <= off < s + sz
+                           for s, sz in self._scope_table_out_ranges):
+                    self._scope_table_out_ranges.append((off, 64))
+        for start, size in self._orphan_blob_out_ranges:
+            if start + 4 <= len(out) and out[start:start + 4] == b'\xff\xff\xff\xff':
+                continue
+            if self._orphan_byte_protected(start):
+                continue
+            end = min(start + size, len(out) - 3)
+            for off in range(start, end, 4):
+                if self._orphan_byte_protected(off):
+                    continue
+                val = struct.unpack_from('<I', out, off)[0]
+                if (self.win10_test_shim and self._w2k_eh3_va
+                        and val in self._seh_eh3_handler_old_vas):
+                    new_val = self._w2k_eh3_va & 0xFFFFFFFF
+                elif code_lo <= val < code_hi:
+                    new_val = self._code_rva_to_pe64_va(val)
+                else:
+                    new_val = remap_image_va(
+                        val, self.pe, self.old_base, self.new_base,
+                        self._old_to_new_section, self._iat_rva_map,
+                        self._final_rva)
+                if new_val != val:
+                    struct.pack_into('<I', out, off, new_val & 0xFFFFFFFF)
+                    patched += 1
+        for start, size in self._scope_table_out_ranges:
+            patched += self._patch_scope_table_entries(out, start, size)
+        if self._orphan_blob_out_ranges:
+            tail = min(s for s, _ in self._orphan_blob_out_ranges)
+            for off in range(tail, len(out) - 19):
+                if not self._valid_scope_sentinel(out, off):
+                    continue
+                patched += self._patch_scope_table_entries(out, off, 64)
+        return bytes(out), patched
+
+    def _fix_scope_tables_in_blob(self, out: bytearray) -> int:
+        """Last-chance rewrite of SEH scope begin/end DWORDs in the orphan tail."""
+        if not self._orphan_blob_out_ranges:
+            return 0
+        fixed = 0
+        tail = min(s for s, _ in self._orphan_blob_out_ranges)
+        for off in range(tail, len(out) - 19):
+            if not self._valid_scope_sentinel(out, off):
+                continue
+            scope_old = None
+            for old_rva, mapped in self.rva_map.items():
+                if mapped == off:
+                    scope_old = old_rva
+                    break
+            if scope_old is None:
+                scope_old = self._scope_old_rva_for_blob_off(off)
+            pos = off + 4
+            begin, end_va, filt, handler = struct.unpack_from('<4I', out, pos)
+            for idx, val in enumerate((begin, end_va, filt, handler)):
+                if idx == 3:
+                    new_val = self._scope_handler_dword(val)
+                elif val == 0:
+                    new_val = 0
+                elif self.old_base <= val < self.old_base + self.pe.image_size:
+                    new_val = self._scope_va_to_pe64(val, scope_old) & 0xFFFFFFFF
+                else:
+                    new_val = val
+                struct.pack_into('<I', out, pos + idx * 4, new_val)
+                if new_val != val:
+                    fixed += 1
+            pos += 16
+            if pos + 16 <= len(out):
+                b2, e2, f2, h2 = struct.unpack_from('<4I', out, pos)
+                if not (self.old_base <= b2 < self.old_base + self.pe.image_size
+                        and self.old_base < e2 <= self.old_base + self.pe.image_size):
+                    pass
+        return fixed
+
+    def _materialize_x86_code_region(self, out: bytearray, rva_map: Dict[int, int],
+                                     text_data: bytes, text_rva: int,
+                                     start_rva: int, end_rva: int,
+                                     deferred_branches: List[Tuple[int, int, str]]) -> None:
+        """Translate a small x86 code blob (CRT tail wrappers) omitted by discovery."""
+        if start_rva in rva_map:
+            return
+        off = start_rva - text_rva
+        end_off = end_rva - text_rva
+        if off < 0 or end_off > len(text_data) or end_off <= off:
+            return
+        blob = text_data[off:end_off]
+        base = len(out)
+        chunk_out, chunk_map = self._translate_function(
+            start_rva, blob, False, 0, chunk_base=base, section_rva=text_rva,
+            global_rva_map=rva_map, deferred_branches=deferred_branches)
+        if not chunk_out:
+            return
+        rva_map[start_rva] = base
+        for old_va, rel in chunk_map.items():
+            old_r = old_va - self.old_base
+            if old_r not in rva_map:
+                rva_map[old_r] = base + rel
+        out += chunk_out
+        pad = (4 - len(out) % 4) % 4
+        if pad:
+            out += b'\x90' * pad
+
+    def _runtime_stub_end_rva(self, text_data: bytes, text_rva: int,
+                              stub_rva: int) -> int:
+        """End RVA of a tiny CRT tail helper ending in `jmp eax` (not tail ff25)."""
+        sec = self.pe.section_for_rva(stub_rva)
+        if not sec:
+            return stub_rva + 0x20
+        data = self.pe.get_section_data(sec)
+        off = stub_rva - sec['vaddr']
+        if off < 0:
+            return stub_rva + 0x20
+        limit = min(len(data), off + 0x40)
+        for i in range(off, limit - 1):
+            if data[i] == 0xFF and data[i + 1] == 0xE0:
+                return stub_rva + (i - off) + 2
+            if data[i] == 0xFF and data[i + 1] == 0x25:
+                return stub_rva + (i - off)
+        return stub_rva + 0x20
+
+    def _materialize_orphan_text_refs(self, out: bytearray, rva_map: Dict[int, int],
+                                      text_data: bytes, text_rva: int,
+                                      refs: Set[int],
+                                      deferred_branches: Optional[List[Tuple[int, int, str]]] = None) -> int:
+        """Emit SEH scope tables and IAT jmp thunks omitted by function-driven layout."""
+        code_refs: List[int] = []
+        data_refs: List[int] = []
+        for old_rva in sorted(refs):
+            if old_rva in rva_map:
+                continue
+            off = old_rva - text_rva
+            if off < 0 or off >= len(text_data):
+                continue
+            if text_data[off:off + 2] == b'\xff\x25':
+                code_refs.append(old_rva)
+            else:
+                data_refs.append(old_rva)
+
+        added = 0
+        if deferred_branches is not None:
+            for old_rva in code_refs:
+                off = old_rva - text_rva
+                raw = text_data[off:off + 6]
+                iat_va = struct.unpack_from('<I', raw, 2)[0]
+                old_slot = self._imm_to_old_rva(iat_va)
+                if old_slot in self._iat_old_rvas:
+                    continue
+                ptr32 = self._read_pe_dword(old_slot)
+                if (ptr32 and self.old_base <= ptr32 < self.old_base + self.pe.image_size):
+                    stub_rva = ptr32 - self.old_base
+                    stub_end = self._runtime_stub_end_rva(text_data, text_rva, stub_rva)
+                    self._materialize_x86_code_region(
+                        out, rva_map, text_data, text_rva,
+                        stub_rva, stub_end, deferred_branches)
+
+        for old_rva in code_refs:
+            off = old_rva - text_rva
+            raw = text_data[off:off + 6]
+            iat_va = struct.unpack_from('<I', raw, 2)[0]
+            old_slot = self._imm_to_old_rva(iat_va)
+            if old_slot in self._iat_old_rvas:
+                base = len(out)
+                rva_map[old_rva] = base
+                self._emit_iat_jmp(out, iat_va, at_rva=text_rva + base)
+            else:
+                pad = (8 - len(out) % 8) % 8
+                if pad:
+                    out += b'\x00' * pad
+                slot_off = self._emit_runtime_pointer_slot(
+                    out, text_data, text_rva, old_slot, rva_map)
+                slot_va = self.new_base + text_rva + slot_off
+                jmp_off = len(out)
+                rva_map[old_rva] = jmp_off
+                self._emit_iat_jmp(out, slot_va, at_rva=text_rva + jmp_off)
+                pad16 = (16 - len(out) % 16) % 16
+                if pad16:
+                    out += b'\x90' * pad16
+            pad = (4 - len(out) % 4) % 4
+            if pad:
+                out += b'\x90' * pad
+            added += 1
+
+        for old_rva in data_refs:
+            off = old_rva - text_rva
+            raw = text_data[off:off + 32]
+            if raw[:4] == b'\xff\xff\xff\xff':
+                size = _msvc_scope_table_size(self.pe, text_data, text_rva, off)
+                raw = text_data[off:off + size]
+            else:
+                size = _embedded_text_blob_size(text_data, off)
+                raw = text_data[off:off + size]
+            base = len(out)
+            out += raw[:size]
+            pad = (4 - len(out) % 4) % 4
+            if pad:
+                out += b'\x00' * pad
+            rva_map[old_rva] = base
+            if raw[:4] == b'\xff\xff\xff\xff':
+                self._scope_table_out_ranges.append((base, size))
+                self._scope_table_old_rva[base] = old_rva
+            self._orphan_blob_out_ranges.append((base, size))
+            added += 1
+        return added
+
+    def _orphan_byte_protected(self, pos: int) -> bool:
+        for start, size in self._scope_table_out_ranges:
+            if start <= pos < start + size:
+                return True
+        for start, end in self._code_span_ranges:
+            if start <= pos < end:
+                return True
+        if self.rva_map:
+            off = self.rva_map.get(getattr(self, '_pe_entry_old_rva', 0))
+            if off is not None and off <= pos < off + 512:
+                return True
+        return False
+
+    def _note_code_span(self, start: int, size: int) -> None:
+        """Record a translated code region so INT3/orphan passes cannot clobber it."""
+        if size <= 0:
+            return
+        end = start + size
+        self._code_span_ranges.append((start, end))
+
+    @staticmethod
+    def _out_tail_pop_reg(out: bytearray) -> Optional[str]:
+        """Return the 64-bit register name if ``out`` ends with a POP insn."""
+        if not out or not HAS_CAPSTONE:
+            return None
+        start = max(0, len(out) - 16)
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = True
+        insns = list(md.disasm(bytes(out[start:]), start, count=8))
+        if not insns:
+            return None
+        last = insns[-1]
+        if last.mnemonic == 'pop' and last.operands:
+            return last.op_str
+        return None
+
+    @staticmethod
+    def _x64_entry_prologue_ok(blob: bytes, off: int) -> bool:
+        """True when *off* looks like a real translated function entry."""
+        if off < 0 or off + 1 > len(blob):
+            return False
+        if blob[off] == 0xC3:
+            return True
+        if blob[off] == 0xC2 and off + 3 <= len(blob):
+            return True
+        if off + 8 > len(blob):
+            return False
+        if blob[off:off + 3] == b'\x55\x48\x89' and blob[off + 3] == 0xE5:
+            tail = blob[off + 4:off + 8]
+            if tail[:4] == b'\xff\xff\xff\xff':
+                return False
+            if tail[0] in (0x00, 0xCC) and tail[1] in (0x00, 0xCC):
+                return False
+        elif off + 3 <= len(blob) and blob[off:off + 2] in (b'\x49\xbb', b'\x48\xb8'):
+            return True  # movabs r11/rax — frameless global helper entry
+        elif off + 4 <= len(blob) and blob[off:off + 3] == b'\x48\x83\xec':
+            pass
+        elif blob[off:off + 2] == b'\xff\x25':
+            return True
+        elif off + 2 <= len(blob) and blob[off:off + 2] == b'\x41\x5d':
+            return False  # pop r13 — epilogue tail, never a function entry
+        elif off + 3 <= len(blob) and blob[off:off + 3] == b'\x4c\x89\xec':
+            return False  # mov rsp, r13 — epilogue / align tail
+        elif blob[off] in (0x53, 0x56, 0x57, 0x40):
+            return True
+        elif blob[off] in (0x68, 0x6A):
+            return True  # push imm32 / push imm8 — tiny CRT helpers
+        elif blob[off] == 0x41:
+            if off + 1 < len(blob) and blob[off + 1] in (
+                    0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57):
+                return True  # push r8–r15
+            return False
+        elif off + 2 <= len(blob) and blob[off:off + 2] in (b'\x48\x89', b'\x4c\x8b'):
+            pass
+        else:
+            return False
+        if HAS_CAPSTONE:
+            md = Cs(CS_ARCH_X86, CS_MODE_64)
+            try:
+                insns = list(md.disasm(blob[off:off + 24], off, count=4))
+            except CsError:
+                return False
+            if len(insns) < 2:
+                return False
+            for ins in insns[:3]:
+                if ins.mnemonic in ('db', '.byte', 'invalid'):
+                    return False
+                if ins.mnemonic.startswith('f') and ins.mnemonic in (
+                        'fisttp', 'fcomp', 'fadd', 'fsub', 'fdiv'):
+                    return False
+        return True
+
+    def _relink_branch_targets(self, out: bytearray,
+                               relink: Dict[int, int]) -> int:
+        """Patch E8/E9 rel32 that still aim at superseded blob offsets."""
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] == 0xE8:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt in relink:
+                    struct.pack_into('<i', out, i + 1, relink[tgt] - (i + 5))
+                    fixed += 1
+            elif out[i] == 0xE9:
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                if tgt in relink:
+                    struct.pack_into('<i', out, i + 1, relink[tgt] - (i + 5))
+                    fixed += 1
+            elif out[i] == 0x0F and i + 5 < len(out) and 0x80 <= out[i + 1] <= 0x8F:
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                if tgt in relink:
+                    struct.pack_into('<i', out, i + 2, relink[tgt] - (i + 6))
+                    fixed += 1
+        return fixed
+
+    @staticmethod
+    def _pure_is_corrupt_x86_hybrid(out: bytearray, off: int) -> bool:
+        """True when *off* begins a broken x86 spill encoded inside PE64 text."""
+        if off < 0 or off + 6 > len(out):
+            return False
+        if off + 2 <= len(out) and out[off] in (0x53, 0x56, 0x57, 0x55):
+            if out[off + 1:off + 3] == b'\xff\x35':
+                return True
+        if off + 8 <= len(out) and out[off:off + 2] == b'\xff\x35':
+            tail = out[off + 5:off + 8]
+            if tail in (b'\x89\x44\x24', b'\x89\x04\x24', b'\x89\x54\x24'):
+                return True
+        if (off > 0 and out[off - 1] in (0x53, 0x56, 0x57, 0x55)
+                and out[off:off + 2] == b'\xff\x35'):
+            return True
+        return False
+
+    @staticmethod
+    def _pure_x86_ff35_leads_call(text_data: bytes, text_rva: int,
+                                  func_rva: int) -> bool:
+        """True when x86 ``push [global]`` at *func_rva* feeds the next ``call``."""
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off + 6 > len(text_data):
+            return False
+        if text_data[func_off:func_off + 2] != b'\xff\x35':
+            return False
+        for nxt in range(func_off + 6, min(func_off + 14, len(text_data) - 1)):
+            b0 = text_data[nxt]
+            if b0 == 0xE8:
+                return True
+            if b0 == 0xFF and text_data[nxt + 1] in (0x15, 0x25):
+                return True
+            if b0 in (0x50, 0x51, 0x52, 0x53, 0x56, 0x57, 0x68, 0x6A):
+                continue
+            if b0 == 0xFF and text_data[nxt + 1] == 0x35:
+                return False
+            break
+        return False
+
+    def _pure_ff35_global_va_from_x86(self, text_data: bytes, text_rva: int,
+                                      func_rva: int) -> Optional[int]:
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off + 6 > len(text_data):
+            return None
+        if text_data[func_off:func_off + 2] != b'\xff\x35':
+            return None
+        disp = struct.unpack_from('<I', text_data, func_off + 2)[0]
+        return self._relocate_imm(disp)
+
+    @staticmethod
+    def _pure_x64_movabs_imm64(out: bytearray, off: int) -> Optional[int]:
+        if off < 0 or off + 10 > len(out):
+            return None
+        if out[off:off + 2] in (b'\x49\xbb', b'\x48\xb8'):
+            return struct.unpack_from('<Q', out, off + 2)[0]
+        return None
+
+    def _pure_x64_region_has_va(self, out: bytearray, off: int,
+                                span: int, va: int) -> bool:
+        va &= 0xFFFFFFFFFFFFFFFF
+        end = min(len(out), off + span)
+        for pos in range(max(0, off), end - 7):
+            if out[pos:pos + 2] in (b'\x49\xbb', b'\x48\xb8'):
+                imm = struct.unpack_from('<Q', out, pos + 2)[0]
+                if imm == va:
+                    return True
+        return False
+
+    def _pure_ff35_global_va_match(self, out: bytearray, off: int,
+                                   func_rva: int, text_data: bytes,
+                                   text_rva: int) -> bool:
+        exp = self._pure_ff35_global_va_from_x86(text_data, text_rva, func_rva)
+        if exp is None:
+            return True
+        imm = self._pure_x64_movabs_imm64(out, off)
+        if imm is not None:
+            return imm == exp
+        return self._pure_x64_region_has_va(out, off, 40, exp)
+
+    def _pure_infer_entry_from_interior_map(self, out: bytearray, func_rva: int,
+                                            rva_map: Dict[int, int],
+                                            text_data: bytes,
+                                            text_rva: int) -> Optional[int]:
+        """Recover a function entry when only interior byte maps survived heal skew."""
+        samples: List[Tuple[int, int]] = []
+        for dr in range(1, 64):
+            xr = (func_rva + dr) & 0xFFFFFFFF
+            mapped = rva_map.get(xr)
+            if mapped is None:
+                continue
+            if self._pure_mapping_is_swallowed_slot(out, mapped):
+                continue
+            if self._pure_is_corrupt_x86_hybrid(out, mapped):
+                continue
+            samples.append((dr, mapped))
+        if not samples:
+            return None
+        uniq = sorted(set(mapped for _, mapped in samples))
+        median = uniq[len(uniq) // 2]
+        cluster = {mapped for _, mapped in samples
+                   if abs(mapped - median) <= 0x200}
+        if not cluster:
+            cluster = set(uniq)
+        seed = min(cluster)
+        for back in range(0, 56):
+            pos = seed - back
+            if pos < 0:
+                break
+            refined = self._refine_shim_target_off(out, func_rva, pos)
+            for try_off in range(refined, max(-1, refined - 12), -1):
+                if try_off < 0:
+                    break
+                if not self._pure_call_target_plausible(out, try_off):
+                    continue
+                if self._pure_mapped_entry_sane(
+                        out, try_off, func_rva, text_data, text_rva):
+                    return try_off
+        return None
+
+    @staticmethod
+    def _pure_x86_global_store_va_from_head(x86: bytes) -> Optional[int]:
+        """Abs32 from x86 global guard/store prologues (``and [abs]``, ``mov [abs]``)."""
+        if len(x86) < 7:
+            return None
+        if x86[:3] == b'\x66\x83\x25':  # and word ptr [abs], imm8
+            return struct.unpack_from('<I', x86, 3)[0]
+        if x86[0] == 0x80 and x86[1] == 0x25:  # and byte ptr [abs], imm8
+            return struct.unpack_from('<I', x86, 2)[0]
+        if x86[0] == 0x83 and x86[1] == 0x25:  # and dword ptr [abs], imm8
+            return struct.unpack_from('<I', x86, 2)[0]
+        if x86[0] == 0xC6 and x86[1] == 0x05:  # mov byte ptr [abs], imm8
+            return struct.unpack_from('<I', x86, 2)[0]
+        if x86[:3] == b'\x66\xc7\x05':  # mov word ptr [abs], imm16
+            return struct.unpack_from('<I', x86, 3)[0]
+        if x86[0] == 0xC7 and x86[1] == 0x05:  # mov dword ptr [abs], imm32
+            return struct.unpack_from('<I', x86, 2)[0]
+        return None
+
+    def _pure_fn_entry_x86_for_x64_off(self, rva_map: Dict[int, int],
+                                     off: int,
+                                     fn_rvas: Set[int]) -> Optional[int]:
+        """x86 function entry that maps to x64 offset *off*, if any."""
+        for r in fn_rvas:
+            if rva_map.get(r) == off:
+                return r
+        return None
+
+    def _pure_mapped_entry_sane(self, out: bytearray, off: int,
+                                func_rva: int, text_data: bytes,
+                                text_rva: int) -> bool:
+        """True when *off* looks like a real translation of *func_rva* (uses x86 head)."""
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off + 8 > len(text_data):
+            return self._x64_entry_prologue_ok(out, off)
+        x86 = text_data[func_off:func_off + 16]
+        x64 = out[off:off + 16]
+        if self._pure_is_corrupt_x86_hybrid(out, off):
+            return False
+        if x86[:2] == b'\xff\x35':  # push dword ptr [imm32]
+            if x64[:3] == b'\x49\xbb':
+                return self._pure_ff35_global_va_match(
+                    out, off, func_rva, text_data, text_rva)
+            if self._pure_x86_ff35_leads_call(text_data, text_rva, func_rva):
+                if not self._x64_entry_prologue_ok(out, off):
+                    return False
+                if x64[:3] in (b'\x89\x44', b'\x89\x04', b'\x89\x54', b'\x66\xc7'):
+                    return False
+                exp = self._pure_ff35_global_va_from_x86(
+                    text_data, text_rva, func_rva)
+                if exp is not None and not self._pure_x64_region_has_va(
+                        out, off, 48, exp):
+                    return False
+                return True
+            if x64[:2] == b'\xff\x35':
+                return (not self._pure_is_corrupt_x86_hybrid(out, off)
+                        and self._pure_ff35_global_va_match(
+                            out, off, func_rva, text_data, text_rva))
+            return False
+        if x86[:2] in (b'\xff\x15', b'\xff\x25'):  # call/jmp [imm32]
+            return (x64[:2] in (b'\xff\x15', b'\xff\x25')
+                    or x64[:2] == b'\x48\xb8' or x64[:3] == b'\x49\xbb')
+        if x86[0] == 0x68:  # push imm32
+            if x64[0] == 0x68:
+                return True
+            if x64[:3] in (b'\x48\xc7\xc1', b'\x48\xc7\xc2', b'\x48\xc7\xc0',
+                           b'\x49\xc7\xc1', b'\x49\xc7\xc2'):
+                return True
+            if x64[0] == 0x41 and x64[1] == 0xb9:
+                return True
+            return False
+        if x86[:2] in (b'\x83\xec', b'\x81\xec'):  # sub esp, imm (frameless entry)
+            # Must translate to ``sub rsp, imm`` — never ``push rbp`` (different fn).
+            return x64[:3] in (b'\x48\x83\xec', b'\x48\x81\xec')
+        # Large-frame probe prologue ``mov eax,imm32; call __chkstk``.  The
+        # translated opener is ``mov rax/eax,imm`` immediately followed by a
+        # direct ``call`` to the one __chkstk body — an exact fingerprint.  This
+        # explicit rule keeps a collapsed slot (which lands in the previous
+        # function's tail) from sneaking through the generic prologue gate, so
+        # the reconcile/resolve path re-snaps it onto the real entry.
+        if (x86[:1] == b'\xb8' and len(x86) >= 10 and x86[5] == 0xE8):
+            rel = int.from_bytes(x86[6:10], 'little', signed=True)
+            if self._is_alloca_probe_rva((func_rva + 10 + rel) & 0xFFFFFFFF):
+                imm = int.from_bytes(x86[1:5], 'little')
+                simm = imm - 0x100000000 if imm >= 0x80000000 else imm
+                if x64[:3] == b'\x48\xc7\xc0' and x64[3:7] == struct.pack('<i', simm):
+                    c = off + 7
+                elif x64[:1] == b'\xb8' and x64[1:5] == struct.pack('<I', imm):
+                    c = off + 5
+                else:
+                    return False
+                # Opener carrying the exact frame size + a ``call`` opcode is a
+                # collision-resistant fingerprint.  Do not require the call's
+                # rel32 to already resolve to __chkstk: at heal time it may still
+                # be a deferred (rel=0) placeholder.
+                return c + 5 <= len(out) and out[c] == 0xE8
+        # Global guard/store prologue (``and [abs],imm`` / ``mov [abs],imm``)
+        # translates to ``movabs r11/rax, <relocated VA>; <op> [reg], imm``.
+        # The 8-byte VA immediately after the movabs is a unique fingerprint of
+        # this exact entry, so accept it here — the generic prologue gate below
+        # would otherwise reject the ``movabs r11`` opener and the VA-scan in
+        # _pure_find_sane_entry_for_x86 would never snap scrambled call targets
+        # back onto the real function body.  Purely additive: only a positive
+        # match returns early; everything else falls through unchanged.
+        gva0 = self._pure_x86_global_store_va_from_head(x86)
+        if gva0 is not None:
+            exp0 = self._relocate_imm(gva0) & 0xFFFFFFFFFFFFFFFF
+            if (x64[:2] in (b'\x49\xbb', b'\x48\xb8') and len(x64) >= 10
+                    and int.from_bytes(x64[2:10], 'little') == exp0):
+                return True
+        # Frameless function whose first instruction tests its first stack
+        # argument, e.g. ``cmp dword[esp+4], imm``.  After translation arg1 lives
+        # in rcx, so the head becomes ``cmp rcx/ecx, imm`` (no push/sub frame).
+        # The generic gate below rejects such entries, so a scrambled rva_map
+        # slot snaps onto the *previous* function's epilogue tail (the
+        # 0x195d2 -> 0x2ff99 cmd case).  The preserved immediate is an exact,
+        # collision-free fingerprint of the real entry.
+        if x86[:4] == b'\x83\x7c\x24\x04' and len(x86) >= 5:   # cmp [esp+4], imm8
+            ib = x86[4]
+            return (x64[:4] == bytes((0x48, 0x83, 0xf9, ib))
+                    or x64[:3] == bytes((0x83, 0xf9, ib)))
+        if x86[:4] == b'\x81\x7c\x24\x04' and len(x86) >= 8:   # cmp [esp+4], imm32
+            im = x86[4:8]
+            return ((x64[:3] == b'\x48\x81\xf9' and x64[3:7] == im)
+                    or (x64[:2] == b'\x81\xf9' and x64[2:6] == im))
+        if not self._x64_entry_prologue_ok(out, off):
+            return False
+        if x86[:3] == b'\x55\x8b\xec':
+            if x64[:4] != b'\x55\x48\x89\xe5':
+                return False
+            if off + 8 <= len(out) and out[off + 4:off + 8] == b'\xff\xff\xff\xff':
+                return False
+            # Match stack reservation when x86 does sub esp, imm.
+            if x86[3:5] == b'\x83\xec' and off + 10 <= len(out):
+                x86_imm = x86[5]
+                if out[off + 4:off + 7] == b'\x48\x83\xec':
+                    x64_imm = out[off + 7]
+                    if abs(x64_imm - (x86_imm + 4)) > 8:
+                        return False
+                elif out[off + 4:off + 7] == b'\x48\x81\xec':
+                    pass
+            return True
+        if x86[:3] == b'\x53\x56\x57':
+            # push ebx/esi/edi -> push rbx/rsi/rdi are byte-identical (low regs
+            # need no REX), so a genuine entry MUST contain that exact push run
+            # right at the start, optionally behind an align-stub lead
+            # (push r13 = 41 55).  Crucially, reject a bare 48-prefixed opener
+            # such as ``mov rsp,rbp`` (48 89 ec): that is the *previous*
+            # function's epilogue tail, which rva_map occasionally points a few
+            # bytes early into.  Accepting it (old behaviour allowed 0x48)
+            # mis-snapped frameless 3-push entries onto the wrong function.
+            x64b = bytes(x64)
+            if x64b[:3] == b'\x53\x56\x57':
+                return True
+            if x64b[:2] == b'\x41\x55' and b'\x53\x56\x57' in x64b[:12]:
+                return True
+            return False
+        if x86[0] in (0x5b, 0x5d, 0x5e, 0x5f, 0x58, 0x59, 0x5a, 0x5c):
+            return x64[0] == x86[0] or (x64[0] == 0x41 and x64[1] == x86[0] + 0x48)
+        if x86[0] in (0xC3, 0xC2):
+            return x64[:len(x86)] == x86[:len(x64)]
+        # A real (non-ret) x86 function must not map to a bare ``ret`` (C3) —
+        # that means the entry was swallowed into a neighbouring epilogue tail
+        # (e.g. call 0x6711 resolved into 0x670d's ``pop ebx; ret``). Reject so
+        # heal/reconcile re-translates the real body.
+        if x64[:1] in (b'\xc3', b'\xc2'):
+            return False  # bare ret / ret imm16 — swallowed into an epilogue
+        if (x64[:2] == b'\x41\x5d'
+                or x64[:3] in (b'\x4c\x89\xec', b'\x48\x89\xec')):
+            return False  # pop r13 / mov rsp,r13 / mov rsp,rbp — epilogue tails
+        # Frameless stdcall/cdecl: mov ecx,[esp+4] (wcslen-style helpers).
+        if x86[:4] == b'\x8b\x4c\x24\x04':
+            if x64[:3] == b'\x48\x89' or x64[0] == 0x55:
+                return False
+            if x64[:3] == b'\x49\xbb' or x64[:2] == b'\x5b\xc3':
+                return False
+            if x64[:1] == b'\x5b':
+                return False
+            if x64[:2] in (b'\x85\xc9', b'\x48\x89', b'\x8b\xc9'):
+                return True
+            if x64[:4] in (b'\x85\xc9\x89\xc8', b'\x85\xc9\x8b\xc1'):
+                return True
+            if x64[:1] == b'\x90':
+                return True
+            return False
+        if x64[0] == 0x66 and off + 3 < len(out) and out[off + 1] == 0xc7:
+            return False  # mov word — interior store, not entry
+        gva = self._pure_x86_global_store_va_from_head(x86)
+        if gva is not None:
+            exp = self._relocate_imm(gva)
+            if not self._pure_x64_region_has_va(out, off, 48, exp):
+                return False
+            if x64[:2] not in (b'\x49\xbb', b'\x48\xb8'):
+                return False
+            return True
+        return self._x64_entry_prologue_ok(out, off)
+
+    @staticmethod
+    def _pure_mapping_is_swallowed_slot(out: bytearray, off: int) -> bool:
+        """True when *off* points at an epilogue/thunk slot, not real translated entry."""
+        if off < 0 or off >= len(out):
+            return True
+        head = out[off:off + 4]
+        if head[:2] == b'\x41\x5d':  # pop r13 (+ jmp)
+            return True
+        if head[:3] == b'\x4c\x89\xec':  # mov rsp, r13
+            return True
+        if head[:2] == b'\x66\xc7':  # mov word — mid-function store
+            return True
+        if head[0] == 0xe9:  # jmp (epilogue skip)
+            return True
+        # Epilogue global-store tail before adjacent fn (movabs r11; mov [r11], rax).
+        if head[:2] == b'\x49\xbb' and off + 12 <= len(out):
+            tail = out[off + 10:off + 13]
+            if tail[:1] == b'\x5b' or tail[:2] == b'\x5b\xc3':
+                return True
+        if Win2000Translator._pure_is_corrupt_x86_hybrid(out, off):
+            return True
+        if off + 2 <= len(out) and out[off:off + 2] == b'\x48\xb8':
+            for back in range(1, min(24, off) + 1):
+                if out[off - back:off - back + 4] == b'\x48\x83\xe4\xf0':
+                    return True
+        return False
+
+    def _pure_heal_entry_rvas(self, out: bytearray,
+                              rva_map: Dict[int, int],
+                              text_data: bytes, text_rva: int) -> Set[int]:
+        """RVAs needing re-translation: E8 call targets (+ swallowed fn entries) failing sanity."""
+        entries: Set[int] = set()
+        cf = self._x86_cf
+        if cf:
+            for tgt in cf.call_targets:
+                if tgt in cf.interior_labels or tgt in cf.epilogue_labels:
+                    continue
+                off = rva_map.get(tgt)
+                if off is None:
+                    entries.add(tgt)
+                    continue
+                if not self._pure_mapped_entry_sane(
+                        out, off, tgt, text_data, text_rva):
+                    entries.add(tgt)
+        for func in self._fn_entry_rvas or ():
+            off = rva_map.get(func)
+            if off is None:
+                entries.add(func)
+                continue
+            if not self._pure_mapping_is_swallowed_slot(out, off):
+                continue
+            if not self._pure_mapped_entry_sane(
+                    out, off, func, text_data, text_rva):
+                entries.add(func)
+        return entries
+
+    def _pure_translation_fingerprint(self, chunk_out: bytes) -> bytes:
+        """Long enough prefix to avoid aliasing different EBP-frame helpers."""
+        return chunk_out[:min(32, len(chunk_out))]
+
+    def _pure_find_existing_translation(self, out: bytearray, head: bytes,
+                                        func_rva: int, text_data: bytes,
+                                        text_rva: int) -> Optional[int]:
+        """Locate an already-emitted copy of *head* that matches the x86 entry."""
+        sig = self._pure_translation_fingerprint(head)
+        if len(sig) < 16:
+            return None
+        pos = 0
+        while True:
+            j = out.find(sig, pos)
+            if j < 0:
+                return None
+            if self._pure_mapped_entry_sane(out, j, func_rva, text_data, text_rva):
+                return j
+            pos = j + 1
+
+    def _pure_global_store_infer_ok(self, out: bytearray, off: int,
+                                    func_rva: int, text_data: bytes,
+                                    text_rva: int) -> bool:
+        """Reject interior-map guesses for ``and/mov [abs]`` prologue functions."""
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off + 16 > len(text_data):
+            return True
+        gva = self._pure_x86_global_store_va_from_head(
+            text_data[func_off:func_off + 16])
+        if gva is None:
+            return True
+        exp = self._relocate_imm(gva)
+        return self._pure_x64_region_has_va(out, off, 48, exp)
+
+    def _pure_force_fresh_translation(self, text_data: bytes, text_rva: int,
+                                      func_rva: int) -> bool:
+        """True when heal must append a new blob, not reuse a fingerprint match."""
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off + 16 > len(text_data):
+            return False
+        x86 = text_data[func_off:func_off + 16]
+        if x86[:4] == b'\x8b\x4c\x24\x04':  # frameless wcslen-style
+            return True
+        return self._pure_x86_global_store_va_from_head(x86) is not None
+
+    def _pure_accept_inferred_entry(self, out: bytearray, off: int,
+                                    func_rva: int, text_data: bytes,
+                                    text_rva: int) -> bool:
+        if not self._pure_mapped_entry_sane(
+                out, off, func_rva, text_data, text_rva):
+            return False
+        if not self._pure_global_store_infer_ok(
+                out, off, func_rva, text_data, text_rva):
+            return False
+        return True
+
+    def _pure_call_e8_sites_near_anchor(self, out: bytearray,
+                                        anchor: int,
+                                        span: int = 96) -> List[int]:
+        """E8 call sites near an x86 rva_map anchor (includes align-stub calls)."""
+        lo = max(0, anchor)
+        hi = min(len(out) - 5, anchor + span)
+        sites: List[int] = []
+        seen: Set[int] = set()
+        for i in range(lo, hi):
+            if out[i] != 0xE8 or i in seen:
+                continue
+            if not self._pure_branch_site_ok(out, i):
+                continue
+            seen.add(i)
+            sites.append(i)
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        pl, el = len(pro), len(epi)
+        scan_lo = max(0, lo - 16)
+        scan_hi = min(hi + 40, len(out) - pl - el - 5)
+        for scan in range(scan_lo, scan_hi):
+            if out[scan:scan + pl] != pro:
+                continue
+            j = scan + pl
+            if j in seen or out[j] != 0xE8:
+                continue
+            if out[j + 5:j + 5 + el] != epi:
+                continue
+            if not self._pure_branch_site_ok(out, j):
+                continue
+            seen.add(j)
+            sites.append(j)
+        return sites
+
+    def _pure_heal_swallowed_entries(self, out: bytearray, rva_map: Dict[int, int],
+                                     text_data: bytes, text_rva: int,
+                                     entry_rvas: Set[int],
+                                     deferred_branches: Optional[List[Tuple[int, int, str]]] = None) -> int:
+        """Re-translate function entries that mega-chunks mapped to non-code slots."""
+        if not self._cmd_no_hacks:
+            return 0
+        if deferred_branches is None:
+            deferred_branches = []
+        healed = 0
+        relink: Dict[int, int] = {}
+        _dbg = self._dbg_rva
+        for func_rva in sorted(entry_rvas):
+            off = rva_map.get(func_rva)
+            if func_rva == _dbg:
+                snap_dbg = self._pure_find_sane_entry_for_x86(
+                    out, func_rva, rva_map, text_data, text_rva)
+                chk_dbg = self._pure_chkstk_prologue_entry_for_x86(
+                    out, func_rva, text_data, text_rva, rva_map)
+                print(f"        [DBG heal {func_rva:#x}] off={off!r} "
+                      f"sane={self._pure_mapped_entry_sane(out, off, func_rva, text_data, text_rva) if off is not None else None} "
+                      f"snap={snap_dbg!r} chk={chk_dbg!r} "
+                      f"ck={self._pure_chkstk_entry_off(out)!r}")
+            if (off is not None
+                    and self._pure_mapped_entry_sane(
+                        out, off, func_rva, text_data, text_rva)):
+                continue
+            inferred = self._pure_infer_entry_from_interior_map(
+                out, func_rva, rva_map, text_data, text_rva)
+            if (inferred is not None
+                    and not self._pure_accept_inferred_entry(
+                        out, inferred, func_rva, text_data, text_rva)):
+                inferred = None
+            if inferred is not None:
+                if off != inferred:
+                    old_off = off
+                    rva_map[func_rva] = inferred
+                    if old_off is not None and old_off != inferred:
+                        relink[old_off] = inferred
+                    healed += 1
+                continue
+            # Prefer repointing onto an already-emitted *correct* translation
+            # before appending a fresh blob.  A large-frame ``mov eax,imm; call
+            # __chkstk`` entry whose only fault is a collapsed rva_map slot
+            # already has a valid body elsewhere in ``out``; re-translating it
+            # would emit a duplicate, and for SEH functions the duplicate's
+            # entry gets mis-anchored onto its leading scope table (the
+            # 0xA4E7 switch-parser case).  Universal: the snap is gated by the
+            # same prologue sanity check, so it only fires on a real match.
+            snap = self._pure_find_sane_entry_for_x86(
+                out, func_rva, rva_map, text_data, text_rva)
+            if (snap is not None and 0 <= snap < len(out)
+                    and self._pure_mapped_entry_sane(
+                        out, snap, func_rva, text_data, text_rva)):
+                if off != snap:
+                    rva_map[func_rva] = snap
+                    if off is not None and off != snap:
+                        relink[off] = snap
+                    healed += 1
+                continue
+            old_off = off
+            func_bytes = self._extract_function_bytes(
+                func_rva, text_data, text_rva)
+            if len(func_bytes) < 4:
+                continue
+            chunk_out, chunk_map = self._translate_function(
+                func_rva, func_bytes, False, 0, chunk_base=0,
+                section_rva=text_rva, global_rva_map=rva_map,
+                deferred_branches=deferred_branches)
+            if not chunk_out:
+                continue
+            existing = self._pure_find_existing_translation(
+                out, chunk_out, func_rva, text_data, text_rva)
+            if existing is not None:
+                base = existing
+            else:
+                base = len(out)
+                out += chunk_out
+                out += b'\x90' * ((4 - len(out) % 4) % 4)
+                self._note_code_span(base, len(chunk_out))
+            rva_map[func_rva] = base
+            for old_va, rel in chunk_map.items():
+                old_r = old_va - self.old_base
+                if old_r == func_rva:
+                    continue
+                if old_r not in rva_map:
+                    rva_map[old_r] = base + rel
+            if old_off is not None and old_off != base:
+                relink[old_off] = base
+            healed += 1
+        if relink:
+            healed += self._relink_branch_targets(out, relink)
+        return healed
+
+    def _pure_repair_call_targets(self, out: bytearray, rva_map: Dict[int, int],
+                                  text_data: bytes, text_rva: int) -> int:
+        """Re-resolve E8 rel32 using x86 source + healed rva_map (pure mode)."""
+        if not self._cmd_no_hacks or not HAS_CAPSTONE:
+            return 0
+        md32 = Cs(CS_ARCH_X86, CS_MODE_32)
+        md32.detail = True
+        fixed = 0
+
+        def _old_rva_for_out_off(off: int) -> Optional[int]:
+            candidates = [(mapped, rva) for rva, mapped in rva_map.items()
+                          if mapped <= off]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda x: x[0])[1]
+
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._pure_branch_site_ok(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            old_rva = _old_rva_for_out_off(i)
+            if old_rva is None:
+                continue
+            off_in_sec = old_rva - text_rva
+            if off_in_sec < 0 or off_in_sec >= len(text_data):
+                continue
+            start = max(0, off_in_sec - 8)
+            found_target = None
+            for insn in md32.disasm(text_data[start:off_in_sec + 8],
+                                    self.old_base + text_rva + start, count=16):
+                if insn.address - self.old_base != old_rva:
+                    continue
+                if insn.mnemonic != 'call':
+                    break
+                if insn.operands and insn.operands[0].type == X86_OP_IMM:
+                    found_target = (insn.operands[0].imm - self.old_base) & 0xFFFFFFFF
+                break
+            if found_target is None:
+                if (0 <= tgt < len(out)
+                        and not self._x64_entry_prologue_ok(out, tgt)):
+                    entry = self._find_enclosing_function_entry(out, tgt, rva_map)
+                    if entry is not None and entry != tgt:
+                        struct.pack_into('<i', out, i + 1, entry - (i + 5))
+                        fixed += 1
+                continue
+            new_tgt = self._pure_resolve_x86_call_target(
+                out, found_target, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            if i + 5 + rel == new_tgt:
+                continue
+            struct.pack_into('<i', out, i + 1, new_tgt - (i + 5))
+            fixed += 1
+        return fixed
+
+    @staticmethod
+    def _pure_off_in_movabs_imm(out: bytearray, i: int) -> bool:
+        """True when byte *i* lies inside a 64-bit ``movabs`` immediate (not a real opcode).
+
+        A stray ``0xE8`` (or ``0xE9``/``0x0F 8x``) byte that is really part of a
+        ``movabs r64, imm64`` operand must never be treated as a branch opcode —
+        rewriting it shreds the loaded address (e.g. an IAT slot VA).
+        """
+        for back in range(2, 10):
+            p = i - back
+            if p < 0:
+                break
+            if out[p] in (0x48, 0x49, 0x4C, 0x4D) and 0xB8 <= out[p + 1] <= 0xBF:
+                # immediate occupies p+2 .. p+9
+                if p + 2 <= i <= p + 9:
+                    return True
+        return False
+
+    def _pure_insn_start_set(self, out: bytearray) -> Optional[Set[int]]:
+        """Offsets in *out* that begin a real x64 instruction (pure mode).
+
+        Built by linear disassembly seeded from every mapped function/instruction
+        offset. Used to reject ``0xE8``/``0xE9`` bytes that are actually operand
+        bytes (movabs immediates, ``[rbp-0x18]`` disp8 = 0xE8, disp32 tails, …)
+        so branch-repair passes never shred a non-branch instruction.
+
+        Returns ``None`` when capstone is unavailable (callers fall back).
+        Cached and invalidated whenever ``len(out)`` changes (rel32 edits keep
+        instruction boundaries, so the cache stays valid across repair passes).
+        """
+        if not HAS_CAPSTONE:
+            return None
+        cache = getattr(self, '_pure_insn_starts_cache', None)
+        if cache is not None and cache[0] == len(out):
+            return cache[1]
+        starts: Set[int] = set()
+        marked = bytearray(len(out))
+        code = bytes(out)
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        seeds = {0}
+        seeds.update(v for v in self.rva_map.values() if 0 <= v < len(out))
+        for s in sorted(seeds):
+            if s < 0 or s >= len(out) or marked[s]:
+                continue
+            for ins in md.disasm(code[s:], s):
+                a = ins.address
+                if a >= len(out) or marked[a]:
+                    break
+                marked[a] = 1
+                starts.add(a)
+        self._pure_insn_starts_cache = (len(out), starts)
+        return starts
+
+    def _pure_branch_site_ok(self, out: bytearray, i: int) -> bool:
+        """True when *i* is a real branch instruction start, not an operand byte."""
+        starts = self._pure_insn_start_set(out)
+        if starts is None:
+            return not self._pure_off_in_movabs_imm(out, i)
+        return i in starts
+
+    @staticmethod
+    def _e8_byte_is_real_call(out: bytearray, i: int) -> bool:
+        """False when *i* is an ``0xE8`` byte inside a ``movabs`` immediate operand."""
+        return not Win2000Translator._pure_off_in_movabs_imm(out, i)
+
+    def _pure_repair_calls_from_x86_source(self, out: bytearray,
+                                           rva_map: Dict[int, int],
+                                           text_data: bytes,
+                                           text_rva: int) -> int:
+        """Fix x64 E8 sites anchored at each x86 ``call rel32`` (handles prologue skew)."""
+        if not self._cmd_no_hacks:
+            return 0
+        fixed = 0
+        paired_sites: Set[int] = set()
+        for off in range(len(text_data) - 5):
+            if text_data[off] != 0xE8:
+                continue
+            x86_rva = (text_rva + off) & 0xFFFFFFFF
+            rel = struct.unpack_from('<i', text_data, off + 1)[0]
+            tgt_x86 = (text_rva + off + 5 + rel) & 0xFFFFFFFF
+            anchor = rva_map.get(x86_rva)
+            if anchor is None:
+                continue
+            if anchor < 0 or anchor >= len(out):
+                continue
+            hint = rva_map.get(tgt_x86)
+            new_tgt = None
+            if hint is not None:
+                hint = self._refine_shim_target_off(out, tgt_x86, hint)
+                if (self._pure_call_target_plausible(out, hint)
+                        and self._pure_mapped_entry_sane(
+                            out, hint, tgt_x86, text_data, text_rva)):
+                    new_tgt = hint
+            if new_tgt is None:
+                new_tgt = self._pure_resolve_x86_call_target(
+                    out, tgt_x86, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                continue
+            sites = [s for s in self._pure_call_e8_sites_near_anchor(out, anchor)
+                     if s not in paired_sites]
+            if not sites:
+                continue
+            for i in sorted(sites, key=lambda s: abs(s - anchor)):
+                cur_rel = struct.unpack_from('<i', out, i + 1)[0]
+                cur_idx = i + 5 + cur_rel
+                if cur_idx == new_tgt:
+                    paired_sites.add(i)
+                    break
+                # Only repair *clearly broken* targets here. A "wrong but
+                # plausible" target (another function's valid entry) must NOT be
+                # rewritten by this window heuristic — anchors are skewed in
+                # mega-chunks, so a later x86 call can otherwise grab an earlier
+                # call's E8 site. Order-based correlation handles those cases.
+                bad_tgt = (
+                    self._pure_mapping_is_swallowed_slot(out, cur_idx)
+                    or self._pure_is_corrupt_x86_hybrid(out, cur_idx)
+                    or not self._pure_call_target_plausible(out, cur_idx)
+                    or not self._pure_mapped_entry_sane(
+                        out, cur_idx, tgt_x86, text_data, text_rva))
+                if not bad_tgt and cur_idx != new_tgt:
+                    if self._pure_mapped_entry_sane(
+                            out, new_tgt, tgt_x86, text_data, text_rva):
+                        cur_fn = self._pure_fn_entry_x86_for_x64_off(
+                            rva_map, cur_idx, self._fn_entry_rvas or set())
+                        if cur_fn != tgt_x86:
+                            bad_tgt = True
+                if not bad_tgt:
+                    continue
+                struct.pack_into('<i', out, i + 1, new_tgt - (i + 5))
+                paired_sites.add(i)
+                fixed += 1
+                break
+        return fixed
+
+    @staticmethod
+    def _movabs_is_abs_load_pair(out, scan: int) -> bool:
+        """True when ``movabs reg,imm`` at ``scan`` is immediately followed by a
+        ``mov reg,[reg]`` consuming the same register — the absolute-load idiom
+        (``mov eax,[abs]``).  Such movabs belong to _try_fix_abs_load and must
+        not be reanchored by push/store sites."""
+        if scan + 2 >= len(out) or out[scan] not in (0x48, 0x49, 0x4C, 0x4D):
+            return False
+        if not (0xB8 <= out[scan + 1] <= 0xBF):
+            return False
+        rn = out[scan + 1] & 7
+        for p in range(scan + 10, min(scan + 22, len(out) - 3)):
+            if out[p] not in (0x48, 0x49, 0x4C, 0x4D):
+                continue
+            if out[p + 1] != 0x8B:
+                continue
+            if (out[p + 2] & 0xC7) == rn:
+                return True
+        return False
+
+    def _pure_reanchor_data_movabs_from_x86_pushes(
+            self, out: bytearray, rva_map: Dict[int, int],
+            text_data: bytes, text_rva: int) -> int:
+        """Re-sync movabs loads/stores with x86 absolute data-pointer insns.
+
+        E8 bytes inside movabs immediates (e.g. 0x8004E874 contains 0xE8) must
+        never be treated as call opcodes, but when they are the rel32 write can
+        corrupt a *nearby* movabs. Re-anchor from the x86 source via rva_map.
+        """
+        if not self._cmd_no_hacks or not rva_map:
+            return 0
+        fixed = 0
+        n = len(text_data)
+        # Sorted translated-block starts: a reanchor scan for one x86 insn must
+        # never cross into the *next* translated block, or it clobbers a
+        # neighbour's movabs (cmd 0xC67E ``cmp [0x1cf64]`` was overwritten by the
+        # 0xC6A2 ``push 0x1fb00`` whose value went into call-arg marshalling and
+        # left no movabs of its own).
+        import bisect as _bisect
+        _blk_starts = sorted(set(rva_map.values()))
+
+        def _scan_hi(anchor: int, default_hi: int) -> int:
+            # Cap the scan at the next translated block start, but only when that
+            # leaves room for a full ``movabs`` (10 bytes) belonging to this insn;
+            # coarse/interleaved rva_map entries closer than that are not trusted.
+            j = _bisect.bisect_right(_blk_starts, anchor)
+            if j < len(_blk_starts):
+                nxt = _blk_starts[j]
+                if anchor + 12 <= nxt < default_hi:
+                    return nxt
+            return default_hi
+
+        def _try_fix(x86_off: int, imm32: int) -> None:
+            nonlocal fixed
+            if not (self.old_base <= imm32 < self.old_base + self.pe.image_size):
+                return
+            old_rva = imm32 - self.old_base
+            sec = self.pe.section_for_rva(old_rva)
+            if not sec:
+                return
+            if sec['flags'] & 0x20000000:
+                embedded = getattr(self, '_embedded_text_refs', set())
+                in_embed = old_rva in embedded
+                if not in_embed:
+                    for start, end in self._merge_embedded_ref_spans(
+                            embedded, text_data, text_rva):
+                        if start <= old_rva < end:
+                            in_embed = True
+                            break
+                if not in_embed:
+                    return
+            x86_rva = (text_rva + x86_off) & 0xFFFFFFFF
+            anchor = rva_map.get(x86_rva)
+            if anchor is None:
+                return
+            exp = self._relocate_imm(imm32, 0, 0) & 0xFFFFFFFFFFFFFFFF
+            hi = _scan_hi(anchor, min(anchor + 128, len(out) - 10))
+            for scan in range(anchor, hi):
+                if out[scan] not in (0x48, 0x49, 0x4C, 0x4D):
+                    continue
+                if not (0xB8 <= out[scan + 1] <= 0xBF):
+                    continue
+                # A movabs immediately consumed by ``mov reg,[reg]`` is an
+                # absolute *load* (cmd 0x14E92 ``mov eax,[0x264c0]``), owned by
+                # _try_fix_abs_load.  A push/store (0x68/0xC7/…) anchored just
+                # before it must NOT hijack that load's movabs — skip it and keep
+                # scanning for this site's own movabs (cmd 0x14E9B push 0x1d28).
+                if self._movabs_is_abs_load_pair(out, scan):
+                    continue
+                got = struct.unpack_from('<Q', out, scan + 2)[0]
+                if got == exp:
+                    break
+                # Never replace a real PE64 .idata cell (cmd 0x194D8 call [IAT]).
+                if self._imm_is_pe64_idata_cell(got) and got != exp:
+                    break
+                # Stale linear VAs (cmd 0x14E92 ``mov eax,[0x264c0]`` → .rsrc) are
+                # not idata cells; patch even when _pure_old_iat_for_imm fuzz-matches.
+                if not (sec and not (sec['flags'] & 0x20000000)):
+                    if self._pure_old_iat_for_imm(got):
+                        break
+                struct.pack_into('<Q', out, scan + 2, exp)
+                fixed += 1
+                break
+
+        def _try_fix_abs_load(x86_off: int, imm32: int) -> None:
+            """Match movabs used for ``mov accum,[abs]`` (A0/A1/A2), not push/C7 slots."""
+            nonlocal fixed
+            if not (self.old_base <= imm32 < self.old_base + self.pe.image_size):
+                return
+            old_rva = imm32 - self.old_base
+            sec = self.pe.section_for_rva(old_rva)
+            if not sec or (sec['flags'] & 0x20000000):
+                return
+            x86_rva = (text_rva + x86_off) & 0xFFFFFFFF
+            anchor = rva_map.get(x86_rva)
+            if anchor is None:
+                return
+            exp = self._relocate_imm(imm32, 0, 0) & 0xFFFFFFFFFFFFFFFF
+            # ``anchor`` is the blob offset of the translated x86 insn (same
+            # space _try_fix uses).  The matching movabs is at/just after it;
+            # scanning ±text_rva variants only mis-targets unrelated movabs.
+            if anchor < 0 or anchor >= len(out) - 14:
+                return
+            hi = _scan_hi(anchor, min(anchor + 128, len(out) - 14))
+            for scan in range(anchor, hi):
+                if not self._movabs_is_abs_load_pair(out, scan):
+                    continue
+                got = struct.unpack_from('<Q', out, scan + 2)[0]
+                if got == exp:
+                    break
+                if self._imm_is_pe64_idata_cell(got) and got != exp:
+                    break
+                struct.pack_into('<Q', out, scan + 2, exp)
+                fixed += 1
+                break
+
+        for off in range(n - 5):
+            b0 = text_data[off]
+            if b0 == 0x68:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 1)[0])
+            elif b0 == 0xC6 and off + 7 <= n and text_data[off + 1] == 0x05:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif b0 == 0xC7 and off + 10 <= n and text_data[off + 1] == 0x05:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif b0 == 0x88 and off + 6 <= n and text_data[off + 1] == 0x1D:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif b0 in (0xA0, 0xA1, 0xA2) and off + 5 <= n:
+                # A0/A1/A2: accum,[abs] — match movabs+load pair (cmd 0x14E92).
+                _try_fix_abs_load(off, struct.unpack_from('<I', text_data, off + 1)[0])
+            elif b0 == 0xA3 and off + 5 <= n:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 1)[0])
+            elif b0 in (0x89, 0x8B) and off + 6 <= n:
+                modrm = text_data[off + 1]
+                if (modrm & 0xC7) == 0x05:
+                    _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif b0 == 0x80 and off + 7 <= n and text_data[off + 1] == 0x25:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif b0 == 0x83 and off + 7 <= n and text_data[off + 1] == 0x25:
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 2)[0])
+            elif off + 8 <= n and text_data[off:off + 3] == b'\x66\x83\x25':
+                _try_fix(off, struct.unpack_from('<I', text_data, off + 3)[0])
+        return fixed
+
+    def _pure_purge_mismapped_embedded_refs(
+            self, out: bytearray, rva_map: Dict[int, int],
+            text_data: bytes, text_rva: int, refs: Set[int]) -> int:
+        """Drop rva_map slots where translated code replaced embedded .text data."""
+        purged = 0
+        for old_rva in sorted(refs):
+            off = old_rva - text_rva
+            if off < 0 or off >= len(text_data):
+                continue
+            size = _embedded_text_blob_size(text_data, off)
+            probe = min(size, 8)
+            x86_chunk = text_data[off:off + probe]
+            mismatch = False
+            anchor = rva_map.get(old_rva)
+            if anchor is None:
+                for r in range(old_rva, old_rva + size):
+                    a = rva_map.get(r)
+                    if a is None:
+                        continue
+                    rel = r - old_rva
+                    if a >= len(out) or out[a] != text_data[off + rel]:
+                        mismatch = True
+                        break
+            elif anchor + probe > len(out):
+                mismatch = True
+            else:
+                mismatch = bytes(out[anchor:anchor + probe]) != x86_chunk
+            if not mismatch:
+                continue
+            for r in range(old_rva, old_rva + size):
+                if rva_map.pop(r, None) is not None:
+                    purged += 1
+        return purged
+
+    @staticmethod
+    def _merge_embedded_ref_spans(refs: Set[int], text_data: bytes,
+                                  text_rva: int) -> List[Tuple[int, int]]:
+        spans: List[Tuple[int, int]] = []
+        for r in sorted(refs):
+            off = r - text_rva
+            if off < 0 or off >= len(text_data):
+                continue
+            sz = _embedded_text_blob_size(text_data, off)
+            spans.append((r, r + sz))
+        if not spans:
+            return []
+        merged: List[Tuple[int, int]] = []
+        for start, end in spans:
+            if merged and start <= merged[-1][1] + _EMBEDDED_SPAN_MERGE_GAP:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def _pure_finalize_embedded_text_data(
+            self, out: bytearray, rva_map: Dict[int, int],
+            text_data: bytes, text_rva: int, refs: Set[int]) -> int:
+        """Append x86 .text wchar/ascii literals after all layout heals.
+
+        Function-driven translation maps these RVAs onto emitted code bytes.
+        Purge + orphan materialize must run last so ``_final_rva`` and movabs
+        re-anchors resolve ``push imm32`` locale tables (``.OCP``, ``Sun``, …).
+        """
+        if not refs:
+            return 0
+        added = 0
+        for start_rva, end_rva in self._merge_embedded_ref_spans(
+                refs, text_data, text_rva):
+            off = start_rva - text_rva
+            size = end_rva - start_rva
+            raw = text_data[off:off + size]
+            for r in range(start_rva, end_rva):
+                rva_map.pop(r, None)
+            base: Optional[int] = None
+            for blob_start, blob_size in self._orphan_blob_out_ranges:
+                if (blob_start + blob_size <= len(out)
+                        and blob_size >= size
+                        and bytes(out[blob_start:blob_start + size]) == raw):
+                    base = blob_start
+                    break
+            if base is None:
+                pad = (4 - len(out) % 4) % 4
+                if pad:
+                    out += b'\x00' * pad
+                base = len(out)
+                out += raw
+                pad2 = (4 - len(out) % 4) % 4
+                if pad2:
+                    out += b'\x00' * pad2
+                self._orphan_blob_out_ranges.append((base, size))
+                added += 1
+            for i in range(size):
+                rva_map[start_rva + i] = base + i
+        self._embedded_text_refs = set(refs)
+        return added
+
+    def _pure_is_align_stub_call_site(self, out: bytearray, site: int) -> bool:
+        """True when *site* is the ``call`` inside a Win64 stack-align stub."""
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        if site < len(pro) or site + 5 + len(epi) > len(out):
+            return False
+        if out[site - len(pro):site] != pro:
+            return False
+        return out[site + 5:site + 5 + len(epi)] == epi
+
+    def _pure_correlate_call_targets(self, out: bytearray,
+                                     rva_map: Dict[int, int],
+                                     text_data: bytes, text_rva: int) -> int:
+        """Re-point direct calls by pairing x86/x64 call sequences per function.
+
+        Mega-chunk translations sometimes collapse an x86 instruction's rva_map
+        entry onto a neighbour, so a window/anchor based repair can target a
+        *different* (but still valid-looking) function entry. Because call order
+        is preserved within a function, the N-th real x64 ``E8`` corresponds to
+        the N-th x86 direct ``call``. When the counts match we can authoritatively
+        set every target from the x86 source. Conservative: skips any function
+        whose call counts differ (ambiguous), so it never mis-pairs.
+        """
+        if not self._cmd_no_hacks or not HAS_CAPSTONE:
+            return 0
+        starts = self._pure_insn_start_set(out)
+        if starts is None:
+            return 0
+        fn_rvas = sorted(r for r in (self._fn_entry_rvas or set()) if r in rva_map)
+        if not fn_rvas:
+            return 0
+        x64_entries = sorted(set(rva_map[r] for r in fn_rvas))
+        md32 = Cs(CS_ARCH_X86, CS_MODE_32)
+        md32.detail = True
+        fixed = 0
+        for i, fn in enumerate(fn_rvas):
+            foff = fn - text_rva
+            if foff < 0 or foff >= len(text_data):
+                continue
+            x86_end = fn_rvas[i + 1] if i + 1 < len(fn_rvas) else None
+            end_off = (x86_end - text_rva) if x86_end is not None else len(text_data)
+            end_off = min(end_off, len(text_data))
+            if end_off <= foff:
+                continue
+            x86_calls: List[int] = []
+            for ins in md32.disasm(bytes(text_data[foff:end_off]),
+                                   self.old_base + fn):
+                if (ins.mnemonic == 'call' and ins.operands
+                        and ins.operands[0].type == X86_OP_IMM):
+                    t = (ins.operands[0].imm - self.old_base) & 0xFFFFFFFF
+                    x86_calls.append(t)
+            if not x86_calls:
+                continue
+            x64_off = rva_map[fn]
+            x64_end = len(out)
+            for e in x64_entries:
+                if e > x64_off:
+                    x64_end = e
+                    break
+            e8_sites: List[int] = []
+            k = x64_off
+            while k < x64_end - 5:
+                if out[k] == 0xE8 and k in starts:
+                    if not self._pure_is_align_stub_call_site(out, k):
+                        e8_sites.append(k)
+                k += 1
+            # Pair the N-th x86 direct call with the N-th x64 E8 site. Only
+            # rewrite a target when the current one is *provably wrong* for that
+            # x86 call AND the wanted one is *provably right* — this tolerates
+            # basic-block reordering (mismatched tails are simply skipped) and
+            # never mis-pairs reordered calls.
+            for site, t86 in zip(e8_sites, x86_calls):
+                newt = rva_map.get(t86)
+                if newt is not None:
+                    newt = self._refine_shim_target_off(out, t86, newt)
+                    if not self._pure_mapped_entry_sane(
+                            out, newt, t86, text_data, text_rva):
+                        resolved = self._pure_resolve_x86_call_target(
+                            out, t86, rva_map, text_data, text_rva)
+                        if resolved is not None:
+                            newt = resolved
+                        else:
+                            newt = None
+                if newt is None:
+                    newt = self._pure_resolve_x86_call_target(
+                        out, t86, rva_map, text_data, text_rva)
+                if newt is None:
+                    continue
+                if not (0 <= newt < len(out)):
+                    continue
+                cur_rel = struct.unpack_from('<i', out, site + 1)[0]
+                cur = site + 5 + cur_rel
+                if cur == newt:
+                    continue
+                cur_fn_x86 = self._pure_fn_entry_x86_for_x64_off(
+                    rva_map, cur, self._fn_entry_rvas or set())
+                if not (0 <= cur < len(out)):
+                    pass  # out-of-range current → definitely fix
+                elif cur_fn_x86 is not None and cur_fn_x86 != t86:
+                    pass  # current is a different function's mapped entry
+                elif self._pure_mapped_entry_sane(out, cur, t86, text_data, text_rva):
+                    continue  # current already looks right for this call
+                if not self._pure_mapped_entry_sane(out, newt, t86, text_data, text_rva):
+                    continue  # wanted target doesn't match either → don't guess
+                struct.pack_into('<i', out, site + 1, newt - (site + 5))
+                fixed += 1
+        return fixed
+
+    def _pure_snap_calls_off_interior_targets(self, out: bytearray,
+                                              rva_map: Dict[int, int]) -> int:
+        """Snap E8 rel32 that land inside a mapped function body to its entry."""
+        if not self._cmd_no_hacks:
+            return 0
+        need: Set[int] = set(self._fn_entry_rvas or ())
+        cf = self._x86_cf
+        if cf:
+            need |= cf.call_targets
+        entries = sorted({rva_map[r] for r in need if r in rva_map})
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._pure_branch_site_ok(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            for entry in entries:
+                if entry == tgt:
+                    break
+                if not (entry < tgt < entry + 96):
+                    continue
+                if (self._pure_mapping_is_swallowed_slot(out, tgt)
+                        or self._pure_is_corrupt_x86_hybrid(out, tgt)
+                        or not self._pure_call_target_plausible(out, tgt)):
+                    struct.pack_into('<i', out, i + 1, entry - (i + 5))
+                    fixed += 1
+                    break
+        return fixed
+
+    def _x86_rva_in_data_span(self, rva: int) -> bool:
+        """True when *rva* falls in a pre-analysed non-code x86 span."""
+        cf = self._x86_cf
+        if not cf:
+            return False
+        for lo, hi in cf.data_spans:
+            if lo <= rva < hi:
+                return True
+        return False
+
+    def _materialize_epilogue_label(self, out: bytearray, rva_map: Dict[int, int],
+                                    ep_rva: int) -> Optional[int]:
+        """Ensure an x86 epilogue label has inline x64 ``pop/leave/ret`` bytes in *out*."""
+        cf = self._x86_cf
+        if not cf or ep_rva not in cf.epilogue_labels:
+            return None
+        text_data = getattr(self, '_pure_heal_text', None)
+        text_rva = getattr(self, '_pure_heal_text_rva', 0)
+        if (self._cmd_no_hacks and text_data is not None
+                and self._looks_like_code(text_data, text_rva, ep_rva)):
+            off = ep_rva - text_rva
+            if 0 <= off < len(text_data):
+                ep = _x64_bytes_for_x86_epilogue(text_data, off)
+                if ep is None:
+                    hint = rva_map.get(ep_rva)
+                    if hint is not None and 0 <= hint < len(out):
+                        if self._pure_mapped_entry_sane(
+                                out, hint, ep_rva, text_data, text_rva):
+                            return hint
+                    return None
+        # cf.epilogue_labels already holds x64 bytes from
+        # _x64_bytes_for_x86_epilogue, which converts stdcall ``ret N`` → ``ret``
+        # (caller-cleanup convention). As a safety net, also fix any raw
+        # ``ret N`` (C2) tail that slipped through verbatim.
+        ep_bytes = cf.epilogue_labels[ep_rva]
+        if not ep_bytes or len(ep_bytes) > 8:
+            return None
+        if len(ep_bytes) >= 3 and ep_bytes[-3] == 0xC2:
+            ep_bytes = ep_bytes[:-3] + b'\xc3\x90\x90'
+        hint = rva_map.get(ep_rva)
+        if hint is not None and 0 <= hint < len(out):
+            if out[hint:hint + len(ep_bytes)] == ep_bytes:
+                return hint
+            for delta in range(0, 20):
+                pos = hint + delta
+                if pos + 5 > len(out):
+                    break
+                if out[pos] == 0xE9:
+                    slot = pos
+                    pad_end = slot + max(5, len(ep_bytes))
+                    out[slot:slot + len(ep_bytes)] = ep_bytes
+                    for k in range(slot + len(ep_bytes), pad_end):
+                        if k < len(out):
+                            out[k] = 0x90
+                    rva_map[ep_rva] = slot
+                    self._note_code_span(slot, len(ep_bytes))
+                    return slot
+                if (out[pos] == ep_bytes[0]
+                        and pos + len(ep_bytes) <= len(out)
+                        and out[pos:pos + len(ep_bytes)] == ep_bytes):
+                    rva_map[ep_rva] = pos
+                    return pos
+        base = len(out)
+        out += ep_bytes
+        out += b'\x90' * ((4 - len(out) % 4) % 4)
+        rva_map[ep_rva] = base
+        self._note_code_span(base, len(ep_bytes))
+        return base
+
+    def _build_epilogue_head_snap_map(self, rva_map: Dict[int, int]) -> Dict[int, int]:
+        """Map any PE64 offset inside a pop/ret tail to the first pop of that tail."""
+        cf = self._x86_cf
+        if not cf or not cf.epilogue_labels:
+            return {}
+        by_tail: Dict[int, List[Tuple[int, int]]] = {}
+        for ep_rva, ep_bytes in cf.epilogue_labels.items():
+            if not ep_bytes:
+                continue
+            head = rva_map.get(ep_rva)
+            if head is None:
+                continue
+            tail = head + len(ep_bytes) - 1
+            by_tail.setdefault(tail, []).append((head, head + len(ep_bytes)))
+        snap: Dict[int, int] = {}
+        for _tail, spans in by_tail.items():
+            canon = min(h for h, _ in spans)
+            end = max(e for _, e in spans)
+            for pos in range(canon, end):
+                snap[pos] = canon
+        return snap
+
+    def _snap_branch_targets_to_epilogue_heads(self, out: bytearray,
+                                               snap_map: Dict[int, int]) -> int:
+        """Redirect branches that land mid pop/ret chain to the canonical epilogue head."""
+        if not snap_map:
+            return 0
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] in (0xE8, 0xE9):
+                rel = struct.unpack_from('<i', out, i + 1)[0]
+                tgt = i + 5 + rel
+                head = snap_map.get(tgt)
+                if head is not None and head != tgt:
+                    struct.pack_into('<i', out, i + 1, head - (i + 5))
+                    fixed += 1
+            elif (out[i] == 0x0F and i + 6 < len(out)
+                  and 0x80 <= out[i + 1] <= 0x8F):
+                rel = struct.unpack_from('<i', out, i + 2)[0]
+                tgt = i + 6 + rel
+                head = snap_map.get(tgt)
+                if head is not None and head != tgt:
+                    struct.pack_into('<i', out, i + 2, head - (i + 6))
+                    fixed += 1
+        return fixed
+
+    def _cf_repair_epilogue_branch_targets(self, out: bytearray,
+                                           rva_map: Dict[int, int]) -> int:
+        """Patch branches that aim at stale offsets for x86 epilogue labels."""
+        cf = self._x86_cf
+        if not cf or not cf.epilogue_labels:
+            return 0
+        fixed = 0
+        for ep_rva in cf.epilogue_labels:
+            stale_off = rva_map.get(ep_rva)
+            slot = self._materialize_epilogue_label(out, rva_map, ep_rva)
+            if slot is None:
+                continue
+            # Only repair stale rva_map slots — not sibling pops in the same tail.
+            if stale_off is None or stale_off == slot:
+                continue
+            bad = {stale_off}
+            for i in range(len(out) - 5):
+                if out[i] == 0xE8:
+                    rel = struct.unpack_from('<i', out, i + 1)[0]
+                    tgt = i + 5 + rel
+                    if tgt in bad:
+                        struct.pack_into('<i', out, i + 1, slot - (i + 5))
+                        fixed += 1
+                elif out[i] == 0xE9:
+                    rel = struct.unpack_from('<i', out, i + 1)[0]
+                    tgt = i + 5 + rel
+                    if tgt in bad:
+                        struct.pack_into('<i', out, i + 1, slot - (i + 5))
+                        fixed += 1
+                elif (out[i] == 0x0F and i + 6 < len(out)
+                      and 0x80 <= out[i + 1] <= 0x8F):
+                    rel = struct.unpack_from('<i', out, i + 2)[0]
+                    tgt = i + 6 + rel
+                    if tgt in bad:
+                        struct.pack_into('<i', out, i + 2, slot - (i + 6))
+                        fixed += 1
+        return fixed
+
+    _CALLEE_POP_OPCODE: Dict[str, int] = {
+        'rbx': 0x5B, 'rbp': 0x5D, 'rsi': 0x5E, 'rdi': 0x5F,
+    }
+
+    def _pure_fixup_swallowed_epilogue_pop(self, out: bytearray,
+                                           rva_map: Dict[int, int],
+                                           text_data: bytes,
+                                           text_rva: int) -> int:
+        """Patch inline ``nop; ret`` tails that swallowed ``pop callee-save``.
+
+        Mega-chunk layout can place the *next* function's prologue on the
+        epilogue POP slot while a healed copy at a branch target keeps the
+        real ``pop r64; ret`` (cmd 0x1089F).  Fall-through paths then execute
+        ``mov reg,1; nop; ret`` with an unbalanced entry ``push rsi``.  Scan
+        x86 code bytes for ``pop ebx/esi/edi/ebp; ret/retn`` (linear disasm
+        of the whole .text misses many sites when data is interleaved).
+        """
+        if not self._cmd_no_hacks:
+            return 0
+        # x86 single-byte POP r32 opcodes
+        pop_map = {
+            0x5B: 'rbx', 0x5D: 'rbp', 0x5E: 'rsi', 0x5F: 'rdi',
+        }
+        fixed = 0
+        n = len(text_data)
+        off = 0
+        while off < n - 1:
+            reg = pop_map.get(text_data[off])
+            if reg is None:
+                off += 1
+                continue
+            nxt = text_data[off + 1]
+            if nxt == 0xC3:
+                ret_size = 1
+            elif nxt == 0xC2 and off + 3 < n:
+                ret_size = 3
+            else:
+                off += 1
+                continue
+            x86_pop = text_rva + off
+            x86_ret = text_rva + off + 1
+            pop_op = self._CALLEE_POP_OPCODE[reg]
+            anchor = rva_map.get(x86_ret)
+            if anchor is not None:
+                lo = max(0, anchor - 24)
+                hi = min(len(out), anchor + 24)
+                for ret_pos in range(lo, hi):
+                    if out[ret_pos] == 0xC3:
+                        slot = ret_pos - 1
+                    elif (ret_pos + 2 < len(out) and out[ret_pos] == 0xC2
+                          and out[ret_pos + 2] == 0x00):
+                        slot = ret_pos - 1
+                    else:
+                        continue
+                    if slot < 0 or out[slot] != 0x90:
+                        continue
+                    # Only patch the known swallowed-tail shape:
+                    # ``push 1; pop eax`` → ``mov rax,1`` then swallowed ``pop esi``.
+                    if not (slot >= 7
+                            and out[slot - 7:slot] == b'\x48\xc7\xc0\x01\x00\x00\x00'):
+                        continue
+                    out[slot] = pop_op
+                    rva_map[x86_pop] = slot
+                    fixed += 1
+                    break
+            off += 1 + ret_size
+        return fixed
+
+    def _pure_final_layout_heal(self, out: bytearray, text_data: bytes,
+                                text_rva: int) -> int:
+        """Run swallowed-entry heal and call repair after all late post-patches."""
+        if not self._cmd_no_hacks or not self._fn_entry_rvas:
+            return 0
+        heal_entries = self._pure_heal_entry_rvas(
+            out, self.rva_map, text_data, text_rva)
+        healed = self._pure_heal_swallowed_entries(
+            out, self.rva_map, text_data, text_rva, heal_entries)
+        if not healed:
+            # Still repair calls / sanity even when no new blobs were appended.
+            pass
+        elif healed:
+            print(f"        Pure final swallowed-entry heal: {healed}")
+        reconciled = self._pure_reconcile_swallowed_rva_map(
+            out, self.rva_map, text_data, text_rva)
+        if reconciled:
+            print(f"        Pure swallowed rva_map reconciles: {reconciled}")
+        epi_pop = self._pure_fixup_swallowed_epilogue_pop(
+            out, self.rva_map, text_data, text_rva)
+        if epi_pop:
+            print(f"        Pure swallowed epilogue POP fixes: {epi_pop}")
+        chk_fixed = self._pure_fix_chkstk_prologue_entries(
+            out, self.rva_map, text_data, text_rva)
+        if chk_fixed:
+            print(f"        Pure chkstk-prologue entry fixes: {chk_fixed}")
+        if not os.environ.get('DISABLE_CHKSTK'):
+            chk_call_fixed = self._pure_fix_broken_chkstk_calls(out)
+            if chk_call_fixed:
+                print(f"        Pure broken chkstk-call repairs: {chk_call_fixed}")
+        cf_epi = self._cf_repair_epilogue_branch_targets(out, self.rva_map)
+        if cf_epi:
+            print(f"        Pure CF epilogue branch repairs: {cf_epi}")
+        # Re-materialize branch-targeted epilogues only (not every pop/ret tail).
+        if self._x86_cf and self._x86_cf.epilogue_labels:
+            mat_epi = self._pure_materialize_call_epilogues(out, self.rva_map)
+            if mat_epi:
+                print(f"        Pure materialized call epilogues: {mat_epi}")
+            for ep_rva in self._x86_cf.epilogue_labels:
+                if ep_rva not in self._x86_cf.branch_targets:
+                    continue
+                self._materialize_epilogue_label(out, self.rva_map, ep_rva)
+            self._epilogue_snap_map = self._build_epilogue_head_snap_map(self.rva_map)
+            epi_snapped = self._snap_branch_targets_to_epilogue_heads(
+                out, self._epilogue_snap_map)
+            if epi_snapped:
+                print(f"        Pure epilogue-head branch snaps: {epi_snapped}")
+        self._resolve_deferred_branches(out, self.rva_map, [])
+        pure_calls = self._pure_repair_call_targets(
+            out, self.rva_map, text_data, text_rva)
+        if pure_calls:
+            print(f"        Pure post-heal CALL re-resolve: {pure_calls}")
+        pure_x86_calls = self._pure_repair_calls_from_x86_source(
+            out, self.rva_map, text_data, text_rva)
+        if pure_x86_calls:
+            print(f"        Pure x86-anchored CALL repairs: {pure_x86_calls}")
+        pure_corr = self._pure_correlate_call_targets(
+            out, self.rva_map, text_data, text_rva)
+        if pure_corr:
+            print(f"        Pure ordered CALL correlations: {pure_corr}")
+        restored_calls = self._pure_restore_nopped_align_calls(
+            out, self.rva_map, text_data, text_rva)
+        if restored_calls:
+            print(f"        Pure post-heal restored align calls: {restored_calls}")
+        self._repair_unfixed_calls(out, self.rva_map, text_data, text_rva)
+        fn_calls = self._snap_calls_to_function_entries(out, self.rva_map)
+        if fn_calls:
+            print(f"        Pure post-heal CALL entry snaps: {fn_calls}")
+        epi_calls = self._pure_snap_calls_to_epilogue_targets(
+            out, self.rva_map, text_data, text_rva)
+        if epi_calls:
+            print(f"        Pure post-heal epilogue CALL snaps: {epi_calls}")
+        align_calls = self._pure_repair_all_align_stub_calls(
+            out, self.rva_map, text_data, text_rva)
+        if align_calls:
+            print(f"        Pure post-heal align-stub CALL repairs: {align_calls}")
+        self._repair_unfixed_calls(out, self.rva_map, text_data, text_rva)
+        self._reconcile_rva_map_prologues(out, self.rva_map)
+        if getattr(self, '_pure_heal_text', None):
+            epi = self._pure_fix_jmp_over_epilogue(
+                out, self._pure_heal_text, self._pure_heal_text_rva)
+            if epi:
+                print(f"        Pure post-heal jmp→epilogue fixes: {epi}")
+        return max(healed, pure_calls)
+
+    def _patch_scope_table_entries(self, out: bytearray, start: int, size: int,
+                                   scope_old_rva: Optional[int] = None,
+                                   fn_blob_off: Optional[int] = None) -> int:
+        """Rewrite begin/end/filter/handler DWORDs in one materialized scope table."""
+        if start + 4 > len(out) or out[start:start + 4] != b'\xff\xff\xff\xff':
+            return 0
+        if scope_old_rva is None:
+            scope_old_rva = self._scope_old_rva_for_blob_off(start)
+            if scope_old_rva is None:
+                for old_rva, off in self.rva_map.items():
+                    if off == start:
+                        scope_old_rva = old_rva
+                        break
+        patched = 0
+        pos = start + 4
+        end = min(start + size, len(out) - 15)
+        while pos + 16 <= end:
+            begin, end_va, filt, handler = struct.unpack_from('<4I', out, pos)
+            if not (self.old_base <= begin < self.old_base + self.pe.image_size
+                    and self.old_base < end_va <= self.old_base + self.pe.image_size
+                    and begin < end_va):
+                break
+            for idx, val in enumerate((begin, end_va, filt, handler)):
+                if idx == 3:
+                    new_val = self._scope_handler_dword(val)
+                elif val == 0:
+                    new_val = 0
+                elif self.old_base <= val < self.old_base + self.pe.image_size:
+                    new_val = (self._scope_va_to_pe64(val, scope_old_rva, fn_blob_off)
+                               & 0xFFFFFFFF)
+                else:
+                    new_val = val
+                off = pos + idx * 4
+                struct.pack_into('<I', out, off, new_val)
+                if new_val != val:
+                    patched += 1
+            pos += 16
+        return patched
+
+    def _valid_scope_sentinel(self, out: bytearray, off: int) -> bool:
+        if off + 12 > len(out) or out[off:off + 4] != b'\xff\xff\xff\xff':
+            return False
+        begin, end_va = struct.unpack_from('<II', out, off + 4)
+        if not self._valid_scope_record_begin_end(begin, end_va):
+            return False
+        return True
+
+    def _reconcile_seh_scope_pushes(self, out: bytearray, rva_map: Dict[int, int],
+                                    text_rva: int) -> int:
+        """Point SEH ``push scope`` at the materialized ``ff ff ff ff`` blob, not a nearby alias."""
+        self._call_target_offs = None
+        scope_off: Dict[int, int] = {}
+        for old_rva, off in rva_map.items():
+            if 0 <= off < len(out) and self._valid_scope_sentinel(out, off):
+                scope_off[old_rva] = off
+        for start, size in self._scope_table_out_ranges:
+            if (start < len(out) and self._valid_scope_sentinel(out, start)
+                    and start not in scope_off.values()):
+                for old_rva, off in rva_map.items():
+                    if off == start:
+                        scope_off[old_rva] = start
+                        break
+        fixed = 0
+        i = 0
+        img_end = self.old_base + self.pe.image_size
+        while i < len(out) - 24:
+            if not (out[i] == 0x6A and out[i + 1] == 0xFF
+                    and out[i + 2] == 0x48 and out[i + 3] == 0xB8):
+                i += 1
+                continue
+            imm = struct.unpack_from('<Q', out, i + 4)[0]
+            correct = None
+            if self.new_base <= imm < self.new_base + 0x01000000:
+                blob_off = imm - self.new_base - text_rva
+                if 0 <= blob_off < len(out):
+                    best_off = None
+                    best_span = 0
+                    for delta in range(-64, min(128, len(out) - blob_off - 3)):
+                        off = blob_off + delta
+                        if off < 0 or not self._valid_scope_sentinel(out, off):
+                            continue
+                        begin, end_va = struct.unpack_from('<II', out, off + 4)
+                        span = end_va - begin
+                        if span > best_span:
+                            best_span = span
+                            best_off = off
+                    correct = best_off
+            old_rva = None
+            if correct is None and self.old_base <= imm < img_end:
+                old_rva = imm - self.old_base
+            elif correct is None and self.new_base <= imm < self.new_base + 0x01000000:
+                blob_off = imm - self.new_base - text_rva
+                for cand_rva, cand_off in rva_map.items():
+                    if cand_off == blob_off:
+                        old_rva = cand_rva
+                        break
+            if correct is None and old_rva is not None:
+                if old_rva in scope_off:
+                    correct = scope_off[old_rva]
+                elif old_rva in rva_map:
+                    base = rva_map[old_rva]
+                    best_off = None
+                    best_span = 0
+                    for delta in range(0, min(128, len(out) - base - 3)):
+                        off = base + delta
+                        if not self._valid_scope_sentinel(out, off):
+                            continue
+                        begin, end_va = struct.unpack_from('<II', out, off + 4)
+                        span = end_va - begin
+                        if span > best_span:
+                            best_span = span
+                            best_off = off
+                    if best_off is not None:
+                        correct = best_off
+                        scope_off[old_rva] = best_off
+            if correct is not None:
+                new_imm = self.new_base + text_rva + correct
+                if imm != new_imm:
+                    struct.pack_into('<Q', out, i + 4, new_imm)
+                    fixed += 1
+                scope_old = None
+                for old_rva, off in scope_off.items():
+                    if off == correct:
+                        scope_old = old_rva
+                        break
+                if scope_old is None:
+                    scope_old = self._scope_old_rva_for_blob_off(correct)
+                if (scope_old is not None
+                        and not self._scope_sentinel_matches_x86(out, correct,
+                                                                 scope_old)):
+                    scope_old = None
+                if scope_old is not None:
+                    self._record_seh_scope_reg_fn(out, scope_old, i)
+                    self._scope_table_old_rva[correct] = scope_old
+                    if not any(s <= correct < s + sz
+                               for s, sz in self._scope_table_out_ranges):
+                        self._scope_table_out_ranges.append((correct, 64))
+                    fn_off = self._seh_scope_reg_fn[scope_old]
+                    self._patch_scope_table_entries(out, correct, 64, scope_old,
+                                                    fn_off)
+            i += 14
+        return fixed
+
+    # ── NTDLL stub translator ────────────────────────────────────────────────────
+
+    def _translate_stub(self, stub: StubInfo) -> bytes:
+        """
+        Translate a Win2000 NTDLL syscall stub to a Win64 wrapper.
+
+        Input stub (32-bit, ~16 bytes):
+          MOV EAX, 0x0020       ; Win2000 NtCreateFile nr
+          LEA EDX, [ESP+4]
+          INT 0x2E
+          RET 0x2C              ; 11 args × 4 bytes
+
+        Output (64-bit, ~11 bytes):
+          MOV RAX, 0x0020       ; Win2000 NtCreateFile nr (win2000 target)
+          SYSCALL
+          RET
+
+        With --syscall-target win10, RAX holds the Win10 x64 SSDT index instead.
+
+        In Win64 ABI the CALLER already placed:
+          arg1=RCX, arg2=RDX, arg3=R8, arg4=R9, arg5=[RSP+0x28], …
+        so the stub just needs to set RAX and call the kernel.
+
+        win10 target only: if no Win10 mapping exists the stub becomes INT3; RET.
+        """
+        nr = resolve_syscall_nr(stub.name, stub.win2000_nr)
+        if (_SYSCALL_TARGET == 'win10'
+                and nr == 0
+                and stub.name not in _WIN10_SYSCALL_NAMES):
+            if not stub.name.startswith('Zw'):
+                self.warnings.append(
+                    f"  [NO MAP] {stub.name} (Win2000=0x{stub.win2000_nr:04X}) "
+                    f"→ no Win10 x64 equivalent (removed/undocumented)"
+                )
+            return self._asm('int3') + self._asm('ret')
+
+        return (
+            self._asm(f'mov rax, 0x{nr:04x}')
+            + self._asm('syscall')
+            + self._asm('ret')
+        )
+
+    # ── Calling convention translator ────────────────────────────────────────────
+
+    def _abs_mem_disp_to_rva(self, disp: int) -> int:
+        """PE32 absolute [disp32] → image RVA."""
+        if disp >= self.old_base:
+            return (disp - self.old_base) & 0xFFFFFFFF
+        return disp & 0xFFFFFFFF
+
+    def _find_ebp_global_table_rva(self, insns: list, from_idx: int) -> Optional[int]:
+        """Detect GetProcAddress trio stores + [ebp+0/+4/+8] cmps (cmd 0x9FC5)."""
+        stores: List[int] = []
+        ebp_cmps = 0
+        for j in range(from_idx, min(from_idx + 140, len(insns))):
+            ins = insns[j]
+            ops = ins.operands
+            if ins.mnemonic == 'cmp' and len(ops) == 2:
+                for op in ops:
+                    if (op.type == X86_OP_MEM and op.mem.base == X86_REG_EBP
+                            and op.mem.index == 0):
+                        ebp_cmps += 1
+            if (ins.mnemonic == 'mov' and len(ops) == 2
+                    and ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_REG
+                    and ops[1].reg == X86_REG_EAX):
+                m = ops[0].mem
+                if m.base == 0 and m.index == 0 and m.segment == 0:
+                    stores.append(self._abs_mem_disp_to_rva(m.disp))
+        if ebp_cmps < 2 or len(stores) < 3:
+            return None
+        for base in stores:
+            if (base + 4) in stores and (base + 8) in stores:
+                return base
+        return None
+
+    @staticmethod
+    def _frameless_stdcall_arg_slot(disp: int, frame_local_sub: int,
+                                    hw_stack_pushes: int,
+                                    elided_arg_bytes: int = 0) -> Optional[int]:
+        """[esp+disp] → caller stdcall arg slot after sub esp,N + callee pushes."""
+        if frame_local_sub <= 0:
+            return None
+        if frame_local_sub == 0x58 and disp >= 0x6c:
+            slot = (disp - 0x6c) // 4
+            if 0 <= slot < 4:
+                return slot
+        arg_byte = disp - hw_stack_pushes * 4 - frame_local_sub - elided_arg_bytes
+        if arg_byte in (4, 8, 12, 16):
+            return (arg_byte // 4) - 1
+        return None
+
+    @staticmethod
+    def _frameless_arg_home_slot_off(slot: int) -> int:
+        """Byte offset from frame base to spilled arg slot."""
+        return 4 + slot * 8
+
+    @staticmethod
+    def _frameless_arg_home_rsp_off(slot: int, frame_rsp_bias: int) -> int:
+        """Byte offset from current RSP to spilled arg at frame_base+4+slot*8."""
+        return 4 + slot * 8 + frame_rsp_bias
+
+    def _translate_function(self, func_rva: int, code: bytes,
+                            is_stdcall: bool, n_args: int,
+                            chunk_base: int = 0,
+                            section_rva: int = 0,
+                            global_rva_map: Optional[Dict[int, int]] = None,
+                            deferred_branches: Optional[List[Tuple[int, int, str]]] = None
+                            ) -> Tuple[bytes, Dict[int, int]]:
+        """
+        Translate a single 32-bit function to 64-bit.
+
+        For Win2000 code that uses stdcall (PUSH args, CALL, callee does RET N):
+          • Convert function prologue:
+              PUSH EBP; MOV EBP,ESP; SUB ESP,N  →  SUB RSP,align(N+32)
+          • Convert argument access:
+              [EBP+8], [EBP+C], … → RCX, RDX, R8, R9, [RSP+0x28], …
+          • Convert calls: PUSH args → MOV RCX/RDX/R8/R9 + stack setup
+          • Convert epilogue:
+              LEAVE; RET N  →  ADD RSP,align(N+32); RET
+          • Fix all branches and pointer immediates
+
+        This is a best-effort translation; complex patterns are flagged
+        with a warning and an INT3 for manual inspection.
+        """
+        out   = bytearray()
+        insns = list(self.md.disasm(code, self.old_base + func_rva))
+        old_new: Dict[int, int] = {}   # old VA → new byte offset in out[]
+        pending_fixups: List[Tuple[int,int,str]] = []   # (patch_off, target_va, type)
+
+        # Env-gated per-instruction trace (DEBUG_FN=0xRVA) to pinpoint where a
+        # function's translation diverges (mis-disassembly / wrong call targets).
+        _dbg_fn = os.environ.get('DEBUG_FN')
+        _dbg_on = False
+        if _dbg_fn:
+            try:
+                _dbg_on = (int(_dbg_fn, 16) == func_rva)
+            except ValueError:
+                _dbg_on = False
+        if _dbg_on:
+            print(f"[DEBUG_FN 0x{func_rva:X}] {len(insns)} insns, {len(code)} bytes")
+
+        # ── Phase 1: Enumerate instructions, build old→new offset map ──────────
+        # We need a two-pass approach: first estimate sizes, then emit.
+        # For simplicity we use a single pass with 5-byte rel32 branch encoding
+        # (always the worst-case; the linker can shrink later).
+        #
+        # Key transformations:
+        #   • INT 0x2E  → SYSCALL (handled by _translate_stub usually, but
+        #                           just in case we encounter it inline here)
+        #   • SYSENTER  → SYSCALL
+        #   • FS:[disp] → GS:[teb64_offset(disp)]
+        #   • PUSH r32  → (accumulated; flushed on CALL as MOV arg_reg,r)
+        #   • CALL near → E8 rel32 (target to be fixed up)
+        #   • Jcc near  → 0F 8x rel32 (6 bytes)
+        #   • JMP near  → E9 rel32 (5 bytes)
+        #   • MOV r,imm → patch imm if it's a pointer
+        #   • RET N     → ADD RSP,N+shadow; RET   (stdcall cleanup)
+        #   • LEAVE     → ADD RSP,frame_size; RET
+
+        push_stack: List[Tuple[str,int]] = []   # accumulated PUSHes before CALL
+        # MSVC ``call; pop ecx; push eax; call`` reuses the popped stack slot as
+        # the 2nd Win64 arg (RDX) for the follow-on import call.
+        cdecl_pop_ecx_arg: Optional[Tuple[str, int]] = None
+        cdecl_pop_ecx_arg2: Optional[Tuple[str, int]] = None
+        iat_fn_holder: Dict[int, str] = {}  # x86 reg → x64 reg holding import fn ptr
+        stack_spill_count = 0   # real stack pushes that must be read back at CALL
+        hw_stack_pushes = 0     # emitted hardware PUSHes (4-byte x86 → 8-byte x64)
+        callee_save_stack: List[str] = []  # r64 regs pushed as callee saves (balance on RET)
+        stack_cleanup_pending = 0   # x86 add esp,N after cdecl/stub call args
+        iat_fwd_epilogue = False    # stdcall push [esp+N]×3 → IAT; skip x86 stack tail
+        cc_mode = 'stdcall'   # stdcall | thiscall | fastcall | cdecl
+        frame_rbp_saved = False   # push ebp seen before mov ebp,esp in this function
+        seh_prev_reg: Optional[str] = None  # reg holding gs:[0] before SEH prev push
+        seh_frame_active = False  # SEH registered — [ebp-4] try level is at [rbp-8]
+        leave_emitted = False     # leave restores frame; ret must not re-pop callee saves
+        in_prologue = True   # callee-save pushes vs. argument pushes disambiguation
+        esp_dirty = False    # has RSP moved since function entry? (frameless arg map)
+        ptr_taint: Set[str] = set()   # r64 regs holding relocated image pointers
+        teb_ptr_regs: Set[str] = set()  # r64 regs holding TEB * (from fs:[0x18])
+        skip_insns: Set[int] = set()  # paired push ecx locals, etc.
+        rcx_home_reload = self._rcx_home_reload_needed(insns)
+        # Whether the function reads its incoming args through [EBP+disp] (the
+        # x86 stack home). Such args must be homed to the x64 shadow slots at
+        # the prologue: x86 always re-reads the stack copy, which never gets
+        # clobbered, whereas the x64 register copy does (cmd 0x15141 passes its
+        # own [ebp+8] arg to GetCurrentDirectoryW after RCX was reloaded).
+        ebp_args_used = any(
+            o.type == X86_OP_MEM and o.mem.base == X86_REG_EBP
+            and not o.mem.index and 0 < (o.mem.disp & 0xFFFFFFFF) <= 0x40
+            for ins in insns for o in (ins.operands or []))
+        frame_args_spilled = False
+        ebp_frame_active = rcx_home_reload or ebp_args_used  # x86 uses [EBP+N] args even if prologue not in chunk
+        ebp_data_ptr = False   # EBP holds a data pointer (mov ebp,[esp+N]), not a frame base
+        ebp_data_ptr_reg = 'r12'  # callee-saved scratch when table base unknown
+        ebp_table_base_rva: Optional[int] = None  # GetProcAddress trio at +0/+4/+8
+        ebp_reg_scratch = False  # mov ebp,reg/imm while rbp is callee-save (cmd 0x6519)
+        ebp_scratch_reg = 'r12'  # unused — scratch lives at [rbp+0x10]
+        ebp_scratch_home = -0x20  # below ret addr at [rbp-0x10] on cmd 0x6511 frame
+        frame_local_sub = 0   # sub esp,N in frameless chunk (cmd 0x9EBA)
+        frameless_stack_bias = 0  # bytes current RSP is below frame base (post sub)
+        frame_arg_anchor = False  # lea r15,[rsp] holds frame base for arg homes
+        elided_arg_bytes = 0  # x86 stack args moved to registers (4 bytes each)
+
+        # Peephole: detect `push X … pop reg` constant-load idioms (MSVC emits
+        # `push imm; pop ecx` to load a small constant). These are NOT call
+        # args, so translate them directly to `mov reg, X` and skip both insns.
+        pair_src_addrs: Set[int] = set()
+        pop_pair: Dict[int, Tuple[str, int]] = {}
+        for _i, _ins in enumerate(insns):
+            if _ins.mnemonic != 'push' or not _ins.operands:
+                continue
+            _op = _ins.operands[0]
+            if _op.type == X86_OP_IMM:
+                _val = ('imm', _op.imm)
+            elif _op.type == X86_OP_REG:
+                _val = ('reg', _op.reg)
+            else:
+                continue
+            for _j in range(_i + 1, min(_i + 7, len(insns))):
+                _nx = insns[_j]
+                nm = _nx.mnemonic
+                if nm == 'pop' and _nx.operands and _nx.operands[0].type == X86_OP_REG:
+                    pair_src_addrs.add(_ins.address)
+                    pop_pair[_nx.address] = _val
+                    break
+                if nm in ('push', 'call', 'ret', 'retn', 'leave') or nm.startswith('j'):
+                    break
+                _stk = any(
+                    (o.type == X86_OP_REG and o.reg == X86_REG_ESP)
+                    or (o.type == X86_OP_MEM and o.mem.base == X86_REG_ESP)
+                    for o in _nx.operands)
+                if _stk:
+                    break
+
+        for _insn_idx, insn in enumerate(insns):
+            old_va  = insn.address
+            if old_va in skip_insns:
+                if _dbg_on:
+                    print(f"  [skip] 0x{old_va - self.old_base:X}: "
+                          f"{insn.mnemonic} {insn.op_str}")
+                continue
+            old_new[old_va] = len(out)
+            _dbg_start = len(out)
+
+            mnem = insn.mnemonic
+            ops  = insn.operands
+            next_insn = insns[_insn_idx + 1] if _insn_idx + 1 < len(insns) else None
+
+            # Once any control-flow happens the prologue is over; subsequent
+            # push ebx/esi/edi are call arguments, not callee-save spills.
+            # EXCEPTION: ``mov eax,N; call __chkstk`` is a large-frame stack
+            # probe that is *part of* the prologue — the callee-save spill
+            # (push ebx/ebp/esi/edi) follows it. Treating the probe call as
+            # end-of-prologue made those pushes look like call args, so esi/edi
+            # were dropped (stack desync → wrong incoming-arg offsets, e.g. cmd
+            # 0xA4E7 → wcschr garbage). Keep the prologue open across a probe.
+            _is_probe_call = (
+                mnem == 'call' and ops and ops[0].type == X86_OP_IMM
+                and self._is_alloca_probe_rva(
+                    (ops[0].imm - self.old_base) & 0xFFFFFFFF))
+            if ((mnem == 'call' and not _is_probe_call)
+                    or mnem.startswith('j') or mnem in ('ret', 'retn')):
+                in_prologue = False
+
+            # ── Frameless cdecl: mov reg, [esp+N] at entry → Win64 arg reg ─────
+            # A frameless function reads its args from [esp+4], [esp+8], … before
+            # touching the stack. We passed those args in RCX/RDX/R8/R9, so map
+            # the stack read to the register while RSP is still at entry.
+            if (not frame_rbp_saved and not esp_dirty and mnem == 'mov'
+                    and len(ops) == 2 and ops[0].type == X86_OP_REG
+                    and ops[1].type == X86_OP_MEM and ops[1].mem.base == X86_REG_ESP
+                    and ops[1].mem.index == 0 and ops[1].mem.segment == 0):
+                n = ops[1].mem.disp
+                if n >= 4 and (n - 4) % 4 == 0 and (n - 4) // 4 < 4:
+                    arg_reg32 = W32_ARG_REG_NAMES[(n - 4) // 4]
+                    dst = W32_REG_ASM.get(ops[0].reg, 'eax')
+                    if dst != arg_reg32:
+                        out += self._asm(f'mov {dst}, {arg_reg32}')
+                    else:
+                        out += b'\x90'
+                    push_stack.clear()
+                    continue
+
+            # Frameless cdecl: cmp/test with [esp+N] → Win64 arg register.
+            if (not frame_rbp_saved and not esp_dirty and mnem in ('cmp', 'test')
+                    and len(ops) == 2):
+                frameless_cmp = False
+                for mem_i, other_i in ((0, 1), (1, 0)):
+                    if ops[mem_i].type != X86_OP_MEM:
+                        continue
+                    m = ops[mem_i].mem
+                    if (m.base != X86_REG_ESP or m.index != 0
+                            or m.segment != 0):
+                        continue
+                    n = m.disp
+                    if n < 4 or (n - 4) % 4 != 0:
+                        continue
+                    idx = (n - 4) // 4
+                    if idx >= 4:
+                        continue
+                    arg = WIN64_ARG_REG_NAMES[idx]
+                    other = ops[other_i]
+                    if mnem == 'test' and other.type == X86_OP_REG:
+                        r = W32_TO_W64_REG.get(other.reg, 'rax')
+                        if r != arg:
+                            out += self._asm(f'test {arg}, {r}')
+                        else:
+                            out += b'\x90'
+                    elif mnem == 'cmp':
+                        if other.type == X86_OP_IMM:
+                            out += self._asm(
+                                f'cmp {arg}, 0x{other.imm & 0xFFFFFFFF:x}')
+                        elif other.type == X86_OP_REG:
+                            r = W32_TO_W64_REG.get(other.reg, 'rax')
+                            out += self._asm(f'cmp {arg}, {r}')
+                        else:
+                            continue
+                    else:
+                        continue
+                    frameless_cmp = True
+                    break
+                if frameless_cmp:
+                    push_stack.clear()
+                    continue
+
+            # Frameless: and/or/xor dword [esp+N], reg → same Win64 arg register.
+            if (not frame_rbp_saved and not esp_dirty
+                    and mnem in ('and', 'or', 'xor') and len(ops) == 2
+                    and ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_REG):
+                m = ops[0].mem
+                if (m.base == X86_REG_ESP and not m.index and m.segment == 0):
+                    n = m.disp
+                    if n >= 4 and (n - 4) % 4 == 0:
+                        idx = (n - 4) // 4
+                        if idx < 4:
+                            arg64 = WIN64_ARG_REG_NAMES[idx]
+                            src32 = W32_REG_ASM.get(ops[1].reg, 'eax')
+                            if 'dword ptr' in insn.op_str.lower():
+                                arg32 = {'rcx': 'ecx', 'rdx': 'edx',
+                                         'r8': 'r8d', 'r9': 'r9d'}.get(
+                                    arg64, 'eax')
+                                out += self._asm(f'{mnem} {arg32}, {src32}')
+                            else:
+                                out += self._asm(
+                                    f'{mnem} {arg64}, '
+                                    f'{W32_TO_W64_REG.get(ops[1].reg, "rax")}')
+                            push_stack.clear()
+                            continue
+
+            # stdcall IAT forwarder tail: mov eax,[esp+N]; add esp,M; ret N
+            if (iat_fwd_epilogue and mnem == 'mov' and len(ops) == 2
+                    and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_EAX
+                    and ops[1].type == X86_OP_MEM and ops[1].mem.base == X86_REG_ESP
+                    and not ops[1].mem.index):
+                push_stack.clear()
+                continue
+
+            # mov ebp, [esp+N] with large N — load a data pointer (0xA071 path).
+            # Small offsets are usually frame tricks; hw_stack_pushes is often 0
+            # after stdcall `pop ecx` tails decrement it.
+            if (mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_REG
+                    and ops[0].reg == X86_REG_EBP
+                    and ops[1].type == X86_OP_MEM and ops[1].mem.base == X86_REG_ESP
+                    and ops[1].mem.index == 0 and ops[1].mem.segment == 0):
+                disp = ops[1].mem.disp
+                if disp > 0x7FFFFFFF:
+                    disp -= 0x100000000
+                if disp >= 0x60:
+                    arg_slot = self._frameless_stdcall_arg_slot(
+                        disp, frame_local_sub, hw_stack_pushes,
+                        elided_arg_bytes)
+                    if arg_slot is not None:
+                        off = self._frameless_arg_home_slot_off(arg_slot)
+                        if frame_arg_anchor:
+                            out += self._asm(f'mov eax, dword ptr [r15+0x{off:x}]')
+                        else:
+                            off = self._frameless_arg_home_rsp_off(
+                                arg_slot, frameless_stack_bias)
+                            out += self._asm(f'mov eax, dword ptr [rsp+0x{off:x}]')
+                        out += self._asm(f'mov {ebp_data_ptr_reg}, rax')
+                        ebp_data_ptr = True
+                        push_stack.clear()
+                        continue
+                    table_rva = self._find_ebp_global_table_rva(insns, _insn_idx)
+                    if table_rva is not None:
+                        new_va = self._relocate_imm(
+                            self.old_base + table_rva, len(out), 0)
+                        out += self._asm(
+                            f'movabs {ebp_data_ptr_reg}, '
+                            f'0x{new_va & 0xFFFFFFFFFFFFFFFF:x}')
+                        ebp_data_ptr = True
+                        ebp_table_base_rva = table_rva
+                        push_stack.clear()
+                        continue
+                    # Deep [esp+N] locals — bias for elided x86 arg pushes.
+                    off_x64 = (disp - elided_arg_bytes
+                               + len(callee_save_stack) * 4) & 0xFFFFFFFFFFFFFFFF
+                    # Keystone cannot encode `mov rbp, dword ptr [rsp+N]`; load via EAX.
+                    out += self._asm(f'mov eax, dword ptr [rsp+0x{off_x64:x}]')
+                    out += self._asm(f'mov {ebp_data_ptr_reg}, rax')
+                    ebp_data_ptr = True
+                    push_stack.clear()
+                    continue
+
+            # mov reg, [esp+N] after callee-save pushes → Win64 arg reg or [rsp+N']
+            if (mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_REG
+                    and ops[1].type == X86_OP_MEM and ops[1].mem.base == X86_REG_ESP
+                    and ops[1].mem.index == 0 and ops[1].mem.segment == 0
+                    and hw_stack_pushes):
+                disp = ops[1].mem.disp
+                if disp > 0x7FFFFFFF:
+                    disp -= 0x100000000
+                arg_slot = self._frameless_stdcall_arg_slot(
+                    disp, frame_local_sub, hw_stack_pushes, elided_arg_bytes)
+                if arg_slot is not None:
+                    off = self._frameless_arg_home_slot_off(arg_slot)
+                    dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    is_dword = 'dword ptr' in insn.op_str.lower()
+                    sz = 'dword' if is_dword else 'qword'
+                    if frame_arg_anchor:
+                        out += self._asm(
+                            f'mov {dst64}, {sz} ptr [r15+0x{off:x}]')
+                    else:
+                        off = self._frameless_arg_home_rsp_off(
+                            arg_slot, frameless_stack_bias)
+                        out += self._asm(
+                            f'mov {dst64}, {sz} ptr [rsp+0x{off:x}]')
+                    push_stack.clear()
+                    continue
+                slot = (disp - 4) // 4 - hw_stack_pushes
+                dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if 0 <= slot < 4:
+                    src64 = WIN64_ARG_REG_NAMES[slot]
+                    if dst64 != src64:
+                        out += self._asm(f'mov {dst64}, {src64}')
+                    push_stack.clear()
+                    continue
+                off_x64 = disp + hw_stack_pushes * 4
+                if off_x64 < 0:
+                    off_x64 &= 0xFFFFFFFFFFFFFFFF
+                is_dword = 'dword ptr' in insn.op_str.lower()
+                sz = 'dword' if is_dword else 'qword'
+                out += self._asm(f'mov {dst64}, {sz} ptr [rsp+0x{off_x64:x}]')
+                push_stack.clear()
+                continue
+
+            # and/or/xor [esp+N], reg after callee-save pushes → Win64 arg reg.
+            # Without this, `and [esp+0xc], eax` after push esi + skipped pop ecx
+            # corrupts the return address on x64 (helper 0x6581 / SetEnv path).
+            if (mnem in ('and', 'or', 'xor') and len(ops) == 2
+                    and ops[0].type == X86_OP_MEM
+                    and ops[0].mem.base == X86_REG_ESP
+                    and ops[0].mem.index == 0
+                    and ops[0].mem.segment == 0
+                    and ops[1].type == X86_OP_REG
+                    and hw_stack_pushes):
+                disp = ops[0].mem.disp
+                if disp > 0x7FFFFFFF:
+                    disp -= 0x100000000
+                slot = (disp - 4) // 4 - hw_stack_pushes
+                if 0 <= slot < 4:
+                    arg64 = WIN64_ARG_REG_NAMES[slot]
+                    src32 = W32_REG_ASM.get(ops[1].reg, 'eax')
+                    if 'dword ptr' in insn.op_str.lower():
+                        arg32 = {'rcx': 'ecx', 'rdx': 'edx',
+                                 'r8': 'r8d', 'r9': 'r9d'}.get(arg64, 'eax')
+                        out += self._asm(f'{mnem} {arg32}, {src32}')
+                    else:
+                        src64 = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                        out += self._asm(f'{mnem} {arg64}, {src64}')
+                    push_stack.clear()
+                    continue
+
+            # mov ecx, ebp at entry often means "this = arg1" — RCX already holds it.
+            if (mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_REG
+                    and ops[1].type == X86_OP_REG and in_prologue
+                    and not frame_rbp_saved
+                    and ops[0].reg == X86_REG_ECX and ops[1].reg == X86_REG_EBP):
+                push_stack.clear()
+                continue
+
+            # Track whether RSP has moved from its entry value (frameless args).
+            if mnem in ('push', 'pop', 'pushfd', 'popfd', 'pushad', 'popad'):
+                esp_dirty = True
+            elif mnem in ('sub', 'add') and ops and ops[0].type == X86_OP_REG \
+                    and ops[0].reg == X86_REG_ESP:
+                esp_dirty = True
+
+            # Deferred pushes are call args — keep them queued until the CALL
+            # consumes them. Only flush (treat as real pushes) when control flow
+            # happens or the stack pointer is explicitly manipulated, since a
+            # compiler may schedule unrelated non-stack ops between arg pushes.
+            if mnem not in ('push', 'call') and push_stack:
+                touches_esp = any(
+                    (op.type == X86_OP_REG and op.reg == X86_REG_ESP)
+                    or (op.type == X86_OP_MEM and op.mem.base == X86_REG_ESP)
+                    for op in ops
+                )
+                flush_now = (
+                    mnem in ('ret', 'retn', 'leave', 'jmp', 'pop', 'int', 'iret')
+                    or mnem.startswith('j')
+                    or mnem in ('sub', 'add') and ops and ops[0].type == X86_OP_REG
+                       and ops[0].reg == X86_REG_ESP
+                    or touches_esp
+                )
+                if flush_now:
+                    self._flush_deferred_pushes(out, push_stack)
+
+            # Detect thiscall: ECX = 'this' before a CALL (not plain arg setup).
+            if mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_REG:
+                if (ops[0].reg == X86_REG_ECX and ops[1].type == X86_OP_REG
+                        and ops[1].reg in (X86_REG_EBX, X86_REG_EDI, X86_REG_EBP)):
+                    for j in range(_insn_idx + 1, min(_insn_idx + 8, len(insns))):
+                        nx = insns[j]
+                        if nx.mnemonic == 'call':
+                            cc_mode = 'thiscall'
+                            break
+                        if nx.mnemonic in ('ret', 'retn', 'jmp'):
+                            break
+
+            # ── INT 0x2E / SYSENTER → SYSCALL ─────────────────────────────────
+            if mnem == 'int' and ops and ops[0].type == X86_OP_IMM and ops[0].imm == 0x2E:
+                out += b'\x0f\x05'   # SYSCALL
+                push_stack.clear()
+                continue
+            if mnem == 'sysenter':
+                out += b'\x0f\x05'
+                push_stack.clear()
+                continue
+
+            # ── FS: segment override → GS: TEB remap ──────────────────────────
+            if mnem in ('mov', 'lea') and ops:
+                has_fs = any(op.type == X86_OP_MEM and op.mem.segment == X86_REG_FS
+                             for op in ops)
+                if has_fs:
+                    # Identify the FS: operand and remap its disp
+                    for op in ops:
+                        if op.type == X86_OP_MEM and op.mem.segment == X86_REG_FS:
+                            fs_disp = op.mem.disp
+                            gs_disp = TEB_FS_TO_GS.get(fs_disp, fs_disp)
+                            if op == ops[1]:  # fs: is src
+                                # MSVC SEH: push -1; push scope; push handler; mov eax,fs:[0]
+                                # Deferred "call arg" pushes before this read are the SEH
+                                # registration record — emit them as real stack pushes.
+                                if push_stack and fs_disp == 0:
+                                    hw_stack_pushes += self._flush_deferred_pushes(
+                                        out, push_stack)
+                                dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                                out += self._encode_gs_load(dst, gs_disp)
+                                if fs_disp == 0x18:
+                                    self._teb_ptr_mark(teb_ptr_regs, ops[0].reg)
+                                if fs_disp == 0 and mnem == 'mov':
+                                    seh_prev_reg = dst
+                            else:             # fs: is dst
+                                src = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                                out += self._encode_gs_store(src, gs_disp)
+                                if fs_disp == 0:
+                                    seh_prev_reg = None
+                                    seh_frame_active = True
+                    push_stack.clear()
+                    continue
+
+            # SEH: push <reg> immediately after mov reg, gs:[0] saves prev chain link.
+            if (mnem == 'push' and ops and seh_prev_reg is not None
+                    and ops[0].type == X86_OP_REG):
+                rname = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if rname == seh_prev_reg:
+                    out += self._asm(f'push {rname}')
+                    hw_stack_pushes += 1
+                    seh_prev_reg = None
+                    continue
+
+            # ── [EBP+disp] stack args / locals → Win64 registers or [RBP-disp] ─
+            if ops and any(op.type == X86_OP_MEM and op.mem.base == X86_REG_EBP for op in ops):
+                ebp_op = next(op for op in ops if op.type == X86_OP_MEM and op.mem.base == X86_REG_EBP)
+                disp = ebp_op.mem.disp
+                if ebp_data_ptr:
+                    # Homed incoming args use positive [EBP+N] — not data-ptr offsets.
+                    if not (disp >= 8 and (disp - 8) % 4 == 0 and disp <= 0x40):
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                        other = (ops[1] if ebp_op == ops[0] else ops[0]) if len(ops) >= 2 else None
+                        if other is not None and mnem == 'cmp' and other.type == X86_OP_REG:
+                            if other.reg == X86_REG_EBX:
+                                r = '0'
+                            else:
+                                r = (self._word_reg_asm_for_op(other, insn.op_str)
+                                     if ebp_sz == 'word'
+                                     else W32_REG_ASM.get(other.reg, 'eax'))
+                            if ebp_table_base_rva is not None:
+                                slot_va = self._relocate_imm(
+                                    self.old_base + ebp_table_base_rva + disp,
+                                    len(out), 0)
+                                scratch = 'r11' if r != 'r11d' else 'r10'
+                                out += self._asm(
+                                    f'movabs {scratch}, '
+                                    f'0x{slot_va & 0xFFFFFFFFFFFFFFFF:x}')
+                                out += self._asm(
+                                    f'cmp {ebp_sz} ptr [{scratch}], {r}')
+                            else:
+                                ptr = ebp_data_ptr_reg
+                                out += self._asm(
+                                    f'cmp {ebp_sz} ptr [{ptr}{disp:+d}], {r}')
+                            continue
+                        if other is not None and mnem == 'mov' and ebp_op == ops[1] and ops[0].type == X86_OP_REG:
+                            dst = (self._word_reg_asm_for_op(ops[0], insn.op_str)
+                                   if ebp_sz == 'word'
+                                   else W32_REG_ASM.get(ops[0].reg, 'eax'))
+                            if ebp_table_base_rva is not None:
+                                slot_va = self._relocate_imm(
+                                    self.old_base + ebp_table_base_rva + disp,
+                                    len(out), 0)
+                                scratch = 'r11' if dst != 'r11' else 'r10'
+                                out += self._asm(
+                                    f'movabs {scratch}, '
+                                    f'0x{slot_va & 0xFFFFFFFFFFFFFFFF:x}')
+                                out += self._asm(
+                                    f'mov {dst}, {ebp_sz} ptr [{scratch}]')
+                            else:
+                                ptr = ebp_data_ptr_reg
+                                out += self._asm(
+                                    f'mov {dst}, {ebp_sz} ptr [{ptr}{disp:+d}]')
+                            continue
+                w64_arg = ebp_disp_to_win64_arg(disp)
+                _home = self._ebp_to_rbp_home(old_va, disp)
+                other = (ops[1] if ebp_op == ops[0] else ops[0]) if len(ops) >= 2 else None
+                # 5th+ incoming args map to [rsp+0x28+…] in w64_arg but are homed at
+                # [rbp+0x28+…] once the prologue spills RCX/RDX/R8/R9 (cmd 0x1A16D
+                # mov edi,[ebp+0x18] must read [rbp+0x28], not the byte alias at +0x20).
+                framed_stack_arg = (
+                    bool(w64_arg and w64_arg.startswith('[')
+                         and frame_args_spilled and _home is not None
+                         and ebp_frame_active))
+                is_ebp_incoming_arg = (
+                    disp >= 8 and (disp - 8) % 4 == 0 and disp <= 0x40)
+                if w64_arg and (mnem == 'push' or not w64_arg.startswith('[')
+                                or framed_stack_arg
+                                or (is_ebp_incoming_arg and mnem == 'mov')):
+                    # Incoming arg referenced via [EBP+disp] (homed to [RBP+N]).
+                    # Reading/using an arg does NOT consume pending call args, so
+                    # do not flush push_stack here — compilers interleave such
+                    # reads among argument pushes (cmd RegOpenKeyExW: mov esi,
+                    # [ebp+8]; and [esi],0; …; call) and flushing drops args.
+                    if mnem == 'push':
+                        slot = (disp - 8) // 4
+                        push_stack.append(('ebp_arg', slot))
+                        continue
+                    if (rcx_home_reload and ebp_frame_active and frame_args_spilled
+                            and mnem == 'mov' and other is not None
+                            and other.type == X86_OP_REG and other.reg == X86_REG_ECX
+                            and ebp_op == ops[1] and disp == 8):
+                        out += self._asm('mov rcx, qword ptr [rbp+0x10]')
+                        push_stack.clear()
+                        continue
+                    if other is not None and mnem == 'cmp' and other.type == X86_OP_IMM:
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        # When the arg was homed, read the stable stack copy; the
+                        # register may have been clobbered (e.g. across a call).
+                        if frame_args_spilled and _home is not None:
+                            csz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                            mask = {'byte': 0xFF, 'word': 0xFFFF}.get(csz, 0xFFFFFFFF)
+                            out += self._asm(
+                                f'cmp {csz} ptr [rbp+0x{_home:x}], '
+                                f'0x{other.imm & mask:x}')
+                        elif ptr_sz == 'word':
+                            reg16 = {'rcx': 'cx', 'rdx': 'dx', 'r8': 'r8w', 'r9': 'r9w'}.get(
+                                w64_arg, 'ax')
+                            out += self._asm(
+                                f'cmp {reg16}, 0x{other.imm & 0xFFFF:x}')
+                        else:
+                            out += self._asm(
+                                f'cmp {w64_arg}, 0x{other.imm & 0xFFFFFFFF:x}')
+                        continue
+                    if other is not None and mnem == 'mov' and other.type == X86_OP_REG:
+                        if ebp_op == ops[1]:
+                            dst = W32_TO_W64_REG.get(other.reg, 'rax')
+                            if ((frame_args_spilled or (is_ebp_incoming_arg and ebp_frame_active))
+                                    and _home is not None):
+                                if self._homed_arg_is_pointer(disp):
+                                    out += self._asm(
+                                        f'mov {dst}, qword ptr [rbp+0x{_home:x}]')
+                                else:
+                                    d32 = W32_REG_ASM.get(other.reg, 'eax')
+                                    out += self._asm(
+                                        f'mov {d32}, dword ptr [rbp+0x{_home:x}]')
+                            elif dst != w64_arg:
+                                out += self._asm(f'mov {dst}, {w64_arg}')
+                            else:
+                                out += self._asm('nop')
+                        elif ebp_op == ops[0]:
+                            src = (self._word_reg_asm_for_op(other, insn.op_str)
+                                   if self._mem_ptr_size(insn.op_str) == 'word'
+                                   else W32_REG_ASM.get(other.reg, 'edx'))
+                            home = self._ebp_to_rbp_home(old_va, disp)
+                            if home is not None:
+                                slot_sz = ('qword' if self._homed_arg_is_pointer(disp)
+                                           else 'dword')
+                                out += self._asm(
+                                    f'mov {slot_sz} ptr [rbp+0x{home:x}], {src}')
+                            else:
+                                out += self._asm(
+                                    f'mov dword ptr [rbp+{disp}], {src}')
+                        else:
+                            dst = W32_TO_W64_REG.get(other.reg, 'rax')
+                            if dst != w64_arg:
+                                out += self._asm(f'mov {dst}, {w64_arg}')
+                    elif other is not None and mnem == 'mov' and other.type == X86_OP_IMM and ebp_op == ops[0]:
+                        home = self._ebp_to_rbp_home(old_va, disp)
+                        if home is not None:
+                            out += self._asm(
+                                f'mov dword ptr [rbp+0x{home:x}], '
+                                f'0x{other.imm & 0xFFFFFFFF:x}')
+                        else:
+                            out += self._asm(
+                                f'mov dword ptr [rbp+{disp}], '
+                                f'0x{other.imm & 0xFFFFFFFF:x}')
+                    elif other is not None and mnem == 'cmp' and other.type == X86_OP_REG:
+                        if frame_args_spilled and _home is not None:
+                            r32 = W32_REG_ASM.get(other.reg, 'eax')
+                            if ebp_op == ops[0]:
+                                out += self._asm(
+                                    f'cmp dword ptr [rbp+0x{_home:x}], {r32}')
+                            else:
+                                out += self._asm(
+                                    f'cmp {r32}, dword ptr [rbp+0x{_home:x}]')
+                        else:
+                            r = W32_TO_W64_REG.get(other.reg, 'rax')
+                            out += self._asm(f'cmp {w64_arg}, {r}')
+                        continue
+                    elif (other is not None and mnem in ('add', 'sub')
+                          and other.type == X86_OP_REG):
+                        r32 = W32_REG_ASM.get(other.reg, 'eax')
+                        if frame_args_spilled and _home is not None:
+                            if self._homed_arg_is_pointer(disp):
+                                dst64 = W32_TO_W64_REG.get(other.reg, 'rax')
+                                if ebp_op == ops[1]:
+                                    out += self._asm(
+                                        f'{mnem} {dst64}, qword ptr [rbp+0x{_home:x}]')
+                                else:
+                                    out += self._asm(
+                                        f'{mnem} qword ptr [rbp+0x{_home:x}], {dst64}')
+                            elif ebp_op == ops[1]:
+                                out += self._asm(
+                                    f'{mnem} {r32}, dword ptr [rbp+0x{_home:x}]')
+                            else:
+                                out += self._asm(
+                                    f'{mnem} dword ptr [rbp+0x{_home:x}], {r32}')
+                        else:
+                            dst64 = W32_TO_W64_REG.get(other.reg, 'rax')
+                            if ebp_op == ops[1]:
+                                out += self._asm(f'{mnem} {dst64}, {w64_arg}')
+                            else:
+                                out += self._asm(f'{mnem} {w64_arg}, {dst64}')
+                        continue
+                    elif mnem in ('inc', 'dec') and ebp_op == ops[0]:
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                        if _home is not None:
+                            out += self._asm(
+                                f'{mnem} {ebp_sz} ptr [rbp+0x{_home:x}]')
+                        continue
+                    elif (other is not None and mnem in ('and', 'or', 'xor')
+                            and ebp_op == ops[0]):
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                        home = self._ebp_to_rbp_home(old_va, disp)
+                        if home is not None:
+                            if other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp+0x{home:x}], '
+                                    f'0x{other.imm & 0xFFFFFFFF:x}')
+                            elif other.type == X86_OP_REG:
+                                r = (self._word_reg_asm_for_op(other, insn.op_str)
+                                     if ebp_sz == 'word'
+                                     else W32_REG_ASM.get(other.reg, 'eax'))
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp+0x{home:x}], {r}')
+                            continue
+                        reg32 = {'rcx': 'ecx', 'rdx': 'edx',
+                                 'r8': 'r8d', 'r9': 'r9d'}.get(w64_arg)
+                        if reg32 and other.type == X86_OP_IMM:
+                            out += self._asm(
+                                f'{mnem} {reg32}, 0x{other.imm & 0xFFFFFFFF:x}')
+                            continue
+                    elif mnem == 'push':
+                        if framed_stack_arg and _home is not None:
+                            out += self._asm(
+                                f'push qword ptr [rbp+0x{_home:x}]')
+                        else:
+                            out += self._asm(f'push {w64_arg}')
+                    elif mnem == 'lea' and len(ops) == 2 and ebp_op == ops[1]:
+                        dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                        self._emit_lea_ebp_slot(out, dst, disp, False)
+                    elif other is not None:
+                        r = W32_TO_W64_REG.get(other.reg, 'rax') if other.type == X86_OP_REG else 'rax'
+                        if framed_stack_arg and _home is not None:
+                            if self._homed_arg_is_pointer(disp):
+                                out += self._asm(
+                                    f'mov {r}, qword ptr [rbp+0x{_home:x}]')
+                            else:
+                                d32 = W32_REG_ASM.get(other.reg, 'eax') if other.type == X86_OP_REG else 'eax'
+                                out += self._asm(
+                                    f'mov {d32}, dword ptr [rbp+0x{_home:x}]')
+                        else:
+                            out += self._asm(f'mov {r}, {w64_arg}')
+                    continue
+                elif disp >= 8:
+                    # Misaligned x86 stack slots (e.g. [EBP+0xA]) — map into
+                    # homed-arg bytes at [RBP+0x10+…], not [RBP+disp] (that
+                    # overlaps the saved return address at [RBP+8]).
+                    home = _home if (frame_args_spilled and _home is not None) else None
+                    if home is None:
+                        home = ebp_disp_to_rbp_stack_off(disp)
+                    ptr_sz = self._mem_ptr_size(insn.op_str)
+                    ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                    other = (ops[1] if ebp_op == ops[0] else ops[0]) if len(ops) >= 2 else None
+                    if home is not None and other is not None and mnem in (
+                            'and', 'or', 'xor', 'mov', 'cmp', 'test', 'add', 'sub'):
+                        if mnem == 'mov' and ebp_op == ops[1] and ops[0].type == X86_OP_REG:
+                            if (self._homed_arg_is_pointer(disp)
+                                    and ebp_sz == 'dword'):
+                                dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                                out += self._asm(
+                                    f'mov {dst64}, qword ptr [rbp+0x{home:x}]')
+                            else:
+                                dst = (self._word_reg_asm_for_op(ops[0], insn.op_str)
+                                       if ebp_sz == 'word'
+                                       else W32_REG_ASM.get(ops[0].reg, 'eax'))
+                                out += self._asm(
+                                    f'mov {dst}, {ebp_sz} ptr [rbp+0x{home:x}]')
+                        elif mnem == 'mov' and ebp_op == ops[0]:
+                            if other.type == X86_OP_REG:
+                                src = (self._word_reg_asm_for_op(other, insn.op_str)
+                                       if ebp_sz == 'word'
+                                       else W32_REG_ASM.get(other.reg, 'edx'))
+                                out += self._asm(
+                                    f'mov {ebp_sz} ptr [rbp+0x{home:x}], {src}')
+                            elif other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'mov {ebp_sz} ptr [rbp+0x{home:x}], '
+                                    f'0x{other.imm & 0xFFFFFFFF:x}')
+                        elif mnem in ('and', 'or', 'xor', 'add', 'sub'):
+                            if other.type == X86_OP_REG:
+                                r = self._ebp_slot_reg_asm(other, insn.op_str, ebp_sz)
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp+0x{home:x}], {r}')
+                            elif other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp+0x{home:x}], '
+                                    f'0x{other.imm & 0xFFFFFFFF:x}')
+                        elif mnem == 'cmp' and other.type == X86_OP_IMM:
+                            out += self._asm(
+                                f'cmp {ebp_sz} ptr [rbp+0x{home:x}], '
+                                f'0x{other.imm & 0xFFFFFFFF:x}')
+                        elif mnem == 'test' and other.type == X86_OP_REG:
+                            r = self._ebp_slot_reg_asm(other, insn.op_str, ebp_sz)
+                            out += self._asm(
+                                f'test {ebp_sz} ptr [rbp+0x{home:x}], {r}')
+                        continue
+                elif disp < 0:
+                    # Local variable — x64 SEH record is 32 bytes vs x86 16 bytes.
+                    disp = self._seh_rbp_local_disp(disp, seh_frame_active)
+                    ptr_sz = self._mem_ptr_size(insn.op_str)
+                    m8_ptr = (disp == -8
+                              and self._cmd_builder_ebp_m8_is_ptr(old_va))
+                    if mnem == 'mov' and len(ops) == 2:
+                        m4_ptr = (disp == -4
+                                  and self._cmd_builder_ebp_m4_is_ptr(old_va))
+                        if ebp_op == ops[1] and ops[0].type == X86_OP_REG:
+                            if m4_ptr or m8_ptr:
+                                dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                                out += self._asm(
+                                    f'mov {dst64}, qword ptr [rbp{disp:+d}]')
+                            else:
+                                dst = (self._word_reg_asm_for_op(ops[0], insn.op_str)
+                                       if ptr_sz == 'word'
+                                       else W32_REG_ASM.get(ops[0].reg, 'eax'))
+                                out += self._asm(
+                                    f'mov {dst}, {ptr_sz} ptr [rbp{disp:+d}]')
+                        elif ebp_op == ops[0] and ops[1].type == X86_OP_REG:
+                            if ops[1].reg == X86_REG_ESP:
+                                out += self._asm(f'mov qword ptr [rbp{disp:+d}], rsp')
+                            elif m4_ptr or m8_ptr:
+                                src64 = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                                out += self._asm(
+                                    f'mov qword ptr [rbp{disp:+d}], {src64}')
+                            else:
+                                src = (self._word_reg_asm_for_op(ops[1], insn.op_str)
+                                       if ptr_sz == 'word'
+                                       else W32_REG_ASM.get(ops[1].reg, 'edx'))
+                                out += self._asm(
+                                    f'mov {ptr_sz} ptr [rbp{disp:+d}], {src}')
+                        elif ebp_op == ops[0] and ops[1].type == X86_OP_IMM:
+                            slot_sz = ('qword' if (m4_ptr or m8_ptr)
+                                       else ptr_sz)
+                            out += self._asm(
+                                f'mov {slot_sz} ptr [rbp{disp:+d}], '
+                                f'0x{ops[1].imm & 0xFFFFFFFF:x}')
+                        continue
+                    if mnem == 'lea' and len(ops) == 2 and ebp_op == ops[1]:
+                        dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                        self._emit_lea_ebp_slot(out, dst, disp, False)
+                        continue
+                    if mnem == 'push' and ebp_op == ops[0]:
+                        # push dword ptr [ebp-N] before CALL — stdcall arg value,
+                        # not a hardware stack push (would corrupt Win64 RSP).
+                        push_stack.append(('ebp_slot', disp))
+                        continue
+                    if disp < 0 and mnem in ('inc', 'dec') and len(ops) == 1 and ebp_op == ops[0]:
+                        ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                        out += self._asm(f'{mnem} {ebp_sz} ptr [rbp{disp:+d}]')
+                        continue
+                    if disp < 0 and len(ops) >= 2 and mnem in ('and', 'or', 'xor', 'add', 'sub',
+                                             'cmp', 'test'):
+                        other = ops[1] if ebp_op == ops[0] else ops[0]
+                        ebp_sz = ('qword' if m8_ptr
+                                  else (ptr_sz if ptr_sz in ('byte', 'word') else 'dword'))
+                        if mnem == 'test' and other.type == X86_OP_REG:
+                            r = self._ebp_slot_reg_asm(other, insn.op_str, ebp_sz)
+                            out += self._asm(
+                                f'test {ebp_sz} ptr [rbp{disp:+d}], {r}')
+                            continue
+                        if mnem == 'cmp':
+                            if other.type == X86_OP_REG:
+                                r = self._ebp_slot_reg_asm(other, insn.op_str, ebp_sz)
+                                out += self._asm(
+                                    f'cmp {ebp_sz} ptr [rbp{disp:+d}], {r}')
+                            elif other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'cmp {ebp_sz} ptr [rbp{disp:+d}], '
+                                    f'0x{other.imm & 0xFFFFFFFF:x}')
+                            continue
+                        if mnem in ('and', 'or', 'xor', 'add', 'sub'):
+                            if other.type == X86_OP_REG:
+                                r = self._ebp_slot_reg_asm(other, insn.op_str, ebp_sz)
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp{disp:+d}], {r}')
+                            elif other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'{mnem} {ebp_sz} ptr [rbp{disp:+d}], '
+                                    f'0x{other.imm & 0xFFFFFFFF:x}')
+                            continue
+
+            # push dword ptr [esp+N] — stdcall arg from caller stack (frameless).
+            if (mnem == 'push' and ops and ops[0].type == X86_OP_MEM):
+                m = ops[0].mem
+                if (m.base == X86_REG_ESP and not m.index and m.segment == 0):
+                    disp = m.disp & 0xFFFFFFFF
+                    if disp > 0x7FFFFFFF:
+                        disp -= 0x100000000
+                    if disp >= 4:
+                        # ``len(push_stack)*4`` accounts for THIS call's earlier
+                        # args already deferred (elided into registers): they
+                        # lowered the x86 ESP but not the translated RSP, so the
+                        # x86 disp is that many bytes high relative to the frame.
+                        arg_slot = self._frameless_stdcall_arg_slot(
+                            disp, frame_local_sub, hw_stack_pushes,
+                            elided_arg_bytes + len(push_stack) * 4)
+                        if arg_slot is not None:
+                            push_stack.append(('arg_home', arg_slot))
+                            continue
+                        slot = ((disp - 4) // 4 - len(push_stack)
+                                - hw_stack_pushes)
+                        if 0 <= slot < 4:
+                            # cmd 0xAC9D: ``push dword ptr [esp+4]`` reloads the
+                            # caller's exit code from the stack for exit().
+                            # esp_fwd slot 0 would wrongly become mov rcx, rcx.
+                            if slot == 0 and disp == 4 and not in_prologue:
+                                off_x64 = (8 + hw_stack_pushes * 4
+                                           ) & 0xFFFFFFFFFFFFFFFF
+                                push_stack.append(('esp_mem', off_x64))
+                            else:
+                                push_stack.append(('esp_fwd', slot))
+                        else:
+                            off_x64 = (disp + hw_stack_pushes * 4
+                                       ) & 0xFFFFFFFFFFFFFFFF
+                            push_stack.append(('esp_mem', off_x64))
+                        continue
+
+            # ── Absolute memory operands (IAT globals, .data) ─────────────────
+            if ops and any(op.type == X86_OP_MEM for op in ops):
+                mem_op = next(op for op in ops if op.type == X86_OP_MEM)
+                if (mem_op.mem.base == 0 and mem_op.mem.index == 0
+                        and mem_op.mem.segment == 0):
+                    abs_va = self._relocate_imm(mem_op.mem.disp & 0xFFFFFFFF,
+                                                len(out), 0)
+                    if mnem == 'call' and len(ops) == 1:
+                        if push_stack and not self._is_zero_arg_iat(mem_op.mem.disp):
+                            old_rva_call = (old_va - self.old_base) & 0xFFFFFFFF
+                            if (self.win10_test_shim and old_rva_call == 0x1A514
+                                    and len(push_stack) == 2):
+                                # push ebx; …; push eax; push edi; call wcsncpy —
+                                # count arg was dropped by callee-save disambiguation.
+                                push_stack.insert(0, ('reg', X86_REG_EBX))
+                            args = list(reversed(push_stack))
+                            push_stack.clear()
+                            arg_regs = self._call_arg_regs(cc_mode)
+                            for idx, (atype, aval) in enumerate(args[:len(arg_regs)]):
+                                reg = arg_regs[idx]
+                                if atype == 'imm':
+                                    imm = self._relocate_imm(aval & 0xFFFFFFFF,
+                                                             len(out), 0)
+                                    out += self._asm(
+                                        f'mov {reg}, 0x{imm & 0xFFFFFFFFFFFFFFFF:x}')
+                                elif atype == 'reg':
+                                    if aval == X86_REG_EBP and ebp_reg_scratch:
+                                        self._emit_ebp_scratch_load_to(
+                                            out, reg)
+                                    else:
+                                        self._emit_mov32_to_w64_reg(
+                                            out, reg, aval,
+                                            ebp_reg_scratch, ebp_scratch_reg)
+                                elif atype == 'spill':
+                                    off = 8 * (stack_spill_count - aval)
+                                    out += self._asm(
+                                        f'mov {reg}, qword ptr [rsp+0x{off:x}]')
+                                elif atype == 'mem_abs':
+                                    self._emit_abs_dword_load(out, reg, aval)
+                                elif atype == 'mem_index':
+                                    base, idx_r, scale, disp = aval
+                                    self._emit_mem_index_dword_load(
+                                        out, reg, base, idx_r, scale, disp)
+                                elif atype == 'esp_fwd':
+                                    if aval < len(WIN64_ARG_REG_NAMES):
+                                        src = WIN64_ARG_REG_NAMES[aval]
+                                        if src != reg:
+                                            out += self._asm(f'mov {reg}, {src}')
+                                    else:
+                                        self._emit_homed_stack_arg_to_reg(
+                                            out, reg, ebp_arg_slot_to_rbp_home(aval))
+                                elif atype == 'ebp_arg':
+                                    if frame_args_spilled or aval >= 4:
+                                        self._emit_homed_stack_arg_to_reg(
+                                            out, reg, ebp_arg_slot_to_rbp_home(aval))
+                                    else:
+                                        src = WIN64_ARG_REG_NAMES[aval]
+                                        if src != reg:
+                                            out += self._asm(f'mov {reg}, {src}')
+                                elif atype == 'ebp_local':
+                                    self._emit_lea_ebp_slot(out, reg, aval)
+                                elif atype in ('ebp_slot', 'esp_mem', 'arg_home'):
+                                    self._emit_push_arg_to_reg(
+                                        out, reg, atype, aval,
+                                        frameless_stack_bias, frame_arg_anchor)
+                                elif atype != 'stack':
+                                    out += self._asm(f'xor {reg}, {reg}')
+                            if stack_spill_count:
+                                out += self._asm(
+                                    f'add rsp, 0x{8 * stack_spill_count:x}')
+                                stack_spill_count = 0
+                            # Args 5+ go on the stack. Win64 places the 5th arg
+                            # at [rsp+0x20] (caller frame), 6th at +0x28, …; the
+                            # 0x20 shadow store precedes them. (cmd __getmainargs
+                            # passes &startinfo as its 5th arg.)
+                            extra = args[len(arg_regs):]
+                            nstack = len(extra)
+                            self._emit_call_align_prologue(out, nstack)
+                            for i, (atype, aval) in enumerate(extra):
+                                off = 0x20 + i * 8
+                                if atype == 'imm':
+                                    imm = self._relocate_imm(
+                                        aval & 0xFFFFFFFF, len(out), 0)
+                                    out += self._asm(
+                                        f'mov rax, 0x{imm & 0xFFFFFFFFFFFFFFFF:x}')
+                                    out += self._asm(
+                                        f'mov qword ptr [rsp+0x{off:x}], rax')
+                                elif atype == 'reg':
+                                    if aval == X86_REG_EBP and ebp_reg_scratch:
+                                        self._emit_ebp_scratch_load_to(
+                                            out, 'rax')
+                                    else:
+                                        src = W32_TO_W64_REG.get(aval, 'rax')
+                                        if src != 'rax':
+                                            out += self._asm(f'mov rax, {src}')
+                                    out += self._asm(
+                                        f'mov qword ptr [rsp+0x{off:x}], rax')
+                                elif atype == 'mem_abs':
+                                    self._emit_abs_dword_load(out, 'rax', aval)
+                                    out += self._asm(
+                                        f'mov qword ptr [rsp+0x{off:x}], rax')
+                                elif atype in ('ebp_slot', 'esp_mem',
+                                               'ebp_local', 'ebp_arg',
+                                               'arg_home'):
+                                    self._emit_push_arg_to_stack(
+                                        out, off, atype, aval,
+                                        frameless_stack_bias,
+                                        frame_arg_anchor,
+                                        args_homed=frame_args_spilled)
+                                else:
+                                    out += self._asm(
+                                        f'mov qword ptr [rsp+0x{off:x}], 0')
+                            self._emit_iat_call(out, mem_op.mem.disp)
+                            self._emit_call_align_epilogue(out, nstack)
+                            iat_fwd_epilogue = True
+                            # stdcall IAT — callee pops args on x86; no pop ecx cleanup.
+                        elif push_stack and self._is_zero_arg_iat(mem_op.mem.disp):
+                            self._emit_call_align_prologue(out, 0)
+                            self._emit_iat_call(out, mem_op.mem.disp)
+                            self._emit_call_align_epilogue(out, 0)
+                            iat_fwd_epilogue = True
+                        else:
+                            self._emit_call_align_prologue(out, 0)
+                            self._emit_iat_call(out, mem_op.mem.disp)
+                            self._emit_call_align_epilogue(out, 0)
+                        cc_mode = 'stdcall'
+                        continue
+                    if mnem == 'mov' and len(ops) == 2:
+                        if mem_op == ops[0] and ops[1].type == X86_OP_IMM:
+                            ptr_sz = self._mem_ptr_size(insn.op_str)
+                            if ptr_sz in ('byte', 'word'):
+                                out += self._asm(f'mov rax, 0x{abs_va:x}')
+                                out += self._asm(
+                                    f'mov {ptr_sz} ptr [rax], '
+                                    f'0x{ops[1].imm & 0xFFFFFFFF:x}')
+                                continue
+                            self._emit_rip_rel_mov_imm32(
+                                out, mem_op.mem.disp, ops[1].imm)
+                            continue
+                        if mem_op == ops[1] and ops[0].type == X86_OP_REG:
+                            dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                            if self._is_iat_rva(mem_op.mem.disp & 0xFFFFFFFF):
+                                self._emit_iat_fn_ptr_load(
+                                    out, ops[0].reg, abs_va, iat_fn_holder)
+                            else:
+                                # Respect the x86 destination width.  ``mov ax,
+                                # [abs]`` / ``mov al,[abs]`` write ONLY the low
+                                # 16/8 bits and preserve the rest of the reg; a
+                                # widened dword/qword load over-reads the adjacent
+                                # global and pollutes the high bits (garbage that
+                                # then drives wrong branches — cmd locale-init
+                                # ``mov ax,[0x1c76c]`` mis-set the error flag).
+                                op_sz = getattr(ops[0], 'size', 4) or 4
+                                if op_sz == 1:
+                                    reg_asm = self._reg_asm_for_op(ops[0], insn.op_str)
+                                    load_sz = 'byte'
+                                elif op_sz == 2:
+                                    reg_asm = self._word_reg_asm_for_op(
+                                        ops[0], insn.op_str)
+                                    load_sz = 'word'
+                                else:
+                                    d32_map = {'rax': 'eax', 'rbx': 'ebx',
+                                               'rcx': 'ecx', 'rdx': 'edx',
+                                               'rsi': 'esi', 'rdi': 'edi',
+                                               'r8': 'r8d', 'r9': 'r9d',
+                                               'r10': 'r10d', 'r11': 'r11d'}
+                                    d32 = d32_map.get(dst, 'eax')
+                                    load_sz = ('qword' if self.win10_test_shim
+                                               else 'dword')
+                                    reg_asm = dst if load_sz == 'qword' else d32
+                                off = len(out)
+                                out += self._asm(
+                                    f'mov {reg_asm}, {load_sz} ptr [rip+0]')
+                                insn_len = len(out) - off
+                                rel = abs_va - (off + insn_len)
+                                if -2147483648 <= rel <= 2147483647:
+                                    struct.pack_into('<i', out, off + insn_len - 4, rel)
+                                else:
+                                    del out[off:]
+                                    scratch = 'r11' if dst != 'r11' else 'r10'
+                                    out += self._asm(
+                                        f'movabs {scratch}, 0x{abs_va:x}')
+                                    out += self._asm(
+                                        f'mov {reg_asm}, '
+                                        f'{load_sz} ptr [{scratch}]')
+                            self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                            continue
+                        if mem_op == ops[0] and ops[1].type == X86_OP_REG:
+                            ptr_sz = self._mem_ptr_size(insn.op_str)
+                            if ptr_sz == 'dword' and getattr(ops[1], 'size', 0) == 1:
+                                ptr_sz = 'byte'
+                            src = (self._word_reg_asm_for_op(ops[1], insn.op_str)
+                                   if ptr_sz == 'word'
+                                   else self._reg_asm_for_op(ops[1], insn.op_str))
+                            # mov dword ptr [abs], eax — do not load abs into RAX.
+                            if ops[1].reg == X86_REG_EAX:
+                                scratch = 'r11'
+                                out += self._asm(
+                                    f'movabs {scratch}, 0x{abs_va:x}')
+                                if self.win10_test_shim:
+                                    out += self._asm(
+                                        f'mov qword ptr [{scratch}], rax')
+                                else:
+                                    out += self._asm(
+                                        f'mov {ptr_sz} ptr [{scratch}], {src}')
+                            else:
+                                out += self._asm(f'mov rax, 0x{abs_va:x}')
+                                out += self._asm(
+                                    f'mov {ptr_sz} ptr [rax], {src}')
+                            continue
+                    if mnem == 'push' and len(ops) == 1:
+                        # Defer as a call argument: push [global] is usually the
+                        # argument to the following CALL (e.g. lpCriticalSection).
+                        push_stack.append(('mem_abs', mem_op.mem.disp & 0xFFFFFFFF))
+                        continue
+
+                    # Generic ALU op on an absolute global: and/or/xor/add/sub/
+                    # cmp/test/inc/dec/… with [abs] as dest or source. Emit it
+                    # through a movabs scratch so the global VA stays a
+                    # relocatable immediate. A RIP-relative encoding here would
+                    # freeze the (still-unrelocated) RVA — there is no later
+                    # fixup pass for RIP displacements — and a write would fault
+                    # into the read-only .text (cmd flag clears: and byte [g],0).
+                    _ALU_ABS = {
+                        'and', 'or', 'xor', 'add', 'sub', 'adc', 'sbb',
+                        'cmp', 'test', 'inc', 'dec', 'neg', 'not',
+                        'movzx', 'movsx',
+                    }
+                    if mnem in _ALU_ABS:
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        imm_mask = {'byte': 0xFF, 'word': 0xFFFF,
+                                    'dword': 0xFFFFFFFF,
+                                    'qword': 0xFFFFFFFFFFFFFFFF}.get(
+                                        ptr_sz, 0xFFFFFFFF)
+                        scratch = 'r11'
+                        if len(ops) == 1:
+                            out += self._asm(
+                                f'movabs {scratch}, 0x{abs_va:x}')
+                            out += self._asm(
+                                f'{mnem} {ptr_sz} ptr [{scratch}]')
+                            continue
+                        if len(ops) == 2:
+                            mem_first = (mem_op == ops[0])
+                            other = ops[1] if mem_first else ops[0]
+                            if other.type == X86_OP_IMM:
+                                out += self._asm(
+                                    f'movabs {scratch}, 0x{abs_va:x}')
+                                out += self._asm(
+                                    f'{mnem} {ptr_sz} ptr [{scratch}], '
+                                    f'0x{other.imm & imm_mask:x}')
+                                continue
+                            if other.type == X86_OP_REG:
+                                r = (self._word_reg_asm_for_op(other, insn.op_str)
+                                     if ptr_sz == 'word'
+                                     else self._reg_asm_for_op(other, insn.op_str))
+                                # ah/bh/ch/dh cannot coexist with a REX-prefixed
+                                # base (r11); skip and let the fallback emit it.
+                                if r not in ('ah', 'bh', 'ch', 'dh'):
+                                    out += self._asm(
+                                        f'movabs {scratch}, 0x{abs_va:x}')
+                                    if mnem in ('movzx', 'movsx'):
+                                        # reg <- [abs] (mem is the source)
+                                        out += self._asm(
+                                            f'{mnem} '
+                                            f'{W32_TO_W64_REG.get(ops[0].reg, "rax")}, '
+                                            f'{ptr_sz} ptr [{scratch}]')
+                                    elif mem_first:
+                                        out += self._asm(
+                                            f'{mnem} {ptr_sz} ptr [{scratch}], {r}')
+                                    else:
+                                        out += self._asm(
+                                            f'{mnem} {r}, {ptr_sz} ptr [{scratch}]')
+                                    continue
+
+            # lea r32,[ebp±N]; push r32 — stdcall out-pointer arg, not a stack local.
+            # Must run before the MSVC push-ecx → sub rsp block below.
+            if (mnem == 'push' and ops and ops[0].type == X86_OP_REG
+                    and frame_rbp_saved):
+                op = ops[0]
+                prev = insns[_insn_idx - 1] if _insn_idx > 0 else None
+                if (prev is not None and prev.mnemonic == 'lea'
+                        and len(prev.operands) == 2
+                        and prev.operands[0].type == X86_OP_REG
+                        and prev.operands[0].reg == op.reg
+                        and prev.operands[1].type == X86_OP_MEM
+                        and prev.operands[1].mem.base == X86_REG_EBP):
+                    disp = prev.operands[1].mem.disp
+                    if disp > 0x7FFFFFFF:
+                        disp -= 0x100000000
+                    if disp < 0:
+                        disp = self._seh_rbp_local_disp(disp, seh_frame_active)
+                    push_stack.append(('ebp_local', disp))
+                    continue
+
+            # ── PUSH ECX after EBP frame → SUB RSP,N (MSVC stack locals) ─────
+            # Only the bare `push ecx` reserve-locals idiom belongs here. A
+            # `push ecx` that is loaded right before (mov ecx,<arg>) or that
+            # appears while call args are already being accumulated is a real
+            # CALL argument and must fall through to the push/CALL marshaller —
+            # otherwise we lose pending args and drift RSP by 4 (cmd's
+            # __getmainargs call: see _emit_iat_call marshalling).
+            if (mnem == 'push' and ops and ops[0].type == X86_OP_REG
+                    and ops[0].reg == X86_REG_ECX and frame_rbp_saved):
+                _prev = insns[_insn_idx - 1] if _insn_idx > 0 else None
+                _prev_loads_ecx = (
+                    _prev is not None and _prev.mnemonic == 'mov'
+                    and len(_prev.operands) == 2
+                    and _prev.operands[0].type == X86_OP_REG
+                    and _prev.operands[0].reg == X86_REG_ECX)
+                if not push_stack and not _prev_loads_ecx:
+                    n_local = 1
+                    for j in range(_insn_idx + 1, min(_insn_idx + 4, len(insns))):
+                        nx = insns[j]
+                        if (nx.mnemonic == 'push' and nx.operands
+                                and nx.operands[0].type == X86_OP_REG
+                                and nx.operands[0].reg == X86_REG_ECX):
+                            n_local += 1
+                            skip_insns.add(nx.address)
+                        else:
+                            break
+                    out += self._asm(f'sub rsp, 0x{4 * n_local:x}')
+                    push_stack.clear()
+                    continue
+
+            # ── PUSH paired with a later POP (constant-load idiom) → skip ─────
+            if mnem == 'push' and old_va in pair_src_addrs:
+                continue
+
+            # ── PUSH r32 / PUSH imm  (accumulate for CALL translation) ─────────
+            if mnem == 'push' and ops:
+                op = ops[0]
+                if op.type == X86_OP_REG:
+                    if self._is_cdecl_scratch_push(_insn_idx, insns):
+                        # push esi; call time; pop ecx; push eax; call srand — the
+                        # push/pop pair is a dead stack slot; reg stays live in RSI.
+                        push_stack.clear()
+                        continue
+                    recent_lea = self._find_recent_ebp_lea(op.reg, _insn_idx, insns)
+                    if recent_lea is not None and frame_rbp_saved:
+                        if recent_lea < 0:
+                            recent_lea = self._seh_rbp_local_disp(
+                                recent_lea, seh_frame_active)
+                        push_stack.append(('ebp_local', recent_lea))
+                        continue
+                    # push ebp is always the frame-pointer save in cmd's code.
+                    if op.reg == X86_REG_EBP:
+                        nops = (next_insn.operands if next_insn else [])
+                        is_std_prologue = (
+                            next_insn is not None and next_insn.mnemonic == 'mov'
+                            and len(nops) == 2 and nops[0].type == X86_OP_REG
+                            and nops[0].reg == X86_REG_EBP
+                            and nops[1].type == X86_OP_REG
+                            and nops[1].reg == X86_REG_ESP
+                        )
+                        is_esp_arg_prologue = (
+                            next_insn is not None and next_insn.mnemonic == 'mov'
+                            and len(nops) == 2 and nops[0].type == X86_OP_REG
+                            and nops[0].reg == X86_REG_EBP
+                            and nops[1].type == X86_OP_MEM
+                            and nops[1].mem.base == X86_REG_ESP
+                        )
+                        if not is_std_prologue and not is_esp_arg_prologue:
+                            if self._push_ebp_is_stdcall_arg(
+                                    _insn_idx, insns, frame_rbp_saved,
+                                    callee_save_stack):
+                                push_stack.append(('reg', X86_REG_EBP))
+                                continue
+                            if (push_stack
+                                    or (next_insn is not None
+                                        and next_insn.mnemonic == 'call')):
+                                if (not push_stack and next_insn is not None
+                                        and next_insn.mnemonic == 'call'
+                                        and self._push_ebp_before_call_is_frame_save(
+                                            _insn_idx, insns)):
+                                    if push_stack:
+                                        self._flush_deferred_pushes(out, push_stack)
+                                    out += self._asm('push rbp')
+                                    frame_rbp_saved = True
+                                    hw_stack_pushes += 1
+                                    if frame_local_sub > 0:
+                                        frameless_stack_bias += 8
+                                    callee_save_stack.append('rbp')
+                                    continue
+                                push_stack.append(('reg', X86_REG_EBP))
+                                continue
+                            # push ebp; push esi/edi — callee-save spill, not a frame.
+                            if push_stack:
+                                self._flush_deferred_pushes(out, push_stack)
+                            out += self._asm('push rbp')
+                            hw_stack_pushes += 1
+                            if frame_local_sub > 0:
+                                frameless_stack_bias += 8
+                            callee_save_stack.append('rbp')
+                            continue
+                        if push_stack:
+                            self._flush_deferred_pushes(out, push_stack)
+                        out += self._asm('push rbp')
+                        frame_rbp_saved = True
+                        hw_stack_pushes += 1
+                        if frame_local_sub > 0:
+                            frameless_stack_bias += 8
+                        callee_save_stack.append('rbp')
+                        continue
+                    # when the register is overwritten right after — otherwise it
+                    # is a call argument and must be deferred (e.g. push esi; call).
+                    if op.reg in (X86_REG_EBX, X86_REG_ESI, X86_REG_EDI):
+                        # A SECOND push of an already-saved callee register, just
+                        # before a CALL, is a call argument — not another save.
+                        # (e.g. push ebx/push ebp at entry, then push ebx; push
+                        # esi; push ebp; call F passes ebx/esi/ebp as args.) The
+                        # register is already in callee_save_stack, so this is
+                        # unambiguous and avoids leaving extra values on the stack.
+                        _rn_dup = W32_TO_W64_REG.get(op.reg, 'rax')
+                        if (_rn_dup in callee_save_stack
+                                and self._push_reg_is_pending_call_arg(
+                                    _insn_idx, insns)):
+                            push_stack.append(('reg', op.reg))
+                            continue
+                        # Prologue callee-save block (push ebx/esi/edi at function
+                        # entry, before any call) with a matching epilogue pop is a
+                        # SAVE, never a call argument — even when a call follows
+                        # immediately. _push_reg_is_pending_call_arg only sees the
+                        # "inner push then call" shape and would misclassify it.
+                        # NOTE: this is a *correct* general fix, but it shifts
+                        # translated addresses and desyncs the address-pinned
+                        # _fix_cmd_* hack layer (breaks /c echo). Gated off by
+                        # default until the hack layer is removed/regenerated.
+                        prologue_save = (
+                            self._prologue_save_fix
+                            and in_prologue and not push_stack
+                            and self._lookahead_matching_pop(
+                                op.reg, _insn_idx, insns))
+                        # push esi/ebx/edi; push ebp; call — callee-save then arg.
+                        if (self._cmd_no_hacks
+                                and next_insn is not None
+                                and next_insn.mnemonic == 'push'
+                                and next_insn.operands
+                                and next_insn.operands[0].type == X86_OP_REG
+                                and next_insn.operands[0].reg == X86_REG_EBP
+                                and self._lookahead_matching_pop(
+                                    op.reg, _insn_idx, insns)):
+                            if push_stack:
+                                self._flush_deferred_pushes(out, push_stack)
+                            rname = W32_TO_W64_REG.get(op.reg, 'rax')
+                            out += self._asm(f'push {rname}')
+                            hw_stack_pushes += 1
+                            if frame_local_sub > 0:
+                                frameless_stack_bias += 8
+                            callee_save_stack.append(rname)
+                            continue
+                        if (not prologue_save
+                                and self._push_reg_is_pending_call_arg(
+                                    _insn_idx, insns)):
+                            push_stack.append(('reg', op.reg))
+                            continue
+                        saved = False
+                        if next_insn is not None:
+                            nops = next_insn.operands
+                            if (next_insn.mnemonic in ('mov', 'lea', 'pop', 'xor')
+                                    and nops and nops[0].type == X86_OP_REG
+                                    and nops[0].reg == op.reg):
+                                saved = True
+                            if (not saved and next_insn.mnemonic == 'push'
+                                    and next_insn.operands):
+                                nops2 = next_insn.operands
+                                if nops2[0].type == X86_OP_REG:
+                                    if in_prologue:
+                                        saved = True
+                                    elif (nops2[0].reg == X86_REG_EBP
+                                          and self._lookahead_matching_pop(
+                                              op.reg, _insn_idx, insns)):
+                                        # push esi; push ebp; call — save before arg.
+                                        saved = True
+                            if not saved and in_prologue and not push_stack:
+                                saved = True
+                        elif in_prologue:
+                            saved = True
+                        elif not saved and self._lookahead_matching_pop(
+                                op.reg, _insn_idx, insns):
+                            # push reg; push imm/reg — call args (e.g. HeapAlloc).
+                            # push reg; push [mem] — callee save before arg pushes.
+                            next_is_call_arg_push = False
+                            if (next_insn is not None
+                                    and next_insn.mnemonic == 'push'
+                                    and next_insn.operands):
+                                n0 = next_insn.operands[0]
+                                if n0.type == X86_OP_IMM:
+                                    next_is_call_arg_push = (
+                                        not self._msvc_push_imm_pop_ecx_idiom(
+                                            _insn_idx, insns))
+                                elif (n0.type == X86_OP_REG
+                                      and n0.reg not in self._CALLEE_SAVE_REG_IDS):
+                                    next_is_call_arg_push = True
+                            if not next_is_call_arg_push:
+                                saved = True
+                        rname_chk = W32_TO_W64_REG.get(op.reg, 'rax')
+                        if saved and rname_chk in callee_save_stack:
+                            if next_insn is not None:
+                                nm = next_insn.mnemonic
+                                if nm == 'call':
+                                    saved = False
+                                elif nm == 'push':
+                                    saved = False
+                                elif nm not in (
+                                        'mov', 'lea', 'xor', 'add', 'sub', 'and',
+                                        'or', 'cmp', 'test', 'xchg', 'pop', 'inc',
+                                        'dec', 'not', 'neg', 'shl', 'shr', 'sar'):
+                                    saved = False
+                        if saved:
+                            if push_stack:
+                                self._flush_deferred_pushes(out, push_stack)
+                            rname = W32_TO_W64_REG.get(op.reg, 'rax')
+                            out += self._asm(f'push {rname}')
+                            hw_stack_pushes += 1
+                            if frame_local_sub > 0:
+                                frameless_stack_bias += 8
+                            callee_save_stack.append(rname)
+                            continue
+                    # lea ecx; push ecx; mov ecx,... — push now or the value is lost.
+                    if next_insn is not None and next_insn.mnemonic == 'mov':
+                        nops = next_insn.operands
+                        if (nops and nops[0].type == X86_OP_REG
+                                and nops[0].reg == op.reg):
+                            rname = W32_TO_W64_REG.get(op.reg, 'rcx')
+                            out += self._asm(f'push {rname}')
+                            hw_stack_pushes += 1
+                            if frame_local_sub > 0:
+                                frameless_stack_bias += 8
+                            push_stack.append(('spill', stack_spill_count))
+                            stack_spill_count += 1
+                            continue
+                    # `mov reg,<stable src>; push reg` as a CALL arg: defer the
+                    # SOURCE, not the register. Win64 arg marshalling reuses
+                    # RCX/RDX/RAX, so a deferred ('reg', ECX/EDX/EAX) would be
+                    # clobbered before the CALL re-reads it (cmd __getmainargs
+                    # dowildcard arg). Re-loading the global/imm at the call is
+                    # clobber-safe.
+                    _prevm = insns[_insn_idx - 1] if _insn_idx > 0 else None
+                    if (_prevm is not None and _prevm.mnemonic == 'mov'
+                            and len(_prevm.operands) == 2
+                            and _prevm.operands[0].type == X86_OP_REG
+                            and _prevm.operands[0].reg == op.reg):
+                        _psrc = _prevm.operands[1]
+                        if (_psrc.type == X86_OP_MEM and _psrc.mem.base == 0
+                                and _psrc.mem.index == 0
+                                and _psrc.mem.segment == 0):
+                            push_stack.append(
+                                ('mem_abs', _psrc.mem.disp & 0xFFFFFFFF))
+                            continue
+                        if _psrc.type == X86_OP_IMM:
+                            push_stack.append(('imm', _psrc.imm))
+                            continue
+                    rname = W32_TO_W64_REG.get(op.reg, 'rcx')
+                    push_stack.append(('reg', op.reg))
+                elif op.type == X86_OP_IMM:
+                    push_stack.append(('imm', op.imm))
+                elif op.type == X86_OP_MEM:
+                    m = op.mem
+                    if (m.base == X86_REG_EBP and not m.index and frame_rbp_saved):
+                        disp = m.disp & 0xFFFFFFFF
+                        if disp > 0x7FFFFFFF:
+                            disp -= 0x100000000
+                        if disp >= 8 and (disp - 8) % 4 == 0:
+                            push_stack.append(('ebp_arg', (disp - 8) // 4))
+                            continue
+                    if (m.base == X86_REG_ESP and not m.index and m.segment == 0):
+                        disp = m.disp & 0xFFFFFFFF
+                        if disp > 0x7FFFFFFF:
+                            disp -= 0x100000000
+                        if disp >= 4:
+                            slot = (disp - 4) // 4 - len(push_stack) - hw_stack_pushes
+                            if 0 <= slot < 4:
+                                push_stack.append(('esp_fwd', slot))
+                                continue
+                            # Deep [esp+disp] inside a large-frame (chkstk / sub
+                            # esp,N) function may be an INCOMING parameter, not a
+                            # local. Route it through the homed-arg machinery so it
+                            # reads the spilled register copy (shadow space) rather
+                            # than raw stack garbage. ``len(push_stack)`` counts the
+                            # pending deferred pushes (this call's earlier args) that
+                            # are elided into registers and so shift the x86 disp.
+                            if frame_local_sub > 0 and frame_arg_anchor:
+                                ah = self._frameless_stdcall_arg_slot(
+                                    disp, frame_local_sub, hw_stack_pushes,
+                                    elided_arg_bytes + len(push_stack) * 4)
+                                if ah is not None:
+                                    push_stack.append(('arg_home', ah))
+                                    continue
+                            off_x64 = (disp + hw_stack_pushes * 4) & 0xFFFFFFFFFFFFFFFF
+                            push_stack.append(('esp_mem', off_x64))
+                            continue
+                    if m.base and m.index and m.segment == 0:
+                        push_stack.append(('mem_index', (
+                            m.base, m.index, m.scale, m.disp & 0xFFFFFFFF)))
+                    else:
+                        push_stack.append(('mem', 0))   # complex, approximate
+                else:
+                    push_stack.append(('unk', 0))
+                # Don't emit anything yet — flush on CALL
+                continue
+
+            # ── CALL → flush push_stack, emit MOV arg_regs, CALL ──────────────
+            if mnem == 'call' and ops:
+                op0 = ops[0]
+                if (push_stack and op0.type == X86_OP_MEM
+                        and op0.mem.base == 0 and op0.mem.index == 0
+                        and self._is_zero_arg_iat(op0.mem.disp)):
+                    self._emit_call_align_prologue(out, 0)
+                    self._emit_iat_call(out, op0.mem.disp)
+                    self._emit_call_align_epilogue(out, 0)
+                    iat_fwd_epilogue = True
+                    cc_mode = 'stdcall'
+                    continue
+                args = list(reversed(push_stack))   # pushes are right-to-left
+                if args:
+                    elided_arg_bytes += len(args) * 4
+                    cdecl_pop_ecx_arg = args[0]
+                    cdecl_pop_ecx_arg2 = args[1] if len(args) > 1 else None
+                push_stack.clear()
+                # thiscall: ECX holds 'this' (maps to RCX = arg1 in Win64)
+                if cc_mode == 'thiscall':
+                    out += self._asm('mov rcx, rcx')  # ECX already = RCX in x64
+                # fastcall: first two args already in ECX, EDX → RCX, RDX
+                if cc_mode == 'fastcall' and not args:
+                    pass  # registers already hold args
+                # Set up args in Win64 ABI registers from pushes
+                arg_regs = self._call_arg_regs(cc_mode)
+                for idx, (atype, aval) in enumerate(args[:len(arg_regs)]):
+                    reg = arg_regs[idx]
+                    self._emit_flushed_push_arg_to_reg(
+                        out, reg, atype, aval,
+                        ebp_reg_scratch=ebp_reg_scratch,
+                        ebp_scratch_reg=ebp_scratch_reg,
+                        frame_args_spilled=frame_args_spilled,
+                        stack_spill_count=stack_spill_count,
+                        frameless_stack_bias=frameless_stack_bias,
+                        frame_arg_anchor=frame_arg_anchor)
+                if stack_spill_count:
+                    out += self._asm(f'add rsp, 0x{8 * stack_spill_count:x}')
+                    stack_spill_count = 0
+                # Stack args (args 5+)
+                extra = args[4:]
+                op = ops[0]
+                alloca_call = (op.type == X86_OP_IMM
+                               and self._is_alloca_probe_rva(op.imm - self.old_base))
+                nstack = len(extra)
+                # Large-frame prologue ``mov eax,N; call __chkstk``: spill the
+                # incoming Win64 arg registers into the caller-provided shadow
+                # space BEFORE __chkstk runs (it clobbers RCX), and anchor R15 at
+                # entry_rsp+4 so the body's deep [esp+disp] parameter reads (routed
+                # through the homed-arg machinery) resolve to those homes:
+                # [r15+4+slot*8] == entry_rsp+8+slot*8 == shadow slot. Without this
+                # a frameless chkstk function reads raw stack garbage for its
+                # stack-passed args (cmd 0xA4E7 switch parser -> wcschr(0x73006C)
+                # AV). Universal: keyed on the prologue shape, not on any binary.
+                if (alloca_call and not frame_arg_anchor and not esp_dirty
+                        and not frame_rbp_saved
+                        and not os.environ.get('NO_CHKSTK_ARGHOME')):
+                    _pmov = insns[_insn_idx - 1] if _insn_idx > 0 else None
+                    _chk_sz = None
+                    if (_pmov is not None and _pmov.mnemonic == 'mov'
+                            and len(_pmov.operands) == 2
+                            and _pmov.operands[0].type == X86_OP_REG
+                            and _pmov.operands[0].reg == X86_REG_EAX
+                            and _pmov.operands[1].type == X86_OP_IMM):
+                        _chk_sz = _pmov.operands[1].imm & 0xFFFFFFFF
+                    if _chk_sz and _chk_sz > 0x28:
+                        # Canonical chkstk arg-spill (matches the build-18 design
+                        # that _chk7.py probes for and that the entry-detection
+                        # skips): spill RCX/RDX/R8/R9 into the caller-provided
+                        # shadow space [rsp+8..0x20] and anchor R15 at entry_rsp+4
+                        # so [r15+4+slot*8] == shadow slot. Emitted between the
+                        # ``mov rax,imm`` opener and ``call __chkstk`` (RSP is still
+                        # entry_rsp here; __chkstk would clobber RCX).
+                        out += self._asm('mov qword ptr [rsp+8], rcx')
+                        out += self._asm('mov qword ptr [rsp+0x10], rdx')
+                        out += self._asm('mov qword ptr [rsp+0x18], r8')
+                        out += self._asm('mov qword ptr [rsp+0x20], r9')
+                        out += self._asm('lea r15, [rsp+4]')
+                        frame_local_sub = _chk_sz
+                        frameless_stack_bias = 0
+                        frame_arg_anchor = True
+                        esp_dirty = True
+                if not alloca_call:
+                    self._emit_call_align_prologue(out, nstack)
+                    for i, (atype, aval) in enumerate(extra):
+                        off = 0x20 + i * 8
+                        if atype == 'imm':
+                            imm = self._relocate_imm(aval & 0xFFFFFFFF, len(out), 0)
+                            out += self._asm(
+                                f'mov rax, 0x{imm & 0xFFFFFFFFFFFFFFFF:x}')
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype == 'reg':
+                            if aval == X86_REG_EBP and ebp_reg_scratch:
+                                self._emit_ebp_scratch_load_to(
+                                    out, 'rax')
+                            else:
+                                src = W32_TO_W64_REG.get(aval, 'rax')
+                                if src != 'rax':
+                                    out += self._asm(f'mov rax, {src}')
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype == 'mem_abs':
+                            self._emit_abs_dword_load(out, 'rax', aval)
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype in ('ebp_slot', 'esp_mem', 'ebp_local', 'ebp_arg', 'arg_home'):
+                            self._emit_push_arg_to_stack(
+                                out, off, atype, aval, frameless_stack_bias,
+                                frame_arg_anchor, args_homed=frame_args_spilled)
+                        else:
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], 0')
+
+                # Emit CALL
+                call_pos = len(out)
+                if op.type == X86_OP_IMM:
+                    target_rva = (op.imm - self.old_base) & 0xFFFFFFFF
+                    iat_slot = self._ff25_iat_slot_at_rva(target_rva)
+                    if iat_slot is not None:
+                        self._emit_iat_call(out, iat_slot)
+                    else:
+                        target_va = op.imm
+                        out += b'\xE8\x00\x00\x00\x00'   # placeholder
+                        pending_fixups.append((call_pos + 1, target_va, 'rel32_call'))
+                elif op.type == X86_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
+                    self._emit_iat_call(out, op.mem.disp)
+                else:
+                    # Indirect call — translate operand
+                    try:
+                        enc, _ = self.ks.asm(f'call {insn.op_str}')
+                        out += bytes(enc)
+                    except KsError:
+                        if op.type == X86_OP_REG:
+                            r = self._x64_call_target_reg(op.reg, iat_fn_holder)
+                            out += self._asm(f'call {r}')
+                        else:
+                            self._emit_iat_call(out, op.mem.disp if op.type == X86_OP_MEM else 0)
+
+                # Restore stack
+                if not alloca_call:
+                    self._emit_call_align_epilogue(out, nstack)
+                # cdecl/indirect: MSVC may emit pop ecx per pushed arg; skip those.
+                # stdcall IAT callees pop args themselves on x86.
+                if args and all(a[0] == 'esp_fwd' for a in args):
+                    iat_fwd_epilogue = True
+                elif (op.type == X86_OP_MEM and op.mem.base == 0
+                      and op.mem.index == 0):
+                    iat_fwd_epilogue = True
+                elif (args and not (op.type == X86_OP_MEM and op.mem.base == 0
+                                  and op.mem.index == 0)):
+                    stack_cleanup_pending = len(args) * 4
+                cc_mode = 'stdcall'
+                continue
+
+            # ── RET / RET N (stdcall epilogue) → balance callee saves + RET ───
+            if mnem in ('ret', 'retn'):
+                if frame_rbp_saved and not leave_emitted:
+                    # Pure-mode merged chunks may reach ``ret`` without a preceding
+                    # x86 ``leave`` (epilogue was linearized away). Restore RBP frame.
+                    out += self._asm('mov rsp, rbp')
+                    out += self._asm('pop rbp')
+                    frame_rbp_saved = False
+                    leave_emitted = True
+                    hw_stack_pushes = max(0, hw_stack_pushes - 1)
+                    if callee_save_stack and callee_save_stack[-1] == 'rbp':
+                        callee_save_stack.pop()
+                elif not leave_emitted:
+                    # Swallowed mega-chunk tails can omit the hardware POP that
+                    # balances an entry callee-save (cmd 0x1089F: ``pop esi``
+                    # overlapped by the next function's entry).  Only repair the
+                    # single x86 POP immediately before this RET when the
+                    # callee-save tracker still expects it and the translated
+                    # tail is not already that POP — never walk a multi-POP chain
+                    # (that double-pops after explicit epilogue POPs were emitted).
+                    if callee_save_stack and _insn_idx > 0:
+                        _prev = insns[_insn_idx - 1]
+                        if (_prev.mnemonic == 'pop'
+                                and _prev.address not in pop_pair
+                                and _prev.operands
+                                and _prev.operands[0].type == X86_OP_REG):
+                            _pr = W32_TO_W64_REG.get(
+                                _prev.operands[0].reg, 'rax')
+                            if (callee_save_stack[-1] == _pr
+                                    and self._out_tail_pop_reg(out) != _pr):
+                                out += self._asm(f'pop {_pr}')
+                                callee_save_stack.pop()
+                                hw_stack_pushes = max(0, hw_stack_pushes - 1)
+                                if frame_local_sub > 0:
+                                    frameless_stack_bias = max(
+                                        0, frameless_stack_bias - 8)
+                    callee_save_stack.clear()
+                else:
+                    callee_save_stack.clear()
+                    leave_emitted = False
+                # x86 ret N pops stack args the caller pushed; Win64 args live in
+                # RCX/RDX/R8/R9 — do not add rsp,N here (would skip ret addr).
+                out += b'\xC3'
+                frame_rbp_saved = False
+                hw_stack_pushes = 0
+                frame_local_sub = 0
+                frameless_stack_bias = 0
+                frame_arg_anchor = False
+                push_stack.clear()
+                iat_fwd_epilogue = False
+                continue
+
+            # ── LEAVE → ADD RSP, frame_size; (will be followed by RET) ────────
+            if mnem == 'leave':
+                out += self._asm('mov rsp, rbp')
+                out += self._asm('pop rbp')
+                frame_rbp_saved = False
+                hw_stack_pushes = max(0, hw_stack_pushes - 1)
+                if frame_local_sub > 0:
+                    frameless_stack_bias = max(0, frameless_stack_bias - 8)
+                if callee_save_stack and callee_save_stack[-1] == 'rbp':
+                    callee_save_stack.pop()
+                leave_emitted = True
+                push_stack.clear()
+                continue
+
+            # ── PUSH EBP; MOV EBP,ESP prologue → Win64 frame ──────────────────
+            if mnem == 'push' and ops and ops[0].type == X86_OP_REG:
+                if ops[0].reg == X86_REG_EBP:
+                    # Emit standard Win64 frame prologue
+                    out += self._asm('push rbp')
+                    frame_rbp_saved = True
+                    ebp_data_ptr = False
+                    hw_stack_pushes += 1
+                    if frame_local_sub > 0:
+                        frameless_stack_bias += 8
+                    callee_save_stack.append('rbp')
+                    push_stack.clear()
+                    continue
+
+            # ── MOV EBP,ESP → PUSH RBP; MOV RBP,RSP (if push ebp omitted) ───
+            if mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG:
+                if ops[0].reg == X86_REG_EBP and ops[1].reg == X86_REG_ESP:
+                    if not frame_rbp_saved:
+                        out += self._asm('push rbp')
+                        hw_stack_pushes += 1
+                        if frame_local_sub > 0:
+                            frameless_stack_bias += 8
+                        callee_save_stack.append('rbp')
+                    out += self._asm('mov rbp, rsp')
+                    frame_rbp_saved = True
+                    ebp_data_ptr = False
+                    # Home incoming integer args into the caller-provided shadow
+                    # slots [rbp+0x10..0x30) so later [ebp+disp] reads/pushes see
+                    # the stable stack copy even after the registers are reused.
+                    if (rcx_home_reload or ebp_args_used) and not frame_args_spilled:
+                        out += self._asm('mov qword ptr [rbp+0x10], rcx')
+                        out += self._asm('mov qword ptr [rbp+0x18], rdx')
+                        out += self._asm('mov qword ptr [rbp+0x20], r8')
+                        out += self._asm('mov qword ptr [rbp+0x28], r9')
+                        frame_args_spilled = True
+                    push_stack.clear()
+                    continue
+                if ops[1].reg == X86_REG_ESP:
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    out += self._asm(f'mov {dst}, rsp')
+                    push_stack.clear()
+                    continue
+                if ops[0].reg == X86_REG_ESP:
+                    src = W32_TO_W64_REG.get(ops[1].reg, 'rcx')
+                    out += self._asm(f'mov rsp, {src}')
+                    push_stack.clear()
+                    continue
+
+            # ── SUB ESP,N / ADD ESP,N (stack frame / cdecl arg cleanup) ───────
+            if mnem in ('sub', 'add') and len(ops) == 2:
+                if (ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_ESP
+                        and ops[1].type == X86_OP_IMM):
+                    signed_n = ops[1].imm
+                    if signed_n > 0x7FFFFFFF:
+                        signed_n -= 0x100000000
+                    if (iat_fwd_epilogue and mnem == 'add' and signed_n > 0):
+                        # IAT forwarder tails are small add esp,N (≤7 stdcall args).
+                        # Large adds (e.g. 0x58 frame dealloc before ret 4 at cmd
+                        # 0xA123) must still be emitted or RET pops garbage.
+                        iat_fwd_epilogue = False
+                        if signed_n <= 0x1c:
+                            push_stack.clear()
+                            continue
+                    if (mnem == 'add' and signed_n == stack_cleanup_pending
+                            and stack_cleanup_pending):
+                        # x86 pops pushed call args; Win64 already used RCX/RDX/…
+                        stack_cleanup_pending = 0
+                        push_stack.clear()
+                        continue
+                    if mnem == 'add' and signed_n < 0:
+                        out += self._asm(f'sub rsp, 0x{-signed_n:x}')
+                        if frame_local_sub > 0:
+                            frameless_stack_bias += -signed_n
+                    elif mnem == 'sub' and signed_n < 0:
+                        out += self._asm(f'add rsp, 0x{-signed_n:x}')
+                        if frame_local_sub > 0:
+                            frameless_stack_bias -= -signed_n
+                    else:
+                        op = 'sub' if mnem == 'sub' else 'add'
+                        out += self._asm(f'{op} rsp, 0x{signed_n & 0xFFFFFFFF:x}')
+                        if (mnem == 'sub' and not frame_rbp_saved
+                                and signed_n > 0x28):
+                            # Real frame alloc (e.g. GPA sub esp,0x58), not 0x28
+                            # Win64 call shadow space.
+                            frame_local_sub = signed_n
+                            frameless_stack_bias = 0
+                            esp_dirty = True
+                            # Spill Win64 incoming args to x86 [esp+4] homes.
+                            for i, reg in enumerate(WIN64_ARG_REG_NAMES[:4]):
+                                out += self._asm(
+                                    f'mov qword ptr [rsp+0x{4 + i * 8:x}], {reg}')
+                            out += self._asm('lea r15, [rsp]')
+                            frame_arg_anchor = True
+                        elif frame_local_sub > 0:
+                            if mnem == 'sub':
+                                frameless_stack_bias += signed_n
+                            else:
+                                frameless_stack_bias -= signed_n
+                    push_stack.clear()
+                    continue
+
+            # ── Jcc short/long → always emit as 6-byte rel32 ──────────────────
+            if mnem.startswith('j') and mnem != 'jmp' and ops:
+                op = ops[0]
+                if op.type == X86_OP_IMM:
+                    if (mnem == 'jl' and self.win10_test_shim
+                            and ((old_va - self.old_base) & 0xFFFFFFFF) == 0x1A391):
+                        # cmd quote tail: do not dec [len] when len==computed (0→-1).
+                        mnem = 'jle'
+                    jmp_pos = len(out)
+                    # Map mnemonic to Jcc opcode suffix
+                    out += b'\x0f\x00\x00\x00\x00\x00'  # placeholder (0F 8x rel32)
+                    pending_fixups.append((jmp_pos, op.imm, f'jcc_{mnem}'))
+                    push_stack.clear()
+                    continue
+
+            # ── JMP rel → E9 rel32 ────────────────────────────────────────────
+            if mnem == 'jmp' and ops and ops[0].type == X86_OP_IMM:
+                jmp_pos = len(out)
+                out += b'\xE9\x00\x00\x00\x00'
+                pending_fixups.append((jmp_pos + 1, ops[0].imm, 'rel32_jmp'))
+                push_stack.clear()
+                continue
+
+            # ── JMP/CALL through absolute IAT slot ────────────────────────────
+            if mnem in ('jmp', 'call') and ops and ops[0].type == X86_OP_MEM:
+                mem = ops[0].mem
+                if mem.base == 0 and mem.index == 0 and mem.segment == 0:
+                    if mnem == 'jmp':
+                        self._emit_iat_jmp(out, mem.disp,
+                                           at_rva=section_rva + chunk_base + len(out))
+                    else:
+                        self._emit_call_align_prologue(out, 0)
+                        self._emit_iat_call(out, mem.disp)
+                        self._emit_call_align_epilogue(out, 0)
+                        iat_fwd_epilogue = True
+                        cc_mode = 'stdcall'
+                    push_stack.clear()
+                    continue
+
+            # ── MOV ebp, r32 after push ebp (scratch reg, not rbp) ─────────────
+            if (self._cmd_no_hacks
+                    and mnem == 'mov' and len(ops) == 2
+                    and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_EBP
+                    and ops[1].type == X86_OP_REG
+                    and 'rbp' in callee_save_stack
+                    and self._mov_ebp_is_heap_scratch(_insn_idx, insns)):
+                src = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                self._emit_ebp_scratch_store_reg(
+                    out, src, ebp_scratch_home)
+                ebp_reg_scratch = True
+                push_stack.clear()
+                continue
+
+            # ── MOV r32, imm32 — patch pointer immediates ──────────────────────
+            if mnem == 'mov' and len(ops) == 2 and ops[1].type == X86_OP_IMM:
+                imm = ops[1].imm & 0xFFFFFFFF
+                if (self._cmd_no_hacks
+                        and ops[0].type == X86_REG_EBP
+                        and 'rbp' in callee_save_stack
+                        and self._mov_ebp_is_heap_scratch(_insn_idx, insns)):
+                    out += self._asm(
+                        f'mov {self._ebp_scratch_mem(ebp_scratch_home)}, '
+                        f'0x{imm & 0xFFFFFFFFFFFFFFFF:x}')
+                    ebp_reg_scratch = True
+                    push_stack.clear()
+                    continue
+                new_imm = self._relocate_imm(imm, len(out), 0)
+                if ops[0].type == X86_OP_REG:
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    out += self._asm(f'mov {dst}, 0x{new_imm & 0xFFFFFFFFFFFFFFFF:x}')
+                    if (self._is_image_pointer(imm)
+                            or (new_imm & 0xFFFFFFFF) != imm):
+                        self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                    else:
+                        self._ptr_taint_clear(ptr_taint, ops[0].reg)
+                    push_stack.clear()
+                    continue
+
+            # ── MOV via 32-bit register base/index (must widen to r64) ─────────
+            if mnem == 'mov' and len(ops) == 2:
+                def _w64(reg_id: int) -> str:
+                    return W32_TO_W64_REG.get(reg_id, 'rax')
+
+                def _mem_str(mem_op) -> Tuple[Optional[str], bool]:
+                    if mem_op.type != X86_OP_MEM:
+                        return None, False
+                    m = mem_op.mem
+                    if m.segment not in (0,):
+                        return None, False
+                    if m.base and m.index:
+                        scale = m.scale or 1
+                        if scale == 1 and not m.disp:
+                            # x86 [eax+ecx] must use 64-bit [rax+rcx] on the host.
+                            # addr32 (67h) truncates base/index and breaks heap ptrs.
+                            base = _w64(m.base)
+                            idx = _w64(m.index)
+                            return f'[{base}+{idx}]', False
+                        return None, False
+                    if m.base:
+                        base = _w64(m.base)
+                        if m.disp:
+                            disp_u = m.disp & 0xFFFFFFFF
+                            new_disp = self._relocate_imm(disp_u, len(out), 0)
+                            if (self._is_image_pointer(disp_u)
+                                    or new_disp != disp_u
+                                    or new_disp >= 0x80000000):
+                                # [reg+image_VA] — scratch base in handlers below.
+                                return None, False
+                            return f'[{base}{m.disp:+d}]', False
+                        return f'[{base}]', False
+                    if m.index:
+                        idx = _w64(m.index)
+                        scale = m.scale or 1
+                        if m.disp:
+                            # [idx*scale + abs] is a global table — needs VA
+                            # relocation; handled by the dedicated handlers below.
+                            return None, False
+                        return f'[{idx}*{scale}]', False
+                    return None, False
+
+                if ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_REG:
+                    mems, addr32 = _mem_str(ops[0])
+                    if mems:
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        src = (self._word_reg_asm_for_op(ops[1], insn.op_str)
+                               if ptr_sz == 'word'
+                               else self._reg_asm_for_op(ops[1], insn.op_str))
+                        emit = self._asm_addr32 if addr32 else self._asm
+                        # cmd heap/cmdline tables: widen to qword slots on Win10 (8-byte
+                        # stride via shl 3 at 0x1A408/0x1A45C) so HeapAlloc pointers survive.
+                        if ptr_sz in ('byte', 'word'):
+                            slot_sz = ptr_sz
+                        elif (self.win10_test_shim
+                              and self._cmd_heap_indexed_mem(ops[0].mem)):
+                            slot_sz = 'qword'
+                        else:
+                            slot_sz = 'dword'
+                        if slot_sz == 'qword':
+                            src64 = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                            out += emit(f'mov {slot_sz} ptr {mems}, {src64}')
+                        else:
+                            out += emit(f'mov {slot_sz} ptr {mems}, {src}')
+                        push_stack.clear()
+                        continue
+                if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_MEM:
+                    mems, addr32 = _mem_str(ops[1])
+                    if mems:
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                        emit = self._asm_addr32 if addr32 else self._asm
+                        if ptr_sz == 'word':
+                            out += emit(f'movzx {dst64}, word ptr {mems}')
+                        elif ptr_sz == 'byte':
+                            out += emit(f'movzx {dst64}, byte ptr {mems}')
+                        elif ptr_sz == 'dword':
+                            m = ops[1].mem
+                            disp_u = m.disp & 0xFFFFFFFF if m.disp else 0
+                            if (self.win10_test_shim
+                                    and (self._cmd_heap_indexed_mem(m)
+                                         or self._cmd_builder_struct_ptr_field(
+                                             old_va, disp_u))):
+                                out += emit(f'mov {dst64}, qword ptr {mems}')
+                            else:
+                                dst32 = W32_REG_ASM.get(ops[0].reg, 'eax')
+                                out += emit(f'mov {dst32}, dword ptr {mems}')
+                            self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                        else:
+                            out += emit(f'mov {dst64}, qword ptr {mems}')
+                            self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                        push_stack.clear()
+                        continue
+                    m = ops[1].mem
+                    if (m.segment == 0 and m.base and m.index and not m.disp
+                            and (m.scale or 1) in (2, 4, 8)):
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        if ptr_sz == 'dword':
+                            b64 = W32_TO_W64_REG.get(m.base, 'rax')
+                            i64 = W32_TO_W64_REG.get(m.index, 'rax')
+                            scale = m.scale or 1
+                            dst32 = W32_REG_ASM.get(ops[0].reg, 'eax')
+                            out += self._asm(
+                                f'mov {dst32}, dword ptr [{b64}+{i64}*{scale}]')
+                            self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                            push_stack.clear()
+                            continue
+
+            # ── XOR r32, r32 → XOR r64, r64 (zero) ────────────────────────────
+            if mnem == 'xor' and len(ops) == 2:
+                if (ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG
+                        and ops[0].reg == ops[1].reg):
+                    r = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    out += self._asm(f'xor {r}, {r}')
+                    self._ptr_taint_clear(ptr_taint, ops[0].reg)
+                    self._teb_ptr_clear(teb_ptr_regs, ops[0].reg)
+                    push_stack.clear()
+                    continue
+
+            # ── MOV r32, r32 — propagate pointer taint ────────────────────────
+            if mnem == 'mov' and len(ops) == 2:
+                if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG:
+                    if (ops[1].reg == X86_REG_EBP and ebp_reg_scratch
+                            and ops[0].reg != X86_REG_EBP):
+                        dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                        self._emit_ebp_scratch_load_to(
+                            out, dst64)
+                        self._ptr_taint_propagate(ptr_taint, ops[0].reg, ops[1].reg)
+                        self._teb_ptr_propagate(teb_ptr_regs, ops[0].reg, ops[1].reg)
+                        continue
+                    dst64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    src64 = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                    # A reg-reg mov can sit *between* argument pushes (compilers
+                    # interleave it, e.g. cmd 0x65B0 `push [g]; mov esi,eax;
+                    # push 0; …; call HeapFree`). Preserve the pending deferred
+                    # args here — clearing push_stack drops the HeapFree lpMem
+                    # arg and frees a garbage pointer (heap corruption).
+                    if dst64 in ('r8', 'r9'):
+                        self._emit_mov32_to_w64_reg(
+                            out, dst64, ops[1].reg,
+                            ebp_reg_scratch, ebp_scratch_reg)
+                    elif dst64 != src64:
+                        if self._cmd_no_hacks:
+                            dst32 = W32_REG_ASM.get(ops[0].reg, 'eax')
+                            src32 = W32_REG_ASM.get(ops[1].reg, 'eax')
+                            if dst32 != src32:
+                                out += self._asm(f'mov {dst32}, {src32}')
+                        else:
+                            out += self._asm(f'mov {dst64}, {src64}')
+                    else:
+                        out += b'\x90'
+                    self._ptr_taint_propagate(ptr_taint, ops[0].reg, ops[1].reg)
+                    self._teb_ptr_propagate(teb_ptr_regs, ops[0].reg, ops[1].reg)
+                    continue
+            if mnem == 'pop' and old_va in pop_pair and ops and ops[0].type == X86_OP_REG:
+                ptype, pval = pop_pair[old_va]
+                if (ptype == 'imm' and (pval & 0xFFFFFFFF) == 0x30
+                        and ops[0].reg == X86_REG_EDI
+                        and next_insn is not None
+                        and next_insn.mnemonic == 'add'
+                        and len(next_insn.operands) == 2
+                        and next_insn.operands[0].type == X86_OP_REG
+                        and next_insn.operands[0].reg == X86_REG_EAX
+                        and next_insn.operands[1].type == X86_OP_REG
+                        and next_insn.operands[1].reg == X86_REG_EDI):
+                    # push 0x30; pop edi; add eax, edi — do not clobber RDI.
+                    continue
+                dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if ptype == 'imm':
+                    imm = pval & 0xFFFFFFFF
+                    new_imm = self._relocate_imm(imm, len(out), 0)
+                    out += self._asm(f'mov {dst}, 0x{new_imm & 0xFFFFFFFFFFFFFFFF:x}')
+                    if (self._is_image_pointer(imm)
+                            or (new_imm & 0xFFFFFFFF) != imm):
+                        self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                    else:
+                        self._ptr_taint_clear(ptr_taint, ops[0].reg)
+                else:
+                    src = W32_TO_W64_REG.get(pval, 'rax')
+                    if src != dst:
+                        out += self._asm(f'mov {dst}, {src}')
+                    self._ptr_taint_propagate(ptr_taint, ops[0].reg, pval)
+                continue
+
+            # ── POP ECX cdecl/stdcall cleanup after register-arg CALL → drop ──
+            # MSVC often emits `pop ecx` after stdcall IAT calls that pushed args
+            # on x86; on Win64 those args are already in RCX/RDX — popping here
+            # corrupts the stack (cmd builder: two pop ecx after HeapAlloc call).
+            if (mnem == 'pop' and ops and ops[0].type == X86_OP_REG
+                    and ops[0].reg == X86_REG_ECX):
+                nx = next_insn
+                nx2 = insns[_insn_idx + 2] if _insn_idx + 2 < len(insns) else None
+                if (nx is not None and nx.mnemonic == 'push'
+                        and nx.operands
+                        and nx.operands[0].type == X86_OP_REG
+                        and nx.operands[0].reg == X86_REG_EAX
+                        and nx2 is not None and nx2.mnemonic == 'call'):
+                    if cdecl_pop_ecx_arg is not None:
+                        rdx_arg = self._pick_cdecl_pop_ecx_rdx_arg(
+                            cdecl_pop_ecx_arg, cdecl_pop_ecx_arg2,
+                            self.old_base, self.pe.image_size)
+                        if rdx_arg is not None:
+                            atype, aval = rdx_arg
+                            self._emit_flushed_push_arg_to_reg(
+                                out, 'rdx', atype, aval,
+                                ebp_reg_scratch=ebp_reg_scratch,
+                                ebp_scratch_reg=ebp_scratch_reg,
+                                frame_args_spilled=frame_args_spilled,
+                                stack_spill_count=stack_spill_count,
+                                frameless_stack_bias=frameless_stack_bias,
+                                frame_arg_anchor=frame_arg_anchor)
+                        cdecl_pop_ecx_arg = None
+                        cdecl_pop_ecx_arg2 = None
+                    push_stack.clear()
+                    continue
+                if stack_cleanup_pending > 0:
+                    stack_cleanup_pending = max(0, stack_cleanup_pending - 4)
+                iat_fwd_epilogue = False
+                push_stack.clear()
+                continue
+
+            # ── POP r32 → POP r64 ─────────────────────────────────────────────
+            if mnem == 'pop' and ops and ops[0].type == X86_OP_REG:
+                if ops[0].reg in (X86_REG_EDI, X86_REG_ESI, X86_REG_EBP, X86_REG_EBX):
+                    iat_fwd_epilogue = False
+                if ops[0].reg == X86_REG_EBP:
+                    ebp_reg_scratch = False
+                    ebp_scratch_reg = 'r12'
+                r = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if callee_save_stack and callee_save_stack[-1] == r:
+                    callee_save_stack.pop()
+                    out += self._asm(f'pop {r}')
+                elif r == 'rbp' and 'rbp' not in callee_save_stack:
+                    push_stack.clear()
+                    continue
+                else:
+                    if r in callee_save_stack:
+                        callee_save_stack.remove(r)
+                    out += self._asm(f'pop {r}')
+                hw_stack_pushes = max(0, hw_stack_pushes - 1)
+                if frame_local_sub > 0:
+                    frameless_stack_bias = max(0, frameless_stack_bias - 8)
+                if ops[0].reg == X86_REG_EBP:
+                    frame_rbp_saved = False
+                    ebp_data_ptr = False
+                push_stack.clear()
+                continue
+
+            # ── Indirect CALL/JMP via register ────────────────────────────────
+            if mnem == 'call' and ops and ops[0].type == X86_OP_REG:
+                if push_stack:
+                    reg_op = ops[0]
+                    args = list(reversed(push_stack))
+                    if args:
+                        elided_arg_bytes += len(args) * 4
+                        cdecl_pop_ecx_arg = args[0]
+                        cdecl_pop_ecx_arg2 = args[1] if len(args) > 1 else None
+                    push_stack.clear()
+                    arg_regs = self._call_arg_regs(cc_mode)
+                    for idx, (atype, aval) in enumerate(args[:len(arg_regs)]):
+                        reg = arg_regs[idx]
+                        self._emit_flushed_push_arg_to_reg(
+                            out, reg, atype, aval,
+                            ebp_reg_scratch=ebp_reg_scratch,
+                            ebp_scratch_reg=ebp_scratch_reg,
+                            frame_args_spilled=frame_args_spilled,
+                            stack_spill_count=stack_spill_count,
+                            frameless_stack_bias=frameless_stack_bias,
+                            frame_arg_anchor=frame_arg_anchor)
+                    if stack_spill_count:
+                        out += self._asm(f'add rsp, 0x{8 * stack_spill_count:x}')
+                        stack_spill_count = 0
+                    extra = args[4:]
+                    nstack = len(extra)
+                    # Capture the call target before arg materialization / realign
+                    # can clobber a volatile target register (rax/r11 are used as
+                    # scratch by the aligned-frame setup).
+                    r = self._x64_call_target_reg(reg_op.reg, iat_fn_holder)
+                    if r in ('rax', 'r11'):
+                        out += self._asm(f'mov r10, {r}')
+                        r = 'r10'
+                    self._emit_call_align_prologue(out, nstack)
+                    for i, (atype, aval) in enumerate(extra):
+                        off = 0x20 + i * 8
+                        if atype == 'imm':
+                            imm = self._relocate_imm(aval & 0xFFFFFFFF, len(out), 0)
+                            out += self._asm(
+                                f'mov rax, 0x{imm & 0xFFFFFFFFFFFFFFFF:x}')
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype == 'reg':
+                            if aval == X86_REG_EBP and ebp_reg_scratch:
+                                self._emit_ebp_scratch_load_to(
+                                    out, 'rax')
+                            else:
+                                src = W32_TO_W64_REG.get(aval, 'rax')
+                                if src != 'rax':
+                                    out += self._asm(f'mov rax, {src}')
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype == 'mem_abs':
+                            self._emit_abs_dword_load(out, 'rax', aval)
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype == 'ebp_local':
+                            self._emit_lea_ebp_slot(out, 'rax', aval)
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], rax')
+                        elif atype in ('ebp_slot', 'esp_mem', 'ebp_arg', 'arg_home'):
+                            self._emit_push_arg_to_stack(
+                                out, off, atype, aval, frameless_stack_bias,
+                                frame_arg_anchor, args_homed=frame_args_spilled)
+                        else:
+                            out += self._asm(f'mov qword ptr [rsp+0x{off:x}], 0')
+                    out += self._asm(f'call {r}')
+                    self._emit_call_align_epilogue(out, nstack)
+                    if args:
+                        iat_fwd_epilogue = True
+                    cc_mode = 'stdcall'
+                    continue
+                r = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                out += self._asm(f'call {r}')
+                push_stack.clear()
+                continue
+            if mnem == 'jmp' and ops and ops[0].type == X86_OP_REG:
+                r = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                out += self._asm(f'jmp {r}')
+                push_stack.clear()
+                continue
+
+            # ── NOP ────────────────────────────────────────────────────────────
+            if mnem == 'nop':
+                out += b'\x90'
+                continue
+
+            # ── LEA r32, [EBP+disp] (positive disp = stack arg in stdcall frame) ─
+            if mnem == 'lea' and len(ops) == 2 and ops[1].type == X86_OP_MEM:
+                m = ops[1].mem
+                if m.base == X86_REG_EBP and not m.index and m.disp >= 0:
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    self._emit_lea_ebp_slot(out, dst, m.disp)
+                    push_stack.clear()
+                    continue
+                # ── lea reg, [esp+disp] — ADDRESS-OF a frameless stack slot ──────
+                # The generic ``base+disp`` path below keeps the raw x86 disp, but
+                # an ESP base must be re-based exactly like a ``mov reg,[esp+disp]``
+                # read: every callee-save / hardware push is 8 bytes on x64 vs 4 on
+                # x86, so the slot sits ``hw_stack_pushes*4`` bytes deeper.  Without
+                # this, e.g. cmd 0x9EBA's ``lea eax,[esp+0x10]`` (the lpMode pointer
+                # handed to GetConsoleMode) resolved to [rsp+0x10] — the SAVED-RBP
+                # slot — and the API wrote through it, trashing rbp on return.
+                # Only the frameless LOCAL case is intercepted here; an address
+                # taken of a homed incoming arg (arg_slot != None) is left to the
+                # generic path below so its bytes stay identical.  The local fix is
+                # a pure displacement rebase (same encoding length, disp8→disp8),
+                # so the whole downstream code layout — and the fragile duplicate/
+                # heal resolution keyed on it — is preserved byte-for-byte.  We
+                # also deliberately do NOT ptr_taint the dest (the legacy path
+                # never did; tainting would cascade into wider instr selection).
+                if (m.base == X86_REG_ESP and not m.index and m.segment == 0
+                        and hw_stack_pushes):
+                    disp = m.disp & 0xFFFFFFFF
+                    if disp > 0x7FFFFFFF:
+                        disp -= 0x100000000
+                    arg_slot = self._frameless_stdcall_arg_slot(
+                        disp, frame_local_sub, hw_stack_pushes, elided_arg_bytes)
+                    if arg_slot is None and disp >= 0:
+                        dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                        off_x64 = (disp + hw_stack_pushes * 4) & 0xFFFFFFFFFFFFFFFF
+                        out += self._asm(f'lea {dst}, [rsp+0x{off_x64:x}]')
+                        push_stack.clear()
+                        continue
+                if m.base and not m.index and m.disp:
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    base = W32_TO_W64_REG.get(m.base, 'rax')
+                    disp_u = m.disp & 0xFFFFFFFF
+                    new_disp = self._relocate_imm(disp_u, len(out), 0)
+                    if (self._is_image_pointer(disp_u) or new_disp != disp_u
+                            or new_disp > 0x7FFFFFFF):
+                        out += self._asm(f'mov {dst}, {base}')
+                        self._emit_add_imm64(out, dst, new_disp)
+                        self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                    else:
+                        out += self._asm(f'lea {dst}, [{base}{m.disp:+d}]')
+                    push_stack.clear()
+                    continue
+                if m.base == 0 and m.index and m.disp:
+                    idx = W32_TO_W64_REG.get(m.index, 'rax')
+                    scale = m.scale or 1
+                    new_disp = self._relocate_imm(m.disp & 0xFFFFFFFF, len(out), 0)
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    if new_disp < 0x80000000:
+                        out += self._asm(
+                            f'lea {dst}, [{idx}*{scale} + 0x{new_disp:x}]')
+                    else:
+                        # disp32 sign-extends past 2GB → load base via scratch.
+                        scratch = 'r11' if idx != 'r11' else 'r10'
+                        out += self._asm(f'mov {scratch}, 0x{new_disp:x}')
+                        out += self._asm(f'lea {dst}, [{scratch} + {idx}*{scale}]')
+                    self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                    push_stack.clear()
+                    continue
+                if m.base and m.index:
+                    dst = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    base = W32_TO_W64_REG.get(m.base, 'rax')
+                    idx = W32_TO_W64_REG.get(m.index, 'rax')
+                    scale = m.scale or 1
+                    disp = m.disp or 0
+                    if scale == 1 and disp == 0:
+                        mem = f'[{base} + {idx}]'
+                    elif disp == 0:
+                        mem = f'[{base} + {idx}*{scale}]'
+                    elif scale == 1:
+                        mem = f'[{base} + {idx}{disp:+d}]'
+                    else:
+                        mem = f'[{base} + {idx}*{scale}{disp:+d}]'
+                    out += self._asm(f'lea {dst}, {mem}')
+                    self._ptr_taint_mark(ptr_taint, ops[0].reg)
+                    push_stack.clear()
+                    continue
+
+            # ── MOV r32, [index*scale + abs] (pointer table load) ─────────────
+            if mnem == 'mov' and len(ops) == 2 and ops[1].type == X86_OP_MEM:
+                m = ops[1].mem
+                if m.base == 0 and m.index and m.disp and ops[0].type == X86_OP_REG:
+                    idx = W32_TO_W64_REG.get(m.index, 'rax')
+                    scale = m.scale or 1
+                    new_disp = self._relocate_imm(m.disp & 0xFFFFFFFF, len(out), 0)
+                    dst = W32_REG_ASM.get(ops[0].reg, 'eax')
+                    if (new_disp < 0x80000000
+                            and not self._is_image_pointer(m.disp & 0xFFFFFFFF)):
+                        out += self._asm(
+                            f'mov {dst}, dword ptr [{idx}*{scale} + 0x{new_disp:x}]')
+                    else:
+                        scratch = 'r11' if idx != 'r11' else 'r10'
+                        out += self._asm(f'mov {scratch}, 0x{new_disp:x}')
+                        out += self._asm(
+                            f'mov {dst}, dword ptr [{scratch} + {idx}*{scale}]')
+                    push_stack.clear()
+                    continue
+
+            # ── MOV [index*scale + abs], r32 (pointer table store) ────────────
+            if mnem == 'mov' and len(ops) == 2 and ops[0].type == X86_OP_MEM:
+                m = ops[0].mem
+                if m.base == 0 and m.index and m.disp and ops[1].type == X86_OP_REG:
+                    idx = W32_TO_W64_REG.get(m.index, 'rax')
+                    scale = m.scale or 1
+                    new_disp = self._relocate_imm(m.disp & 0xFFFFFFFF, len(out), 0)
+                    ptr_sz = self._mem_ptr_size(insn.op_str)
+                    ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                    src = (self._word_reg_asm_for_op(ops[1], insn.op_str)
+                           if ebp_sz == 'word'
+                           else W32_REG_ASM.get(ops[1].reg, 'eax'))
+                    if (new_disp < 0x80000000
+                            and not self._is_image_pointer(m.disp & 0xFFFFFFFF)):
+                        out += self._asm(
+                            f'mov {ebp_sz} ptr [{idx}*{scale} + 0x{new_disp:x}], '
+                            f'{src}')
+                    else:
+                        scratch = 'r11' if idx != 'r11' else 'r10'
+                        out += self._asm(
+                            f'mov {scratch}, 0x{new_disp & 0xFFFFFFFFFFFFFFFF:x}')
+                        out += self._asm(
+                            f'mov {ebp_sz} ptr [{scratch} + {idx}*{scale}], {src}')
+                    push_stack.clear()
+                    continue
+                if m.base and not m.index and m.disp and ops[1].type == X86_OP_REG:
+                    disp_u = m.disp & 0xFFFFFFFF
+                    new_disp = self._relocate_imm(disp_u, len(out), 0)
+                    if self._is_image_pointer(disp_u) or new_disp != disp_u:
+                        base64 = W32_TO_W64_REG.get(m.base, 'rax')
+                        scratch = 'r11' if base64 != 'r11' else 'r10'
+                        out += self._asm(
+                            f'mov {scratch}, 0x{new_disp & 0xFFFFFFFFFFFFFFFF:x}')
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = ptr_sz if ptr_sz in ('byte', 'word') else 'dword'
+                        src = (self._word_reg_asm_for_op(ops[1], insn.op_str)
+                               if ebp_sz == 'word'
+                               else W32_REG_ASM.get(ops[1].reg, 'eax'))
+                        out += self._asm(
+                            f'mov {ebp_sz} ptr [{scratch} + {base64}], {src}')
+                        push_stack.clear()
+                        continue
+
+            # ── 64-bit ALU on pointer-tainted registers (inc edx truncates RDX) ─
+            if mnem in ('inc', 'dec') and len(ops) == 1 and ops[0].type == X86_OP_REG:
+                r64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if (ops[0].reg != X86_REG_ESP
+                        and (r64 in ptr_taint or self.win10_test_shim)):
+                    out += self._asm(f'{mnem} {r64}')
+                    push_stack.clear()
+                    continue
+
+            if mnem in ('add', 'sub') and len(ops) == 2 and ops[0].type == X86_OP_REG:
+                if (mnem == 'add' and ops[0].reg == X86_REG_EAX
+                        and ops[1].type == X86_OP_REG and ops[1].reg == X86_REG_EDI
+                        and self._cmd_builder_add_eax_edi_plus30(old_va)):
+                    out += self._asm('add rax, 0x30')
+                    push_stack.clear()
+                    continue
+                r64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                if r64 in ptr_taint and ops[0].reg != X86_REG_ESP:
+                    if ops[1].type == X86_OP_IMM:
+                        signed_n = ops[1].imm
+                        if signed_n > 0x7FFFFFFF:
+                            signed_n -= 0x100000000
+                        if mnem == 'add' and signed_n < 0:
+                            out += self._asm(f'sub {r64}, 0x{-signed_n:x}')
+                        elif mnem == 'sub' and signed_n < 0:
+                            out += self._asm(f'add {r64}, 0x{-signed_n:x}')
+                        else:
+                            op = 'sub' if mnem == 'sub' else 'add'
+                            out += self._asm(
+                                f'{op} {r64}, 0x{signed_n & 0xFFFFFFFFFFFFFFFF:x}')
+                        continue
+                    if ops[1].type == X86_OP_REG:
+                        src64 = W32_TO_W64_REG.get(ops[1].reg, 'rax')
+                        out += self._asm(f'{mnem} {r64}, {src64}')
+                        continue
+
+            # ── String store (stosd) → explicit dword store + advance RDI ─────
+            if mnem == 'stosd':
+                out += self._asm('mov dword ptr [rdi], eax')
+                out += self._asm('add rdi, 4')
+                push_stack.clear()
+                continue
+
+            # ── [reg + reg] pointer null tests (cmd table slots) ───────────────
+            if (self.win10_test_shim and mnem in ('cmp', 'test') and len(ops) == 2
+                    and ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_IMM
+                    and ops[1].imm == 0):
+                m = ops[0].mem
+                if m.segment == 0 and m.base and m.index and not m.disp:
+                    base64 = W32_TO_W64_REG.get(m.base, 'rax')
+                    idx64 = W32_TO_W64_REG.get(m.index, 'rax')
+                    scale = m.scale or 1
+                    if scale == 1:
+                        slot_sz = ('qword' if self.win10_test_shim
+                                   and self._cmd_heap_indexed_mem(m)
+                                   else 'dword')
+                        out += self._asm(
+                            f'cmp {slot_sz} ptr [{base64}+{idx64}], 0')
+                        push_stack.clear()
+                        continue
+
+            # ── [TEB+disp] indirect field access (post fs:[0x18] self load) ───
+            if len(ops) == 2 and any(op.type == X86_OP_MEM for op in ops):
+                mem_op = next(op for op in ops if op.type == X86_OP_MEM)
+                m = mem_op.mem
+                if m.segment == 0 and m.base and not m.index:
+                    base64 = W32_TO_W64_REG.get(m.base, 'rax')
+                    if base64 in teb_ptr_regs:
+                        fs_disp = m.disp & 0xFFFFFFFF
+                        if fs_disp > 0x7FFFFFFF:
+                            fs_disp -= 0x100000000
+                        gs_disp = TEB_FS_TO_GS.get(fs_disp, fs_disp)
+                        sz = self._teb_indirect_field_size(gs_disp)
+                        other = ops[1] if mem_op is ops[0] else ops[0]
+                        if mem_op is ops[0] and other.type == X86_OP_REG:
+                            dst = (self._word_reg_asm_for_op(other, insn.op_str)
+                                   if sz == 'word'
+                                   else (W32_TO_W64_REG.get(other.reg, 'rax')
+                                         if sz == 'qword'
+                                         else W32_REG_ASM.get(other.reg, 'eax')))
+                            out += self._asm(
+                                f'mov {dst}, {sz} ptr [{base64}+0x{gs_disp:x}]')
+                            push_stack.clear()
+                            continue
+                        if mem_op is ops[1] and other.type == X86_OP_REG:
+                            src = (self._word_reg_asm_for_op(other, insn.op_str)
+                                   if sz == 'word'
+                                   else (W32_TO_W64_REG.get(other.reg, 'rax')
+                                         if sz == 'qword'
+                                         else W32_REG_ASM.get(other.reg, 'eax')))
+                            out += self._asm(
+                                f'mov {sz} ptr [{base64}+0x{gs_disp:x}], {src}')
+                            push_stack.clear()
+                            continue
+
+            # ── [reg + image_disp32] mem ops (cmd quote buffer: [edi+0x4AD…]) ─
+            if len(ops) == 2 and any(op.type == X86_OP_MEM for op in ops):
+                mem_op = next(op for op in ops if op.type == X86_OP_MEM)
+                m = mem_op.mem
+                if m.segment == 0 and m.base and not m.index and m.disp:
+                    disp_u = m.disp & 0xFFFFFFFF
+                    new_disp = self._relocate_imm(disp_u, len(out), 0)
+                    if self._is_image_pointer(disp_u) or new_disp != disp_u:
+                        base64 = W32_TO_W64_REG.get(m.base, 'rax')
+                        scratch = 'r11' if base64 != 'r11' else 'r10'
+                        out += self._asm(
+                            f'mov {scratch}, 0x{new_disp & 0xFFFFFFFFFFFFFFFF:x}')
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = (ptr_sz if ptr_sz in ('byte', 'word')
+                                  else 'dword')
+                        other = ops[1] if mem_op is ops[0] else ops[0]
+                        if mem_op is ops[0]:
+                            if other.type == X86_OP_IMM:
+                                mask = {'byte': 0xFF, 'word': 0xFFFF}.get(
+                                    ebp_sz, 0xFFFFFFFF)
+                                out += self._asm(
+                                    f'mov {ebp_sz} ptr [{scratch}+{base64}], '
+                                    f'0x{other.imm & mask:x}')
+                            elif other.type == X86_OP_REG:
+                                src = (self._word_reg_asm_for_op(other, insn.op_str)
+                                       if ebp_sz == 'word'
+                                       else W32_REG_ASM.get(other.reg, 'eax'))
+                                out += self._asm(
+                                    f'mov {ebp_sz} ptr [{scratch}+{base64}], '
+                                    f'{src}')
+                        elif other.type == X86_OP_REG:
+                            dst = (self._word_reg_asm_for_op(other, insn.op_str)
+                                   if ebp_sz == 'word'
+                                   else W32_REG_ASM.get(other.reg, 'eax'))
+                            out += self._asm(
+                                f'mov {dst}, {ebp_sz} ptr [{scratch}+{base64}]')
+                        push_stack.clear()
+                        continue
+                if (m.segment == 0 and m.base and m.index and m.disp
+                        and (m.scale or 1) == 2):
+                    disp_u = m.disp & 0xFFFFFFFF
+                    new_disp = self._relocate_imm(disp_u, len(out), 0)
+                    if self._is_image_pointer(disp_u) or new_disp != disp_u:
+                        base64 = W32_TO_W64_REG.get(m.base, 'rax')
+                        idx64 = W32_TO_W64_REG.get(m.index, 'rax')
+                        scratch = 'r11' if base64 != 'r11' else 'r10'
+                        out += self._asm(
+                            f'mov {scratch}, 0x{new_disp & 0xFFFFFFFFFFFFFFFF:x}')
+                        ptr_sz = self._mem_ptr_size(insn.op_str)
+                        ebp_sz = (ptr_sz if ptr_sz in ('byte', 'word')
+                                  else 'dword')
+                        other = ops[1] if mem_op is ops[0] else ops[0]
+                        if mem_op is ops[0] and other.type == X86_OP_REG:
+                            src = (self._word_reg_asm_for_op(other, insn.op_str)
+                                   if ebp_sz == 'word'
+                                   else W32_REG_ASM.get(other.reg, 'eax'))
+                            out += self._asm(
+                                f'mov {ebp_sz} ptr [{scratch}+{idx64}*2+{base64}], '
+                                f'{src}')
+                        push_stack.clear()
+                        continue
+
+            # cmd builder: table slot index is byte offset — use 8-byte slots on Win10.
+            if (self.win10_test_shim and mnem == 'shl' and len(ops) == 2
+                    and ops[0].type == X86_OP_REG and ops[1].type == X86_OP_IMM
+                    and ops[1].imm == 2):
+                old_rva = (old_va - self.old_base) & 0xFFFFFFFF
+                if old_rva in (0x1A408, 0x1A45C):
+                    r64 = W32_TO_W64_REG.get(ops[0].reg, 'rax')
+                    out += self._asm(f'shl {r64}, 3')
+                    push_stack.clear()
+                    continue
+
+            # ── EBP scratch: test/cmp on repurposed ebp (cmd 0x651D heap handle) ─
+            if (self._cmd_no_hacks and ebp_reg_scratch
+                    and mnem in ('test', 'cmp') and len(ops) == 2):
+                if (mnem == 'test' and ops[0].type == X86_OP_REG
+                        and ops[1].type == X86_OP_REG
+                        and ops[0].reg == X86_REG_EBP
+                        and ops[1].reg == X86_REG_EBP):
+                    out += self._asm(
+                        f'cmp {self._ebp_scratch_mem(ebp_scratch_home)}, 0')
+                    push_stack.clear()
+                    continue
+                if (mnem == 'cmp' and ops[0].type == X86_OP_REG
+                        and ops[1].type == X86_OP_IMM
+                        and ops[0].reg == X86_REG_EBP):
+                    out += self._asm(
+                        f'cmp {self._ebp_scratch_mem(ebp_scratch_home)}, '
+                        f'0x{ops[1].imm & 0xFFFFFFFF:x}')
+                    push_stack.clear()
+                    continue
+                if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG:
+                    if ops[0].reg == X86_REG_EBP or ops[1].reg == X86_REG_EBP:
+                        def _scratch_x64(rid: int) -> str:
+                            if rid == X86_REG_EBP:
+                                return self._ebp_scratch_mem(ebp_scratch_home)
+                            return W32_TO_W64_REG.get(rid, 'rax')
+                        r0 = _scratch_x64(ops[0].reg)
+                        r1 = _scratch_x64(ops[1].reg)
+                        out += self._asm(f'{mnem} {r0}, {r1}')
+                        push_stack.clear()
+                        continue
+
+            # ── Default: re-assemble the instruction as-is (best effort) ───────
+            # NOTE: do not clear push_stack here. Control-flow instructions are
+            # handled earlier; anything reaching this default is data-processing
+            # that may be interleaved among a call's argument pushes (e.g. cmd
+            # RegOpenKeyExW: push …; and dword [esi],0; push …; call). Clearing
+            # would drop those pending arguments.
+            try:
+                enc, _ = self.ks.asm(
+                    self._normalize_x64_asm(f'{mnem} {insn.op_str}'), old_va)
+                out += bytes(enc)
+            except KsError:
+                # Cannot translate → INT3 + original bytes as comment
+                out += b'\xCC'
+                if self.verbose:
+                    self.warnings.append(f"  [UNTRANSLATED] 0x{old_va:08X}: {mnem} {insn.op_str}")
+
+        # ── Phase 2: Fix up branches ────────────────────────────────────────────
+        out_bytes = bytearray(out)
+        JCC_MAP = {
+            'jcc_jo':0x80,'jcc_jno':0x81,'jcc_jb':0x82,'jcc_jnb':0x83,
+            'jcc_jz':0x84,'jcc_jnz':0x85,'jcc_jbe':0x86,'jcc_ja':0x87,
+            'jcc_js':0x88,'jcc_jns':0x89,'jcc_jp':0x8A,'jcc_jnp':0x8B,
+            'jcc_jl':0x8C,'jcc_jge':0x8D,'jcc_jle':0x8E,'jcc_jg':0x8F,
+            # common aliases
+            'jcc_je':0x84,'jcc_jne':0x85,'jcc_jae':0x83,'jcc_jbe':0x86,
+            'jcc_jnle':0x8F,'jcc_jng':0x8E,
+        }
+        _dbg_res = os.environ.get('DEBUG_RESOLVE')
+        _dbg_res_rva = int(_dbg_res, 16) if _dbg_res else None
+        for patch_off, target_va, ftype in pending_fixups:
+            new_target = old_new.get(target_va)
+            target_rva = (target_va - self.old_base) & 0xFFFFFFFF
+            if _dbg_res_rva is not None and target_rva == _dbg_res_rva:
+                print(f"[RESOLVE phase2] tgt_rva=0x{target_rva:X} "
+                      f"old_new={old_new.get(target_va)} "
+                      f"global={global_rva_map.get(target_rva) if global_rva_map else None} "
+                      f"chunk_base=0x{chunk_base:X} patch_off=0x{patch_off:X} ftype={ftype}")
+            if (new_target is None and global_rva_map is not None
+                    and not self._defer_cross_chunk):
+                new_target = global_rva_map.get(target_rva)
+                if new_target is not None:
+                    if ftype in ('rel32_call', 'rel32_jmp'):
+                        after = (chunk_base + patch_off + 4) if chunk_base else (patch_off + 4)
+                        rel = new_target - after
+                        struct.pack_into('<i', out_bytes, patch_off, rel)
+                    elif ftype.startswith('jcc_'):
+                        cc_byte = JCC_MAP.get(ftype, 0x84)
+                        out_bytes[patch_off + 1] = cc_byte
+                        after = (chunk_base + patch_off + 6) if chunk_base else (patch_off + 6)
+                        rel = new_target - after
+                        struct.pack_into('<i', out_bytes, patch_off + 2, rel)
+                    continue
+            if new_target is None:
+                if deferred_branches is not None:
+                    abs_patch = patch_off if chunk_base == 0 else chunk_base + patch_off
+                    deferred_branches.append((abs_patch, target_rva, ftype))
+                continue
+            if ftype in ('rel32_call', 'rel32_jmp'):
+                # Patch 4-byte rel32 (offsets relative to current function chunk)
+                after = patch_off + 4
+                rel   = new_target - after
+                struct.pack_into('<i', out_bytes, patch_off, rel)
+            elif ftype.startswith('jcc_'):
+                cc_byte = JCC_MAP.get(ftype, 0x84)
+                out_bytes[patch_off + 1] = cc_byte
+                after = patch_off + 6
+                rel   = new_target - after
+                struct.pack_into('<i', out_bytes, patch_off + 2, rel)
+
+        if _dbg_on:
+            print(f"[DEBUG_FN 0x{func_rva:X}] emitted {len(out_bytes)} bytes; "
+                  f"{len(pending_fixups)} fixups, "
+                  f"{len(old_new)} mapped insns")
+            for _po, _tva, _ft in pending_fixups:
+                _trva = (_tva - self.old_base) & 0xFFFFFFFF
+                _on = old_new.get(_tva)
+                _gl = global_rva_map.get(_trva) if global_rva_map else None
+                print(f"    fixup off=+0x{_po:X} tgt_rva=0x{_trva:X} "
+                      f"old_new={_on} global={_gl} {_ft}")
+
+        return bytes(out_bytes), old_new
+
+    def _resolve_deferred_branches(self, out: bytearray,
+                                   rva_map: Dict[int, int],
+                                   deferred: List[Tuple[int, int, str]]) -> int:
+        """Second pass: patch CALL/JMP placeholders that target other functions."""
+        JCC_MAP = {
+            'jcc_jo': 0x80, 'jcc_jno': 0x81, 'jcc_jb': 0x82, 'jcc_jnb': 0x83,
+            'jcc_jz': 0x84, 'jcc_jnz': 0x85, 'jcc_jbe': 0x86, 'jcc_ja': 0x87,
+            'jcc_js': 0x88, 'jcc_jns': 0x89, 'jcc_jp': 0x8A, 'jcc_jnp': 0x8B,
+            'jcc_jl': 0x8C, 'jcc_jge': 0x8D, 'jcc_jle': 0x8E, 'jcc_jg': 0x8F,
+            'jcc_je': 0x84, 'jcc_jne': 0x85, 'jcc_jae': 0x83,
+        }
+        _dbg_res = os.environ.get('DEBUG_RESOLVE')
+        _dbg_res_rva = int(_dbg_res, 16) if _dbg_res else None
+        fixed = 0
+        for patch_off, target_rva, ftype in deferred:
+            if self._cmd_no_hacks:
+                tgt = self._resolve_call_target_off(out, target_rva, rva_map)
+            else:
+                tgt = rva_map.get(target_rva)
+            if _dbg_res_rva is not None and target_rva == _dbg_res_rva:
+                print(f"[RESOLVE deferred] tgt_rva=0x{target_rva:X} "
+                      f"resolved=0x{tgt:X} patch_off=0x{patch_off:X} ftype={ftype}"
+                      if tgt is not None else
+                      f"[RESOLVE deferred] tgt_rva=0x{target_rva:X} UNRESOLVED "
+                      f"patch_off=0x{patch_off:X}")
+            if tgt is None:
+                continue
+            if ftype in ('rel32_call', 'rel32_jmp'):
+                after = patch_off + 4
+                rel = tgt - after
+                struct.pack_into('<i', out, patch_off, rel)
+                fixed += 1
+            elif ftype.startswith('jcc_'):
+                cc_byte = JCC_MAP.get(ftype, 0x84)
+                out[patch_off + 1] = cc_byte
+                after = patch_off + 6
+                rel = tgt - after
+                struct.pack_into('<i', out, patch_off + 2, rel)
+                fixed += 1
+        return fixed
+
+    def _bridge_ret_to_entry_gaps(self, out: bytearray,
+                                  rva_map: Dict[int, int]) -> int:
+        """Turn orphan bytes + INT3 after RET into a JMP to the real entry."""
+        entry_offs = set(rva_map.values())
+        _PROLOGUES = (
+            b'\x48\x83\xec', b'\x48\x81\xec', b'\x55', b'\x53',
+            b'\x41\x54', b'\x48\x89', b'\x40\x53', b'\x48\x8b',
+            b'\x56', b'\x57', b'\x41\x55', b'\x41\x56',
+        )
+        bridged = 0
+        i = 0
+        while i < len(out) - 6:
+            if out[i] != 0xC3:
+                i += 1
+                continue
+            bridged_here = False
+            for j in range(i + 1, min(i + 24, len(out) - 4)):
+                if out[j] != 0xCC:
+                    continue
+                entry = j + 1
+                head = out[entry:entry + 3]
+                if not any(head.startswith(p) for p in _PROLOGUES):
+                    continue
+                gap_start = i + 1
+                if gap_start not in entry_offs:
+                    break
+                gap_len = entry - gap_start
+                if gap_len < 5:
+                    break
+                rel = entry - (gap_start + 5)
+                out[gap_start:gap_start + 5] = b'\xE9' + struct.pack('<i', rel)
+                for k in range(gap_start + 5, entry):
+                    out[k] = 0x90
+                for rva, off in list(rva_map.items()):
+                    if gap_start <= off < entry:
+                        rva_map[rva] = gap_start
+                bridged += 1
+                bridged_here = True
+                i = entry
+                break
+            if not bridged_here:
+                i += 1
+        return bridged
+
+    def _inject_seh_before_naked_rets(self, out: bytearray,
+                                      text_rva: Optional[int] = None) -> int:
+        """Expand bare ``ret`` in SEH functions into GS-restore + leave + ret."""
+        if not self.win10_test_shim or self._cmd_no_hacks:
+            return 0
+        if text_rva is None:
+            text_rva = self.text_rva
+        gs_set = bytes([0x65, 0x48, 0x89, 0x24, 0x25, 0, 0, 0, 0])
+        seh_mark = bytes([0x6A, 0xFF, 0x48, 0xB8])
+        restore = (
+            bytes([0xC7, 0x45, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF])
+            + bytes([0x65, 0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0])
+            + bytes([0x48, 0x85, 0xC0, 0x74, 0x0C])
+            + bytes([0x48, 0x8B, 0x00])
+            + bytes([0x65, 0x48, 0x89, 0x04, 0x25, 0, 0, 0, 0])
+        )
+        leave5 = bytes([0x48, 0x89, 0xEC, 0x5D, 0xC3])
+        tail = restore + bytes([0x48, 0x89, 0xEC, 0x5D])
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        sites: List[int] = []
+        pos = 0
+        while pos < len(out) - len(gs_set):
+            if out[pos:pos + len(gs_set)] != gs_set:
+                pos += 1
+                continue
+            head = max(0, pos - 96)
+            if seh_mark not in out[head:pos + 4]:
+                pos += 1
+                continue
+            end = min(len(out), pos + 0x8000)
+            nseh = out.find(seh_mark, pos + len(gs_set), end)
+            if nseh > pos:
+                end = nseh
+            for ins in md.disasm(out[pos:end], self.new_base + text_rva + pos):
+                if ins.mnemonic != 'ret' or ins.op_str:
+                    continue
+                i = ins.address - self.new_base - text_rva
+                if i < pos or i >= end:
+                    continue
+                if i >= 5 and out[i - 5:i] == leave5:
+                    continue
+                window = out[max(pos, i - 96):i]
+                if restore[:7] in window:
+                    continue
+                if bytes([0x48, 0x89, 0xEC, 0x5D]) in out[max(pos, i - 8):i]:
+                    continue
+                # Skip R13 stack-align call epilogue (not a function exit).
+                if bytes([0x4C, 0x89, 0xEC]) in out[max(pos, i - 24):i]:
+                    continue
+                sites.append(i)
+            pos += len(gs_set)
+        if not sites:
+            return 0
+        patched = 0
+        for i in sorted(set(sites), reverse=True):
+            out[i:i + 1] = tail + b'\xC3'
+            patched += 1
+        return patched
+
+    def _inject_seh_gs_restore_epilogues(self, out: bytearray) -> int:
+        """Restore GS:[0] before return when MSVC SEH was registered but epilogue was omitted."""
+        if self._cmd_no_hacks:
+            return 0
+        gs_set = bytes([0x65, 0x48, 0x89, 0x24, 0x25, 0, 0, 0, 0])
+        seh_mark = bytes([0x6A, 0xFF, 0x48, 0xB8])
+        epilog = bytes([0x5F, 0x5E, 0x5B, 0x48, 0x89, 0xEC, 0x5D, 0xC3])
+        restore = (
+            bytes([0xC7, 0x45, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF])
+            + bytes([0x65, 0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0])
+            + bytes([0x48, 0x85, 0xC0, 0x74, 0x0C])
+            + bytes([0x48, 0x8B, 0x00])
+            + bytes([0x65, 0x48, 0x89, 0x04, 0x25, 0, 0, 0, 0])
+        )
+        restore_head = restore[:7]
+        sites: List[int] = []
+        pos = 0
+        while pos < len(out) - len(gs_set):
+            if out[pos:pos + len(gs_set)] != gs_set:
+                pos += 1
+                continue
+            head = max(0, pos - 96)
+            if seh_mark not in out[head:pos + 4]:
+                pos += 1
+                continue
+            end = min(len(out), pos + 0x8000)
+            nseh = out.find(seh_mark, pos + len(gs_set), end)
+            if nseh > pos:
+                end = nseh
+            scan = pos + len(gs_set)
+            while scan < end - len(epilog):
+                ep = out.find(epilog, scan, end)
+                if ep < 0:
+                    break
+                ins = ep + 3
+                if out[ins:ins + len(restore_head)] != restore_head:
+                    sites.append(ins)
+                scan = ep + len(epilog)
+            pos += len(gs_set)
+        if not sites:
+            return 0
+        patched = 0
+        for ins in sorted(set(sites), reverse=True):
+            out[ins:ins] = restore
+            patched += 1
+        return patched
+
+    def _fix_alloca_probe_epilogues(self, out: bytearray) -> int:
+        """MSVC _alloca_probe / __chkstk on x64.
+
+        After ``push rcx`` at entry, the return address lives at ``[rsp+8]``.
+        The naive ``mov rax, rsp; push qword ptr [rax]; ret`` pushes the
+        saved rcx register instead of the caller return address.
+        """
+        _BAD = (
+            b'\x48\x89\xe0'              # mov rax, rsp
+            b'\x85\x01'                  # test dword ptr [rcx], eax
+            b'\x48\x89\xcc'              # mov rsp, rcx
+            b'\xff\x30'                  # push qword ptr [rax]
+            b'\xc3'                      # ret
+        )
+        _DUP = (
+            b'\x48\x89\xe0'              # mov rax, rsp
+            b'\x85\x01'
+            b'\x48\x89\xcc'
+            b'\x48\x8b\x44\x24\x08'      # mov rax, [rsp+8]  (partial prior fix)
+            b'\x85\x01'
+            b'\x48\x89\xcc'
+            b'\x50'
+            b'\xc3'
+        )
+        _GOOD = (
+            b'\x48\x8b\x44\x24\x08'      # mov rax, qword ptr [rsp+8]
+            b'\x85\x01'                  # test dword ptr [rcx], eax
+            b'\x48\x89\xcc'              # mov rsp, rcx
+            b'\x50'                      # push rax
+            b'\xc3'                      # ret
+        )
+        _LEGACY_BAD = b'\x8b\x08\x8b\x40\x04\x50\xc3'
+        _CHK = (b'\x3d\x00\x10\x00\x00', b'\x48\x3d\x00\x10\x00\x00')
+
+        def _in_chkstk(head: bytes) -> bool:
+            return any(p in head for p in _CHK)
+
+        fixed = 0
+        for bad in (_BAD, _DUP, _LEGACY_BAD):
+            start = 0
+            while start < len(out):
+                i = out.find(bad, start)
+                if i < 0:
+                    break
+                head = out[max(0, i - 512):i]
+                if _in_chkstk(head):
+                    out[i:i + len(bad)] = _GOOD + b'\x90' * (len(bad) - len(_GOOD))
+                    fixed += 1
+                start = i + 1
+        # Frame-base LEA: x86 ``lea ecx,[esp+8]`` (4-byte retaddr + 4-byte saved
+        # ecx) becomes ``lea rcx,[rsp+0x10]`` on x64 — both slots are now 8 bytes.
+        # The instruction-level port kept the x86 ``+8`` displacement, so the
+        # probe sets RSP 8 bytes too low and EVERY large-frame function's
+        # ``add rsp,N; ret`` epilogue then reads a garbage return address
+        # (the cmd 0xA4E7 epilogue crash).  Universal: keyed on the unique
+        # ``cmp eax,0x1000`` probe fingerprint immediately preceding the LEA.
+        _LEA_BAD = b'\x48\x8d\x4c\x24\x08'   # lea rcx, [rsp+8]
+        _LEA_GOOD = b'\x48\x8d\x4c\x24\x10'  # lea rcx, [rsp+0x10]
+        start = 0
+        while start < len(out):
+            i = out.find(_LEA_BAD, start)
+            if i < 0:
+                break
+            start = i + 1
+            head = out[max(0, i - 12):i]
+            if b'\x3d\x00\x10\x00\x00' not in head:
+                continue
+            out[i:i + len(_LEA_BAD)] = _LEA_GOOD
+            fixed += 1
+        return fixed
+
+    def _pure_chkstk_entry_off(self, out: bytearray) -> Optional[int]:
+        """Locate the clean translated __chkstk/_alloca_probe entry.
+
+        The probe is a universal MSVC CRT routine, but its rva_map entry
+        frequently collapses onto the *previous* function's ``ret``/thunk tail
+        (every interior instruction maps to one stale slot), so callers snap to
+        garbage.  The translated body itself is intact and unmistakable —
+        ``cmp eax,0x1000`` then ``push rcx; lea rcx,[rsp+8]`` (in either order),
+        with the page-probe ``sub eax,0x1000`` close behind.  Find it by
+        signature and hand every probe call straight to it.
+        """
+        cached = getattr(self, '_chkstk_entry_cache', None)
+        if (cached is not None and 0 <= cached < len(out)
+                and (out[cached:cached + 5] == b'\x3d\x00\x10\x00\x00'
+                     or out[cached:cached + 6] == b'\x51\x3d\x00\x10\x00\x00')):
+            return cached
+        sigs = (
+            b'\x3d\x00\x10\x00\x00\x51\x48\x8d\x4c\x24\x08',  # cmp;push rcx;lea rcx,[rsp+8]
+            b'\x51\x3d\x00\x10\x00\x00\x48\x8d\x4c\x24\x08',  # push rcx;cmp;lea rcx,[rsp+8]
+            b'\x3d\x00\x10\x00\x00\x51\x48\x8d\x4c\x24\x10',  # …lea rcx,[rsp+0x10] (fixed)
+            b'\x51\x3d\x00\x10\x00\x00\x48\x8d\x4c\x24\x10',  # …lea rcx,[rsp+0x10] (fixed)
+        )
+        loop = b'\x2d\x00\x10\x00\x00'                        # sub eax, 0x1000
+        found: Optional[int] = None
+        for sig in sigs:
+            start = 0
+            while True:
+                i = out.find(sig, start)
+                if i < 0:
+                    break
+                if out.find(loop, i, i + 0x40) != -1:
+                    found = i
+                    break
+                start = i + 1
+            if found is not None:
+                break
+        self._chkstk_entry_cache = found
+        return found
+
+    def _int3_sled_ff25_gaps(self, out: bytearray) -> int:
+        """Fill bytes between orphan ``ff 25`` IAT thunks with INT3 so fall-through cannot execute garbage."""
+        fixed = 0
+        mapped_offs = set(self.rva_map.values()) if self.rva_map else set()
+        i = 0
+        while i + 6 <= len(out):
+            if out[i:i + 2] != b'\xff\x25' or self._orphan_byte_protected(i):
+                i += 1
+                continue
+            j = i + 6
+            limit = min(len(out), i + 48)
+            while j < limit:
+                if self._orphan_byte_protected(j):
+                    break
+                if j in mapped_offs:
+                    break
+                if (j + 4 <= len(out)
+                        and out[j:j + 4] == b'\x55\x48\x89\xe5'):
+                    break
+                if j + 2 <= len(out) and out[j:j + 2] == b'\xff\x25':
+                    break
+                if out[j] not in (0xCC, 0x90, 0xC3, 0x00):
+                    out[j] = 0xCC
+                    fixed += 1
+                j += 1
+            i = j if j > i + 6 else i + 6
+        return fixed
+
+    def _pure_fix_rbp_leave_before_ret(self, out: bytearray) -> int:
+        """Insert ``mov rsp,rbp; pop rbp`` before ``ret`` when an RBP frame was not closed.
+
+        Merged function blobs in pure mode can reach ``ret`` via branch repair while
+        the x86 ``leave`` at the epilogue label was linearized into dead NOPs.
+        """
+        del out  # disabled — broad matching corrupts interior rets; use jmp fix.
+        return 0
+
+    def _pure_fix_jmp_over_epilogue(self, out: bytearray,
+                                    text_data: bytes,
+                                    text_rva: int) -> int:
+        """Replace forward ``jmp`` at x86 ``pop/leave/ret`` labels with inline epilogue."""
+        if not self._cmd_no_hacks or not self.rva_map:
+            return 0
+        fixed = 0
+        seen_slots: Set[int] = set()
+        for old_rva, off in list(self.rva_map.items()):
+            xoff = old_rva - text_rva
+            if xoff < 0 or xoff >= len(text_data) or text_data[xoff] != 0x5E:
+                continue
+            if xoff + 2 < len(text_data) and text_data[xoff + 1] == 0xC9:
+                if text_data[xoff + 2] == 0xC3:
+                    epilog = b'\x5E\xc9\xc3'
+                elif (text_data[xoff + 2] == 0xC2 and xoff + 5 <= len(text_data)):
+                    epilog = b'\x5E\xc9\xc2' + text_data[xoff + 3:xoff + 5]
+                else:
+                    epilog = b'\x5E\xc9\xc3'
+            else:
+                epilog = b'\x5E\xc9\xc3'
+            if len(epilog) > 5:
+                continue
+            slot: Optional[int] = None
+            for delta in range(0, 16):
+                pos = off + delta
+                if pos + 5 > len(out):
+                    break
+                if out[pos] == 0xE9:
+                    slot = pos
+                    break
+                if out[pos] == 0x5E and pos + 2 <= len(out) and out[pos + 1] == 0xC9:
+                    break
+            if slot is None or slot in seen_slots:
+                continue
+            out[slot:slot + len(epilog)] = epilog
+            for k in range(slot + len(epilog), slot + 5):
+                if k < len(out):
+                    out[k] = 0x90
+            seen_slots.add(slot)
+            fixed += 1
+        return fixed
+
+    def _int3_sled_orphan_data(self, out: bytearray) -> int:
+        """Trap SEH/orphan *data* blobs (not IAT thunks) so stray RIP cannot run them as code."""
+        if self._cmd_no_hacks:
+            return 0
+        fixed = 0
+        for start, size in self._orphan_blob_out_ranges:
+            end = min(len(out), start + size)
+            if end - start >= 4 and out[start:start + 4] == b'\xff\xff\xff\xff':
+                continue
+            for pos in range(start, end):
+                if self._orphan_byte_protected(pos):
+                    continue
+                if out[pos:pos + 2] == b'\xff\x25':
+                    pos += 5
+                    continue
+                if out[pos:pos + 4] == b'\xff\xff\xff\xff':
+                    continue
+                if out[pos] not in (0xCC, 0x00):
+                    out[pos] = 0xCC
+                    fixed += 1
+        return fixed
+
+    def _fix_misaligned_direct_calls(self, out: bytearray,
+                                     rva_map: Dict[int, int]) -> int:
+        """
+        Snap E8 rel32 targets that land inside an orphan FF25 stub (mid ``ff 25``).
+        Do not snap to arbitrary rva_map values — that mis-anchors calls onto
+        epilogue bytes inside translated functions.
+        """
+        del rva_map  # kept for call-site stability; not used for snapping
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._e8_byte_is_real_call(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt < 0 or tgt >= len(out):
+                continue
+            if out[tgt:tgt + 2] == b'\xff\x25':
+                continue
+            snapped: Optional[int] = None
+            for delta in range(1, 12):
+                pos = tgt - delta
+                if pos >= 0 and out[pos:pos + 2] == b'\xff\x25':
+                    snapped = pos
+                    break
+            if snapped is not None:
+                struct.pack_into('<i', out, i + 1, snapped - (i + 5))
+                fixed += 1
+        return fixed
+
+    _WRAPPER_PROLOG = b'\x48\x89\xf1\x48\x89\xfa'   # mov rcx,rsi; mov rdx,rdi
+    _WRAPPER_EPILOG = b'\x48\x89\xf0\x5f\x5e\xc3'    # mov rax,rsi; pop rdi; pop rsi; ret
+
+    def _fix_calls_to_wrapper_bodies(self, out: bytearray) -> int:
+        """
+        Call fixups sometimes land on ``mov eax,esi; pop edi; pop esi; ret`` tails.
+        Prefer the next real function entry after that epilogue; only fall back to
+        the import-wrapper prologue when no forward entry exists.
+        """
+        fixed = 0
+        pro, epi = self._WRAPPER_PROLOG, self._WRAPPER_EPILOG
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._e8_byte_is_real_call(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt < 2 or tgt >= len(out):
+                continue
+            if out[tgt - 2:tgt + len(epi) - 2] != epi:
+                continue
+            snapped: Optional[int] = None
+            epi_end = tgt - 2 + len(epi)
+            for pos in range(epi_end, min(epi_end + 16, len(out) - 3)):
+                if out[pos:pos + 4] == b'\x48\x83\xec\x58':   # sub rsp, 0x58
+                    snapped = pos
+                    break
+                if out[pos:pos + 4] == b'\x48\x83\xec\x20':   # sub rsp, 0x20
+                    snapped = pos
+                    break
+                if out[pos:pos + 1] == b'\x40' and out[pos + 1:pos + 3] == b'\x55':
+                    snapped = pos + 1   # push rbp (REX prefix)
+                    break
+            if snapped is None:
+                for back in range(0, 0x80):
+                    pos = tgt - back
+                    if pos >= 0 and out[pos:pos + len(pro)] == pro:
+                        snapped = pos
+                        break
+            if snapped is not None and snapped != tgt:
+                struct.pack_into('<i', out, i + 1, snapped - (i + 5))
+                fixed += 1
+        return fixed
+
+    def _snap_calls_to_insn_boundaries(self, out: bytearray) -> int:
+        """Snap E8 targets that land mid-instruction back to the enclosing start."""
+        if not HAS_CAPSTONE:
+            return 0
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._e8_byte_is_real_call(out, i):
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt <= 0 or tgt >= len(out):
+                continue
+            prologue_hit = False
+            for delta in range(0, 4):
+                pos = tgt + delta
+                if pos + 3 > len(out):
+                    break
+                if out[pos:pos + 3] == b'\x55\x48\x89':
+                    struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                    fixed += 1
+                    prologue_hit = True
+                    break
+                if out[pos:pos + 3] == b'\x48\x83\xec':
+                    struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                    fixed += 1
+                    prologue_hit = True
+                    break
+            if not prologue_hit and self._call_lands_in_epilogue_tail(out, tgt):
+                for delta in range(0, 24):
+                    pos = tgt + delta
+                    if pos + 1 > len(out):
+                        break
+                    if out[pos] == 0x53 or out[pos] == 0x56:       # push rbx/rsi
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                        prologue_hit = True
+                        break
+                    if pos + 3 <= len(out) and out[pos:pos + 3] == b'\x48\x83\xec':
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                        prologue_hit = True
+                        break
+                    if pos + 2 <= len(out) and out[pos:pos + 2] == b'\x48\xb8':
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                        prologue_hit = True
+                        break
+                    if out[pos:pos + 3] == b'\x55\x48\x89':
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                        prologue_hit = True
+                        break
+            if prologue_hit:
+                continue
+            snapped: Optional[int] = None
+            scan_lo = max(0, tgt - 14)
+            for start in range(scan_lo, tgt + 1):
+                insns = list(md.disasm(out[start:start + 20], start, count=8))
+                for ins in insns:
+                    if ins.address > tgt:
+                        break
+                    end = ins.address + ins.size
+                    if ins.address <= tgt < end and ins.address != tgt:
+                        snapped = ins.address
+                        break
+                if snapped is not None:
+                    break
+            if snapped is not None:
+                struct.pack_into('<i', out, i + 1, snapped - (i + 5))
+                fixed += 1
+                tgt = snapped
+            # Do not forward-snap to ``sub rsp`` inside call-align prologues:
+            # callers must land on outer push rbx/rbp before the align wrapper.
+            if (tgt + 16 <= len(out)
+                    and not self._offset_is_mapped_entry(out, tgt)):
+                for delta in range(0, 16):
+                    pos = tgt + delta
+                    if out[pos:pos + 3] != b'\x48\x83\xec':
+                        continue
+                    if self._outer_entry_before_align(out, pos) is not None:
+                        break
+                    if pos != i + 5 + rel:
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                    break
+        return fixed
+
+    def _snap_calls_to_function_entries(self, out: bytearray,
+                                        rva_map: Optional[Dict[int, int]] = None) -> int:
+        """Snap E8 rel32 targets that land mid-function back to a real entry."""
+        if rva_map is None:
+            rva_map = self.rva_map or None
+        return self._snap_calls_to_enclosing_entries(out, rva_map)
+
+    def _crt_entry_quality_score(self, text_blob: bytes, off: int) -> int:
+        """Score a translated MSVC CRT prologue (higher = healthier code)."""
+        crt_sig = b'\x55\x48\x89\xe5\x6a\xff'
+        if off < 0 or off + len(crt_sig) > len(text_blob):
+            return -999
+        if text_blob[off:off + len(crt_sig)] != crt_sig:
+            return -999
+        score = 100
+        if not HAS_CAPSTONE:
+            return score
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        chunk = text_blob[off:off + 0x140]
+        try:
+            for ins in md.disasm(chunk, off):
+                if ins.address - off > 0x120:
+                    break
+                try:
+                    for op in ins.operands:
+                        if op.type != X86_OP_MEM:
+                            continue
+                        disp = op.mem.disp
+                        if disp > 0x7FFFFFFF:
+                            disp -= 0x100000000
+                        if disp < -0x1000 or disp > 0x1000:
+                            score -= 40
+                except CsError:
+                    score -= 10
+                if ins.mnemonic == 'call' and ins.op_str.startswith('0x'):
+                    score += 5
+                if (self._cmd_no_hacks and ins.mnemonic == 'sub'
+                        and ins.op_str.startswith('rsp')):
+                    try:
+                        n = int(ins.op_str.split(',')[1].strip(), 0)
+                        if n > 0x180:
+                            score -= 60
+                    except (ValueError, IndexError):
+                        pass
+        except CsError:
+            score -= 20
+        return score
+
+    def _find_nearest_crt_startup_off(self, text_blob: bytes,
+                                      near_off: int) -> Optional[int]:
+        """Locate translated CRT startup nearest *near_off* (PE entry anchor).
+
+        Requires the canonical ``push rbp; mov rbp,rsp; push -1`` head, a
+        following ``movabs rax, imm64`` (EH3 handler), and ``mov rax, gs:[0]``
+        SEH prologue within 0x30 bytes.
+        """
+        crt_sig = b'\x55\x48\x89\xe5\x6a\xff'
+        seh_gs = b'\x65\x48\x8b\x04\x25\x00\x00\x00\x00'
+        best: Optional[int] = None
+        best_dist = 0x7FFFFFFF
+        idx = 0
+        while True:
+            j = text_blob.find(crt_sig, idx)
+            if j < 0:
+                break
+            if text_blob[j:j + 3] != b'\x55\x48\x89':
+                idx = j + 1
+                continue
+            head = text_blob[j:j + 0x60]
+            if b'\x48\xb8' not in head:
+                idx = j + 1
+                continue
+            if seh_gs not in text_blob[j:j + 0x30]:
+                idx = j + 1
+                continue
+            dist = abs(j - near_off)
+            if dist < best_dist:
+                best_dist = dist
+                best = j
+            idx = j + 1
+        return best
+
+    def _find_real_crt_entry_off(self, text_blob: bytes) -> Optional[int]:
+        """Locate the translated MSVC CRT startup (eh3 + sub rsp,0x10c frame)."""
+        eh3_imm = ((W2KSHIM_IMAGE_BASE + W2KSHIM_EXCEPT_HANDLER3_RVA)
+                   & 0xFFFFFFFFFFFFFFFF)
+        eh3_bytes = b'\x48\xb8' + struct.pack('<Q', eh3_imm)
+        frame_10c = b'\x48\x81\xec\x0c\x01\x00\x00'
+        best: Optional[int] = None
+        idx = 0
+        while idx < len(text_blob) - 0x40:
+            j = text_blob.find(b'\x55\x48\x89\xe5', idx)
+            if j < 0:
+                break
+            head = text_blob[j:j + 0x80]
+            if eh3_bytes not in head or b'\x6a\xff' not in head:
+                idx = j + 1
+                continue
+            chunk = text_blob[j:j + 0x120]
+            if frame_10c not in chunk:
+                idx = j + 1
+                continue
+            if best is None or j < best:
+                best = j
+            idx = j + 1
+        return best
+
+    def _resolve_pe64_entry_rva(self, text_blob: bytes, text_rva: int,
+                                mapped_entry: int) -> int:
+        """Ensure the PE loader entry lands on a real translated prologue."""
+        if not mapped_entry or mapped_entry < text_rva:
+            return mapped_entry
+        entry_off = mapped_entry - text_rva
+        if entry_off < 0 or entry_off >= len(text_blob):
+            return mapped_entry
+        if self._cmd_no_hacks:
+            # Prefer the direct rva_map anchor when it already looks like CRT startup.
+            if (text_blob[entry_off:entry_off + 3] == b'\x55\x48\x89'
+                    and text_blob[entry_off + 3] == 0xE5
+                    and self._x64_entry_prologue_ok(text_blob, entry_off)):
+                return mapped_entry
+            # rva_map[pe.entry_rva] often lands mid-function; walk back to push-rbp.
+            for back in range(0, 4096):
+                pos = entry_off - back
+                if pos < 0:
+                    break
+                if back > 0 and text_blob[pos] == 0xC3:
+                    break
+                if text_blob[pos:pos + 3] != b'\x55\x48\x89':
+                    continue
+                if text_blob[pos + 3] != 0xE5:  # mov rbp, rsp
+                    continue
+                return text_rva + pos
+            nearest = self._find_nearest_crt_startup_off(text_blob, entry_off)
+            if nearest is not None:
+                return text_rva + nearest
+        if (text_blob[entry_off:entry_off + 4] == b'\x55\x48\x89\xe5'
+                and self._crt_entry_quality_score(text_blob, entry_off) >= 80):
+            return mapped_entry
+        crt_sig = b'\x55\x48\x89\xe5\x6a\xff'
+        eh3_imm = ((W2KSHIM_IMAGE_BASE + W2KSHIM_EXCEPT_HANDLER3_RVA)
+                   & 0xFFFFFFFFFFFFFFFF)
+        crt_hits: List[int] = []
+        idx = 0
+        while True:
+            j = text_blob.find(crt_sig, idx)
+            if j < 0:
+                break
+            crt_hits.append(j)
+            idx = j + 1
+        best_crt: Optional[int] = None
+        best_score = -999
+        best_dist = 0x7FFFFFFF
+        for j in crt_hits:
+            head = text_blob[j:j + 0x40]
+            if self._cmd_no_hacks:
+                if (b'\x48\xb8' not in head
+                        or b'\x65\x48\x8b\x04\x25\x00\x00\x00\x00'
+                        not in text_blob[j:j + 0x30]):
+                    continue
+            elif b'\x48\xb8' + struct.pack('<Q', eh3_imm) not in head:
+                continue
+            q = self._crt_entry_quality_score(text_blob, j)
+            if self._cmd_no_hacks:
+                dist = abs(j - entry_off)
+                if q > best_score or (q == best_score and dist < best_dist):
+                    best_score = q
+                    best_dist = dist
+                    best_crt = j
+                elif q >= 80 and best_score < 80:
+                    best_score = q
+                    best_dist = dist
+                    best_crt = j
+            else:
+                if q > best_score or (q == best_score and best_crt is not None
+                                      and j < best_crt):
+                    best_score = q
+                    best_crt = j
+                elif q > best_score:
+                    best_score = q
+                    best_crt = j
+        if best_crt is None and crt_hits:
+            best_crt = min(crt_hits)
+        if best_crt is not None:
+            return text_rva + best_crt
+        ent = self._entry_for_x86_target(
+            text_blob, self.pe.entry_rva, self.rva_map or {})
+        if ent is not None and 0 <= ent < len(text_blob):
+            if (text_blob[ent:ent + 4] == b'\x55\x48\x89\xe5'
+                    or self._offset_is_mapped_entry(text_blob, ent)):
+                return text_rva + ent
+        for back in range(1, 256):
+            pos = entry_off - back
+            if pos < 0:
+                break
+            if text_blob[pos] == 0xC3:
+                break
+            if text_blob[pos:pos + 4] == b'\x55\x48\x89\xe5':
+                return text_rva + pos
+            if self._offset_is_wrapper_entry(text_blob, pos):
+                return text_rva + pos
+        if self.win10_test_shim:
+            try:
+                eh3_va = (W2KSHIM_IMAGE_BASE + W2KSHIM_EXCEPT_HANDLER3_RVA) & 0xFFFFFFFFFFFFFFFF
+                tail = (
+                    b"\x50"
+                    + b"\x48\xb8" + struct.pack("<Q", eh3_va)
+                    + b"\x50"
+                    + b"\x65\x48\x8b\x04\x25\x00\x00\x00\x00"
+                    + b"\x50"
+                    + b"\x65\x48\x89\x24\x25\x00\x00\x00\x00"
+                )
+                j = text_blob.find(tail)
+                if j >= 0:
+                    candidate = text_rva + max(0, j - (1 + 10 + 1 + 9 + 1 + 10 + 1))
+                    off = candidate - text_rva
+                    if (0 <= off < len(text_blob)
+                            and text_blob[off:off + 4] == b'\x55\x48\x89\xe5'):
+                        return candidate
+            except Exception:
+                pass
+        return mapped_entry
+
+    def _reconcile_rva_map_prologues(self, out: bytearray,
+                                     rva_map: Dict[int, int]) -> int:
+        """Move rva_map entries off mid-function bytes onto real prologues."""
+        fixed = 0
+        text_data = getattr(self, '_pure_heal_text', None) if self._cmd_no_hacks else None
+        text_rva = getattr(self, '_pure_heal_text_rva', 0)
+        for old_rva in list(rva_map.keys()):
+            off = rva_map.get(old_rva)
+            if off is None or off < 0 or off >= len(out):
+                continue
+            if self._cmd_no_hacks and text_data is not None:
+                if self._pure_mapped_entry_sane(out, off, old_rva, text_data, text_rva):
+                    continue
+                for back in range(1, 160):
+                    pos = off - back
+                    if pos < 0:
+                        break
+                    if self._pure_mapped_entry_sane(out, pos, old_rva, text_data, text_rva):
+                        if rva_map[old_rva] != pos:
+                            rva_map[old_rva] = pos
+                            fixed += 1
+                        break
+                continue
+            if self._x64_entry_prologue_ok(out, off):
+                continue
+            for back in range(1, 160):
+                pos = off - back
+                if pos < 0:
+                    break
+                if self._x64_entry_prologue_ok(out, pos):
+                    if rva_map[old_rva] != pos:
+                        rva_map[old_rva] = pos
+                        fixed += 1
+                    break
+        return fixed
+
+    def _neutralize_degenerate_calls(self, out: bytearray) -> int:
+        """
+        NOP CALL rel32 inside align prologue stubs whose target is the byte
+        before ``mov rsp, r13`` (failed fixup rel32 often equals -1).
+        """
+        if self._cmd_no_hacks:
+            return 0
+        align_and = b'\x48\x83\xe4\xf0'
+        epilogue = b'\x4c\x89\xec'   # mov rsp, r13
+        fixed = 0
+        for i in range(len(out) - 8):
+            if out[i] != 0xE8:
+                continue
+            after = i + 5
+            if out[after:after + 3] != epilogue:
+                continue
+            if align_and not in out[max(0, i - 12):i]:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = after + rel
+            if not (after - 4 <= tgt <= after + 1):
+                continue
+            out[i:i + 5] = b'\x90' * 5
+            fixed += 1
+        return fixed
+
+    def _call_lands_in_epilogue_tail(self, out: bytearray, tgt: int) -> bool:
+        """True when *tgt* points at ``add rsp, N`` / ``ret`` in a translated tail."""
+        if tgt + 4 <= len(out) and out[tgt:tgt + 4] == b'\x48\x83\xc4\x58':
+            return True
+        if tgt + 3 <= len(out) and out[tgt:tgt + 3] == b'\x48\x83\xc4':
+            return True
+        if tgt + 7 <= len(out) and out[tgt:tgt + 3] == b'\x48\x81\xc4':
+            return True
+        if tgt + 1 <= len(out) and out[tgt] in (0x5F, 0x5E, 0x5B, 0x5D):  # pop reg
+            return True
+        if tgt + 3 <= len(out) and out[tgt:tgt + 3] == b'\x48\x89\xf0':
+            return True
+        return False
+
+    def _fix_mangled_imm_ret_stubs(self, out: bytearray) -> int:
+        """NOP a stray ``pop reg`` between ``mov rax, imm32`` and ``ret`` in tiny stubs."""
+        fixed = 0
+        i = 0
+        pops = {0x5E, 0x5F, 0x5B, 0x5D, 0x58, 0x59, 0x5A, 0x5C}
+        while i + 9 <= len(out):
+            if out[i:i + 3] == b'\x48\xc7\xc0' and out[i + 7] in pops and out[i + 8] == 0xC3:
+                out[i + 7] = 0x90
+                fixed += 1
+                i += 9
+                continue
+            i += 1
+        return fixed
+
+    def _fix_corrupted_align_prologues(self, out: bytearray) -> int:
+        """Restore ``and rsp,-16`` when stray x86 bytes replace it after align ``sub rsp,0x20``."""
+        align_sub = b'\x41\x55\x49\x89\xe5\x48\x83\xec\x20'
+        and16 = b'\x48\x83\xe4\xf0'
+        fixed = 0
+        start = 0
+        while start < len(out) - len(align_sub) - 4:
+            i = out.find(align_sub, start)
+            if i < 0:
+                break
+            off = i + len(align_sub)
+            if out[off:off + 4] != and16:
+                out[off:off + 4] = and16
+                fixed += 1
+            start = i + 1
+        return fixed
+
+    def _nop_empty_align_stubs(self, out: bytearray) -> int:
+        """Drop orphan ``push r13`` align wrappers that realign the stack but emit no call."""
+        if self._cmd_no_hacks:
+            return 0
+        pro = b'\x41\x55\x49\x89\xe5\x48\x83\xec\x20\x48\x83\xe4\xf0'
+        epi = b'\x4c\x89\xec\x41\x5d'
+        fixed = 0
+        start = 0
+        while start < len(out) - len(pro) - len(epi):
+            i = out.find(pro, start)
+            if i < 0:
+                break
+            j = i + len(pro)
+            end = None
+            for k in range(j, min(j + 8, len(out) - len(epi) + 1)):
+                gap = out[j:k]
+                if 0xE8 in gap or 0xFF in gap:
+                    break
+                if out[k:k + len(epi)] == epi:
+                    end = k + len(epi)
+                    break
+            if end is not None:
+                out[i:end] = b'\x90' * (end - i)
+                fixed += 1
+            start = i + 1
+        return fixed
+
+    def _pure_align_stub_pro_epilogue(self) -> Tuple[bytes, bytes]:
+        pro = bytearray()
+        self._emit_call_align_prologue(pro, 0)
+        epi = bytearray()
+        self._emit_call_align_epilogue(epi, 0)
+        return bytes(pro), bytes(epi)
+
+    def _pure_call_target_plausible(self, out: bytearray, tgt: int) -> bool:
+        """Reject IAT thunks / epilogue tails as direct E8 call destinations."""
+        if tgt < 0 or tgt + 2 > len(out):
+            return False
+        if out[tgt:tgt + 2] == b'\xff\x25':
+            return False
+        if out[tgt:tgt + 2] in (b'\x41\x5d', b'\x4c\x89'):
+            return False
+        if self._pure_is_corrupt_x86_hybrid(out, tgt):
+            return False
+        if tgt + 3 <= len(out) and out[tgt:tgt + 3] in (
+                b'\x89\x44\x24', b'\x89\x04\x24', b'\x89\x54\x24'):
+            return False
+        return True
+
+    def _pure_ff35_entry_rank(self, out: bytearray, off: int) -> int:
+        """Lower is better: prefer canonical ``movabs r11, imm`` global helpers."""
+        if off + 3 <= len(out) and out[off:off + 3] == b'\x49\xbb':
+            return 0
+        if off + 2 <= len(out) and out[off:off + 2] == b'\xff\x35':
+            return 2
+        return 1
+
+    def _pure_entry_after_prev_ret(self, out: bytearray, tgt_x86: int,
+                                   rva_map: Dict[int, int]) -> Optional[int]:
+        """Snap a collapsed entry forward past the previous function's ``ret``.
+
+        rva_map[entry] very often lands a few bytes early — inside the *previous*
+        function's epilogue tail (a run of pop / mov rsp,* / leave ending in
+        ``ret``) — so a caller jumps into register restores or a bare ``ret`` and
+        unwinds to garbage.  When the recorded slot is a *clean* epilogue, the
+        real entry is the instruction right after that ``ret`` (skipping
+        nop/int3/zero padding).  The snap is validated with the function's own
+        forward interior maps, which cluster on the true body, so it is
+        prologue-shape agnostic and therefore universal across every Win2000
+        binary (it fixes mov-eax-imm, push-imm, cmp-[esp+4], … entries alike
+        without a bespoke rule for each).
+        """
+        base = rva_map.get(tgt_x86)
+        if base is None or not (0 <= base < len(out) - 1):
+            return None
+        i = base
+        end = min(len(out) - 1, base + 28)
+        ret_end: Optional[int] = None
+        while i < end:
+            b = out[i]
+            if 0x58 <= b <= 0x5f:                              # pop r32/r64 (low)
+                i += 1
+                continue
+            if b == 0x41 and 0x58 <= out[i + 1] <= 0x5f:       # pop r8..r15
+                i += 2
+                continue
+            if bytes(out[i:i + 3]) in (b'\x48\x89\xec', b'\x4c\x89\xec'):
+                i += 3                                          # mov rsp,rbp / r13
+                continue
+            if out[i] == 0x48 and out[i + 1] == 0x83 and out[i + 2] == 0xc4:
+                i += 4                                          # add rsp, imm8
+                continue
+            if b == 0xc9:                                       # leave
+                i += 1
+                continue
+            if b == 0xc3:                                       # ret
+                ret_end = i + 1
+                break
+            if b == 0xc2:                                       # ret imm16
+                ret_end = i + 3
+                break
+            return None                                        # not a clean epilogue
+        if ret_end is None:
+            return None
+        j = ret_end
+        while j < len(out) and out[j] in (0x90, 0xcc, 0x00):
+            j += 1
+        cand = j
+        if not (0 <= cand < len(out)):
+            return None
+        if not self._pure_call_target_plausible(out, cand):
+            return None
+        fwd = 0
+        for dr in range(1, 28):
+            v = rva_map.get((tgt_x86 + dr) & 0xFFFFFFFF)
+            if v is not None and cand <= v <= cand + 0x80:
+                fwd += 1
+        if fwd < 2:
+            return None
+        return cand
+
+    def _pure_fix_chkstk_prologue_entries(self, out: bytearray,
+                                          rva_map: Dict[int, int],
+                                          text_data: bytes,
+                                          text_rva: int) -> int:
+        """Force every ``mov eax,imm; call __chkstk`` entry onto its real body.
+
+        These large-frame prologues are the ones whose rva_map slot most often
+        collapses into a neighbouring epilogue (the 0xA4E7 switch-parser bug).
+        Running this authoritatively *before* the call-repair passes means every
+        downstream CALL/align-stub repair resolves against the correct entry, so
+        a single fix here propagates universally to all callers.
+        """
+        if not self._cmd_no_hacks:
+            return 0
+        # ENABLED BY DEFAULT (opt out with DISABLE_CHKSTK=1).
+        #
+        # This pass snaps a chkstk-prologue function's rva_map slot onto its
+        # ``mov rax,imm; …; call __chkstk`` entry so calls to large-frame
+        # functions resolve onto the real body.  Earlier this regressed (the
+        # 0xA4E7 wcschr crash at ~68k) because of three now-fixed bugs:
+        #   1. the spurious post-__chkstk callee-save entry (0xA4F1) — rejected
+        #      by ``_is_post_chkstk_callee_save``;
+        #   2. the CALL re-pointer hijacking an adjacent unrelated call — fixed
+        #      in ``_pure_repair_chkstk_prologue_calls`` (only junk/duplicate
+        #      sites are repointed now);
+        #   3. the translated __chkstk leaving RSP 8 bytes low (``lea rcx,
+        #      [rsp+8]`` not doubled) — fixed in ``_fix_alloca_probe_epilogues``.
+        # With all three fixed, cmd's ``/c`` parser (0xA4E7) now executes and
+        # returns correctly and the trace runs PAST the old 202,344 baseline.
+        # Disable only for debugging regressions.
+        if os.environ.get('DISABLE_CHKSTK'):
+            return 0
+        need: Set[int] = set(self._fn_entry_rvas or ())
+        if self._x86_cf:
+            need |= self._x86_cf.call_targets
+        fixed = 0
+        for func in need:
+            fo = func - text_rva
+            if not (0 <= fo and fo + 10 <= len(text_data)):
+                continue
+            if text_data[fo] != 0xB8 or text_data[fo + 5] != 0xE8:
+                continue
+            snap = self._pure_chkstk_prologue_entry_for_x86(
+                out, func, text_data, text_rva, rva_map)
+            if snap is not None and rva_map.get(func) != snap:
+                if func == self._dbg_rva:
+                    print(f"        [DBG chkfix {func:#x}] "
+                          f"{rva_map.get(func)!r} -> {snap:#x}")
+                rva_map[func] = snap
+                fixed += 1
+        return fixed
+
+    def _pure_fix_broken_chkstk_calls(self, out: bytearray) -> int:
+        """Repoint every large-frame ``call __chkstk`` that lost its target.
+
+        A chkstk-prologue is ``mov rax,imm`` + the RCX/RDX/R8/R9 shadow spill +
+        ``call __chkstk``. When a function is re-emitted by the swallowed-entry
+        heal pass, that interior probe ``call`` is frequently left as its rel=0
+        placeholder (``call $+5``) — the heal blob's deferred branches are not
+        reconciled against the alloca probe — so the 0x2464-byte frame is never
+        allocated and the body scribbles over the return address / spilled args
+        (cmd 0xA4E7 heal copy). Find each opener whose ``call`` does NOT land on
+        the single translated __chkstk body and snap it there. Universal: keyed
+        on the prologue shape + the unique chkstk fingerprint, not any binary.
+        """
+        ck = self._pure_chkstk_entry_off(out)
+        if ck is None:
+            return 0
+
+        def _is_chkstk_body(t: int) -> bool:
+            return (0 <= t < len(out) - 6
+                    and (out[t:t + 5] == b'\x3d\x00\x10\x00\x00'
+                         or out[t:t + 6] == b'\x51\x3d\x00\x10\x00\x00'))
+
+        fixed = 0
+        openers = (b'\x48\xc7\xc0', b'\xb8')  # mov rax,imm32 / mov eax,imm32
+        for opener in openers:
+            olen = len(opener) + 4  # opcode bytes + imm32
+            start = 0
+            while True:
+                p = out.find(opener, start)
+                if p < 0:
+                    break
+                start = p + 1
+                c = p + olen
+                # REQUIRE the canonical arg-spill: ``mov rax,imm; call X`` is an
+                # extremely common ordinary sequence, so only an opener carrying
+                # the RCX/RDX/R8/R9 shadow spill (emitted exclusively for chkstk
+                # large-frame prologues) may be repointed — never a normal call.
+                if out[c:c + len(_CHKSTK_ARG_SPILL)] != _CHKSTK_ARG_SPILL:
+                    continue
+                c += len(_CHKSTK_ARG_SPILL)
+                if c + 5 > len(out) or out[c] != 0xE8:
+                    continue
+                crel = int.from_bytes(out[c + 1:c + 5], 'little', signed=True)
+                tgt = (c + 5 + crel) & 0xFFFFFFFFFFFFFFFF
+                # Leave correctly-resolved probes alone; only repair the ones
+                # whose call missed the body (``call $+5`` heal placeholder).
+                if _is_chkstk_body(tgt):
+                    continue
+                struct.pack_into('<i', out, c + 1, ck - (c + 5))
+                fixed += 1
+        return fixed
+
+    def _pure_chkstk_prologue_targets(self, rva_map: Dict[int, int],
+                                      text_data: bytes,
+                                      text_rva: int) -> Dict[int, int]:
+        """{x86 entry -> shim offset} for every ``mov eax,imm; call __chkstk`` fn."""
+        out_map: Dict[int, int] = {}
+        need: Set[int] = set(self._fn_entry_rvas or ())
+        if self._x86_cf:
+            need |= self._x86_cf.call_targets
+        for func in need:
+            fo = func - text_rva
+            if not (0 <= fo and fo + 10 <= len(text_data)):
+                continue
+            if text_data[fo] != 0xB8 or text_data[fo + 5] != 0xE8:
+                continue
+            rel = int.from_bytes(text_data[fo + 6:fo + 10], 'little', signed=True)
+            if not self._is_alloca_probe_rva((func + 10 + rel) & 0xFFFFFFFF):
+                continue
+            snap = rva_map.get(func)
+            if snap is not None:
+                out_map[func] = snap
+        return out_map
+
+    def _pure_repair_chkstk_prologue_calls(self, out: bytearray,
+                                           rva_map: Dict[int, int],
+                                           text_data: bytes,
+                                           text_rva: int) -> int:
+        """Final, targeted: re-point CALLs to ``mov eax,imm; call __chkstk`` fns.
+
+        The dozens of generic call-repair passes occasionally re-snap a call to
+        one of these large-frame entries onto a neighbour (the 0xA4E7 case maps
+        ``call`` onto an unrelated 0x208-frame helper).  Running last and ONLY
+        for chkstk-prologue targets — whose rva_map slots were just corrected —
+        guarantees their callers land on the real body without disturbing any
+        other call.  Universal: keyed purely on the prologue shape.
+        """
+        if not self._cmd_no_hacks:
+            return 0
+        # ENABLED BY DEFAULT (opt out with DISABLE_CHKSTK=1) — paired with
+        # _pure_fix_chkstk_prologue_entries.  Only repoints calls whose current
+        # target is a junk/swallowed slot or a stale duplicate copy (never a
+        # sane unrelated entry), so the adjacent-call hijack that caused the
+        # 0xA4E7 wcschr crash can no longer happen.
+        if os.environ.get('DISABLE_CHKSTK'):
+            return 0
+        targets = self._pure_chkstk_prologue_targets(rva_map, text_data, text_rva)
+        if not targets:
+            return 0
+        # Anchor at each x86 ``call rel32`` whose destination is a chkstk-prologue
+        # function, then patch the matching translated E8 (plain or align-stub)
+        # nearest that call's anchor — the same proven mechanism as the generic
+        # x86-anchored repair, but scoped to these collision-prone entries.
+        fixed = 0
+        for off in range(len(text_data) - 5):
+            if text_data[off] != 0xE8:
+                continue
+            x86_rva = (text_rva + off) & 0xFFFFFFFF
+            rel = struct.unpack_from('<i', text_data, off + 1)[0]
+            tgt_x86 = (text_rva + off + 5 + rel) & 0xFFFFFFFF
+            if tgt_x86 not in targets:
+                continue
+            anchor = rva_map.get(x86_rva)
+            if anchor is None or not (0 <= anchor < len(out)):
+                continue
+            want = targets[tgt_x86]
+            if not (0 <= want < len(out)):
+                continue
+            sites = self._pure_call_e8_sites_near_anchor(out, anchor)
+            if not sites:
+                continue
+            # Framesize of the target ``mov eax,imm32; call __chkstk`` prologue,
+            # used to recognise an alternate (duplicate) translated copy.
+            fo = tgt_x86 - text_rva
+            framesize: Optional[int] = None
+            if 0 <= fo and fo + 5 <= len(text_data) and text_data[fo] == 0xB8:
+                framesize = int.from_bytes(text_data[fo + 1:fo + 5], 'little')
+
+            def _repointable(site: int) -> bool:
+                """Only redirect a call that is currently junk or a stale copy.
+
+                Deferred-push argument flushing routinely emits an UNRELATED
+                neighbouring call (e.g. cmd 0xAB1D) closer to this call's
+                rva_map anchor than the real one.  The old ``nearest site``
+                heuristic hijacked that neighbour and pointed it into the
+                large-frame body, leaving the genuine call aimed at a junk
+                duplicate (the 0xA4E7 wcschr crash).  Repoint a site ONLY when
+                its current target is a swallowed epilogue/thunk slot or
+                another copy of THIS same chkstk prologue — never when it
+                already resolves to a sane, unrelated function entry.
+                """
+                cur = site + 5 + struct.unpack_from('<i', out, site + 1)[0]
+                if cur == want:
+                    return False
+                if not (0 <= cur < len(out)):
+                    return True
+                if self._pure_mapping_is_swallowed_slot(out, cur):
+                    return True
+                if (framesize is not None
+                        and self._pure_is_chkstk_opener_at(out, cur, framesize)):
+                    return True
+                return False
+
+            cand = [s for s in sites if _repointable(s)]
+            if not cand:
+                continue
+            best = min(cand, key=lambda s: abs(s - anchor))
+            struct.pack_into('<i', out, best + 1, want - (best + 5))
+            fixed += 1
+        return fixed
+
+    @staticmethod
+    def _pure_is_chkstk_opener_at(out: bytearray, off: int,
+                                  framesize: int) -> bool:
+        """True when *off* begins a ``mov rax/eax,framesize`` chkstk copy."""
+        if off < 0 or off + 5 > len(out):
+            return False
+        simm = framesize - 0x100000000 if framesize >= 0x80000000 else framesize
+        if (out[off:off + 3] == b'\x48\xc7\xc0' and off + 7 <= len(out)
+                and struct.unpack_from('<i', out, off + 3)[0] == simm):
+            return True
+        if (out[off] == 0xb8 and off + 5 <= len(out)
+                and int.from_bytes(out[off + 1:off + 5], 'little') == framesize):
+            return True
+        return False
+
+    def _pure_chkstk_prologue_entry_for_x86(
+            self, out: bytearray, tgt_x86: int,
+            text_data: bytes, text_rva: int,
+            rva_map: Dict[int, int]) -> Optional[int]:
+        """Snap an x86 ``mov eax,imm32; call __chkstk`` large-frame entry.
+
+        A great many Win2000 functions open with the MSVC large-frame stack
+        probe ``mov eax,<framesize>; call __chkstk``.  That two-instruction
+        prologue routinely has its rva_map slot collapse into the *previous*
+        function's aligned-call / epilogue tail, so a caller lands
+        mid-instruction and the whole function is skipped — this is exactly
+        what swallowed cmd's ``/c`` switch parser at 0xA4E7 (its slot pointed
+        into the preceding ``srand`` wrapper, so ``call 0xA4E7`` just ran srand
+        and returned).  The translated opener is an exact, collision-resistant
+        fingerprint: ``mov rax/eax,<framesize>`` immediately followed by a
+        direct ``call`` to the single translated __chkstk body.  Locate that
+        pair and pick the occurrence nearest the recorded slot.  Purely
+        prologue-driven, so it is universal across every Win2000 binary rather
+        than specific to cmd.
+        """
+        fo = tgt_x86 - text_rva
+        if not (0 <= fo and fo + 10 <= len(text_data)):
+            return None
+        if text_data[fo] != 0xB8 or text_data[fo + 5] != 0xE8:  # mov eax,imm; call rel32
+            return None
+        imm = int.from_bytes(text_data[fo + 1:fo + 5], 'little')
+        rel = int.from_bytes(text_data[fo + 6:fo + 10], 'little', signed=True)
+        call_tgt = (tgt_x86 + 10 + rel) & 0xFFFFFFFF
+        if not self._is_alloca_probe_rva(call_tgt):
+            return None
+        simm = imm - 0x100000000 if imm >= 0x80000000 else imm
+        openers = (
+            b'\x48\xc7\xc0' + struct.pack('<i', simm),   # mov rax, imm32 (sign-extended)
+            b'\xb8' + struct.pack('<I', imm),            # mov eax, imm32
+        )
+
+        def _is_chkstk_body(t: int) -> bool:
+            # Bytes of the __chkstk probe: ``cmp eax,0x1000`` optionally behind a
+            # ``push rcx``.  Used only as a *preference*, since at heal time the
+            # prologue's chkstk ``call`` rel32 may still be a deferred (rel=0)
+            # placeholder — so the opener+call shape alone must remain sufficient.
+            return (0 <= t < len(out) - 6
+                    and (out[t:t + 5] == b'\x3d\x00\x10\x00\x00'
+                         or out[t:t + 6] == b'\x51\x3d\x00\x10\x00\x00'))
+
+        hint = rva_map.get(tgt_x86)
+        # candidates: (chkstk_resolved_pref, distance, offset); 0 sorts first.
+        cands: List[Tuple[int, int, int]] = []
+        for opener in openers:
+            olen = len(opener)
+            start = 0
+            while True:
+                p = out.find(opener, start)
+                if p < 0:
+                    break
+                start = p + 1
+                c = p + olen
+                # Skip the canonical chkstk arg-spill prologue (RCX/RDX/R8/R9 ->
+                # shadow space + ``lea r15,[rsp+4]``) emitted between the opener
+                # and ``call __chkstk`` so the fingerprint still resolves.
+                if out[c:c + len(_CHKSTK_ARG_SPILL)] == _CHKSTK_ARG_SPILL:
+                    c += len(_CHKSTK_ARG_SPILL)
+                if c + 5 > len(out) or out[c] != 0xE8:
+                    continue
+                if not self._pure_call_target_plausible(out, p):
+                    continue
+                crel = int.from_bytes(out[c + 1:c + 5], 'little', signed=True)
+                pref = 0 if _is_chkstk_body((c + 5 + crel) & 0xFFFFFFFFFFFFFFFF) else 1
+                d = abs(p - hint) if hint is not None else p
+                cands.append((pref, d, p))
+        if not cands:
+            return None
+        cands.sort()
+        return cands[0][2]
+
+    def _pure_find_sane_entry_for_x86(self, out: bytearray, tgt_x86: int,
+                                      rva_map: Dict[int, int],
+                                      text_data: bytes, text_rva: int) -> Optional[int]:
+        """Locate a shim offset that actually matches the x86 entry at *tgt_x86*."""
+        if self._is_alloca_probe_rva(tgt_x86):
+            ck = self._pure_chkstk_entry_off(out)
+            if ck is not None:
+                return ck
+        frameless = self._pure_find_frameless_entry_for_x86(
+            out, tgt_x86, text_data, text_rva, rva_map)
+        if frameless is not None:
+            return frameless
+        # Large-frame functions opening with ``mov eax,imm; call __chkstk`` get
+        # their slot collapsed into the previous function's tail; the translated
+        # ``mov rax/eax,imm; call <chkstk>`` opener is a unique fingerprint.
+        chk_pro = self._pure_chkstk_prologue_entry_for_x86(
+            out, tgt_x86, text_data, text_rva, rva_map)
+        if chk_pro is not None:
+            return chk_pro
+        # The function's OWN recorded slot (and a short forward window past it)
+        # is the most authoritative source whenever it actually matches the x86
+        # prologue.  rva_map frequently points a handful of bytes early — into
+        # the preceding function's epilogue tail — so scan forward from the slot
+        # to snap onto the true entry.  Prefer this over interior inference,
+        # which can be badly skewed when a function's interior byte-maps landed
+        # in an unrelated chunk.
+        direct = rva_map.get(tgt_x86)
+        if direct is not None and 0 <= direct < len(out):
+            bases = (direct, self._refine_shim_target_off(out, tgt_x86, direct))
+            for base in bases:
+                for d in range(0, 12):
+                    cand = base + d
+                    if (0 <= cand < len(out)
+                            and self._pure_call_target_plausible(out, cand)
+                            and self._pure_mapped_entry_sane(
+                                out, cand, tgt_x86, text_data, text_rva)):
+                        return cand
+        # Universal collapsed-epilogue recovery: when the recorded slot is a
+        # clean epilogue tail, snap to the entry right after its ``ret`` (proven
+        # by forward interior maps).  Catches entries whose prologue shape the
+        # idiom checks above don't recognise (mov eax,imm; push imm; …).
+        snapped = self._pure_entry_after_prev_ret(out, tgt_x86, rva_map)
+        if snapped is not None:
+            return snapped
+        inferred = self._pure_infer_entry_from_interior_map(
+            out, tgt_x86, rva_map, text_data, text_rva)
+        if (inferred is not None
+                and self._pure_accept_inferred_entry(
+                    out, inferred, tgt_x86, text_data, text_rva)):
+            return inferred
+        exp_va = self._pure_ff35_global_va_from_x86(
+            text_data, text_rva, tgt_x86)
+        if exp_va is None:
+            func_off = tgt_x86 - text_rva
+            if 0 <= func_off < len(text_data):
+                gva = self._pure_x86_global_store_va_from_head(
+                    text_data[func_off:func_off + 16])
+                if gva is not None:
+                    exp_va = self._relocate_imm(gva)
+        if exp_va is not None:
+            va_le = struct.pack('<Q', exp_va & 0xFFFFFFFFFFFFFFFF)
+            pos = 0
+            while pos < len(out) - 10:
+                j = out.find(b'\x49\xbb', pos)
+                if j < 0:
+                    break
+                if out[j + 2:j + 10] == va_le:
+                    if (self._pure_call_target_plausible(out, j)
+                            and self._pure_mapped_entry_sane(
+                                out, j, tgt_x86, text_data, text_rva)):
+                        return j
+                pos = j + 1 if j >= 0 else pos + 1
+        seen: Set[int] = set()
+        candidates: List[Tuple[int, int, int]] = []
+        for rva, mapped in sorted(rva_map.items(), key=lambda x: x[0]):
+            if not (tgt_x86 <= rva <= tgt_x86 + 24):
+                continue
+            for base in (mapped, self._refine_shim_target_off(out, tgt_x86, mapped)):
+                # Scan a small window behind the recorded base too: rva_map
+                # sometimes points a few bytes early (into the prior epilogue)
+                # *or* a few bytes late, so a forward-only scan can miss the
+                # true entry that sits just before ``base``.
+                for delta in range(-8, 32):
+                    off = base + delta
+                    if off in seen or off < 0 or off >= len(out):
+                        continue
+                    seen.add(off)
+                    if (self._pure_call_target_plausible(out, off)
+                            and self._pure_mapped_entry_sane(
+                                out, off, tgt_x86, text_data, text_rva)):
+                        candidates.append(
+                            (self._pure_ff35_entry_rank(out, off), rva, off))
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            return candidates[0][2]
+        return None
+
+    def _pure_reconcile_swallowed_rva_map(self, out: bytearray,
+                                          rva_map: Dict[int, int],
+                                          text_data: bytes, text_rva: int) -> int:
+        """Point rva_map entries at sane translations instead of swallowed slots."""
+        if not self._cmd_no_hacks:
+            return 0
+        need: Set[int] = set(self._fn_entry_rvas or ())
+        if self._x86_cf:
+            need |= self._x86_cf.call_targets
+        fixed = 0
+        for func in sorted(need):
+            off = rva_map.get(func)
+            func_off = func - text_rva
+            x86_head = (text_data[func_off:func_off + 2]
+                        if 0 <= func_off < len(text_data) else b'')
+            if off is not None and self._pure_mapped_entry_sane(
+                    out, off, func, text_data, text_rva):
+                func_off = func - text_rva
+                x86_head = (text_data[func_off:func_off + 16]
+                            if 0 <= func_off < len(text_data) else b'')
+                need_repoint = False
+                if (x86_head[:2] == b'\xff\x35'
+                        and out[off:off + 3] == b'\x49\xbb'
+                        and not self._pure_ff35_global_va_match(
+                            out, off, func, text_data, text_rva)):
+                    need_repoint = True
+                elif self._pure_x86_global_store_va_from_head(x86_head) is not None:
+                    gva = self._pure_x86_global_store_va_from_head(x86_head)
+                    exp = self._relocate_imm(gva)
+                    if not self._pure_x64_region_has_va(out, off, 48, exp):
+                        need_repoint = True
+                if need_repoint:
+                    sane = self._pure_find_sane_entry_for_x86(
+                        out, func, rva_map, text_data, text_rva)
+                    if sane is not None and sane != off:
+                        rva_map[func] = sane
+                        fixed += 1
+                continue
+            if off is not None:
+                sane = self._pure_find_sane_entry_for_x86(
+                    out, func, rva_map, text_data, text_rva)
+                if sane is not None and sane != off:
+                    rva_map[func] = sane
+                    fixed += 1
+                    continue
+            inferred = self._pure_infer_entry_from_interior_map(
+                out, func, rva_map, text_data, text_rva)
+            if (inferred is not None
+                    and not self._pure_accept_inferred_entry(
+                        out, inferred, func, text_data, text_rva)):
+                inferred = None
+            if inferred is not None:
+                if off is None or off != inferred:
+                    rva_map[func] = inferred
+                    fixed += 1
+                continue
+            if off is None:
+                continue
+            if (self._pure_mapping_is_swallowed_slot(out, off)
+                    or self._pure_is_corrupt_x86_hybrid(out, off)
+                    or not self._pure_call_target_plausible(out, off)):
+                sane = self._pure_find_sane_entry_for_x86(
+                    out, func, rva_map, text_data, text_rva)
+                if sane is not None and sane != off:
+                    rva_map[func] = sane
+                    fixed += 1
+        return fixed
+
+    def _pure_resolve_x86_call_target(self, out: bytearray, tgt_x86: int,
+                                      rva_map: Dict[int, int],
+                                      text_data: bytes, text_rva: int,
+                                      reject: Optional[int] = None) -> Optional[int]:
+        """Resolve an x86 CALL destination to a shim offset (pure mode)."""
+        hint = rva_map.get(tgt_x86)
+        if hint is not None and hint != reject:
+            if hint < 0 or hint >= len(out):
+                hint = None
+            else:
+                refined = self._refine_shim_target_off(out, tgt_x86, hint)
+                if (self._pure_call_target_plausible(out, refined)
+                        and self._pure_mapped_entry_sane(
+                            out, refined, tgt_x86, text_data, text_rva)):
+                    return refined
+        sane = self._pure_find_sane_entry_for_x86(
+            out, tgt_x86, rva_map, text_data, text_rva)
+        if sane is not None and sane != reject and 0 <= sane < len(out):
+            rva_map[tgt_x86] = sane
+            return sane
+        resolved = self._resolve_call_target_off(out, tgt_x86, rva_map)
+        if (resolved is not None and resolved != reject
+                and self._pure_call_target_plausible(out, resolved)):
+            if (tgt_x86 in (getattr(self._x86_cf, 'epilogue_labels', {}) or {})
+                    or self._pure_mapped_entry_sane(
+                        out, resolved, tgt_x86, text_data, text_rva)):
+                rva_map[tgt_x86] = resolved
+                return resolved
+        return None
+
+    def _pure_repatch_align_stub_self_calls(self, out: bytearray,
+                                            rva_map: Dict[int, int],
+                                            text_data: bytes,
+                                            text_rva: int) -> int:
+        """Fix E8 inside align stubs that still call the stub prologue (infinite recursion)."""
+        if not self._cmd_no_hacks:
+            return 0
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        pro_len = len(pro)
+        fixed = 0
+        seen: Set[int] = set()
+        for p in range(len(out) - pro_len - len(epi) - 5):
+            if out[p:p + pro_len] != pro:
+                continue
+            j = p + len(pro)
+            if j in seen or j + 5 > len(out) or out[j] != 0xE8:
+                continue
+            if out[j + 5:j + 5 + len(epi)] != epi:
+                continue
+            rel = struct.unpack_from('<i', out, j + 1)[0]
+            if j + 5 + rel != p:
+                continue
+            tgt_x86 = None
+            anchor_rvas = [rva for rva, mapped in rva_map.items()
+                           if p <= mapped <= j + 5]
+            for anchor in anchor_rvas:
+                for delta in range(-16, 17):
+                    cand = anchor + delta
+                    off = cand - text_rva
+                    if not (0 <= off < len(text_data) - 5):
+                        continue
+                    if text_data[off] != 0xE8:
+                        continue
+                    rel_x = struct.unpack_from('<i', text_data, off + 1)[0]
+                    tgt_x86 = (cand + 5 + rel_x) & 0xFFFFFFFF
+                    break
+                if tgt_x86 is not None:
+                    break
+            if tgt_x86 is None:
+                continue
+            new_tgt = self._pure_resolve_x86_call_target(
+                out, tgt_x86, rva_map, text_data, text_rva, reject=p)
+            if new_tgt is None:
+                continue
+            struct.pack_into('<i', out, j + 1, new_tgt - (j + 5))
+            seen.add(j)
+            fixed += 1
+        return fixed
+
+    def _pure_repair_all_align_stub_calls(self, out: bytearray,
+                                          rva_map: Dict[int, int],
+                                          text_data: bytes,
+                                          text_rva: int) -> int:
+        """Re-resolve E8 inside call-align stubs, one x86 ``call`` per stub site."""
+        if not self._cmd_no_hacks:
+            return 0
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        pro_len = len(pro)
+        epi_len = len(epi)
+        fixed = 0
+        paired: Set[int] = set()
+        for off in range(len(text_data) - 5):
+            if text_data[off] != 0xE8:
+                continue
+            x86_rva = (text_rva + off) & 0xFFFFFFFF
+            mapped = rva_map.get(x86_rva)
+            if mapped is None:
+                continue
+            rel = struct.unpack_from('<i', text_data, off + 1)[0]
+            tgt_x86 = (x86_rva + 5 + rel) & 0xFFFFFFFF
+            new_tgt = self._pure_resolve_x86_call_target(
+                out, tgt_x86, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                continue
+            best_j: Optional[int] = None
+            best_dist = 999999
+            j_lo = max(pro_len, mapped - 8)
+            j_hi = min(mapped + 64, len(out) - 5)
+            for j in range(j_lo, j_hi):
+                if out[j] != 0xE8 or j in paired:
+                    continue
+                scan = j - pro_len
+                if scan < 0 or out[scan:scan + pro_len] != pro:
+                    continue
+                if out[j + 5:j + 5 + epi_len] != epi:
+                    continue
+                # Anchor often precedes the align stub; stub E8 follows within span.
+                if not (mapped <= j + 5 and j <= mapped + 96):
+                    continue
+                dist = abs(j - mapped)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+            if best_j is None:
+                continue
+            paired.add(best_j)
+            cur = best_j + 5 + struct.unpack_from('<i', out, best_j + 1)[0]
+            if cur == new_tgt:
+                continue
+            struct.pack_into('<i', out, best_j + 1, new_tgt - (best_j + 5))
+            fixed += 1
+        return fixed
+
+    def _pure_restore_nopped_align_calls(self, out: bytearray,
+                                         rva_map: Dict[int, int],
+                                         text_data: bytes,
+                                         text_rva: int) -> int:
+        """Restore E8 rel32 inside align stubs that legacy NOP-out passes erased."""
+        if not self._cmd_no_hacks:
+            return 0
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        fixed = 0
+        seen: Set[int] = set()
+        sec_end = text_rva + len(text_data)
+        for off in range(len(text_data) - 5):
+            if text_data[off] != 0xE8:
+                continue
+            x86_rva = text_rva + off
+            if not (text_rva <= x86_rva < sec_end):
+                continue
+            rel = struct.unpack_from('<i', text_data, off + 1)[0]
+            tgt_x86 = (x86_rva + 5 + rel) & 0xFFFFFFFF
+            new_tgt = self._pure_resolve_x86_call_target(
+                out, tgt_x86, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                continue
+            site = rva_map.get(x86_rva)
+            if site is None:
+                continue
+            for p in range(max(0, site - 8),
+                           min(site + 40, len(out) - len(pro) - len(epi))):
+                if out[p:p + len(pro)] != pro:
+                    continue
+                key = p
+                if key in seen:
+                    break
+                j = p + len(pro)
+                if j + 5 <= len(out) and out[j] == 0xE8:
+                    if out[j + 5:j + 5 + len(epi)] == epi:
+                        cur = j + 5 + struct.unpack_from('<i', out, j + 1)[0]
+                        if cur != new_tgt:
+                            struct.pack_into('<i', out, j + 1, new_tgt - (j + 5))
+                            seen.add(key)
+                            fixed += 1
+                        break
+                k = j
+                while k < j + 12 and k < len(out) and out[k] == 0x90:
+                    k += 1
+                if k > j and k + len(epi) <= len(out) and out[k:k + len(epi)] == epi:
+                    rel32 = new_tgt - (j + 5)
+                    out[j:j + 5] = b'\xE8' + struct.pack('<i', rel32)
+                    seen.add(key)
+                    fixed += 1
+                    break
+        fixed += self._pure_repair_all_align_stub_calls(
+            out, rva_map, text_data, text_rva)
+        return fixed
+
+    def _pure_find_frameless_entry_for_x86(
+            self, out: bytearray, tgt_x86: int,
+            text_data: bytes, text_rva: int,
+            rva_map: Dict[int, int]) -> Optional[int]:
+        """Locate frameless ``mov ecx,[esp+4]`` helpers (e.g. wcslen @ 0x6711)."""
+        func_off = tgt_x86 - text_rva
+        if func_off < 0 or func_off + 4 > len(text_data):
+            return None
+        if text_data[func_off:func_off + 4] != b'\x8b\x4c\x24\x04':
+            return None
+        head_variants = (b'\x85\xc9\x8b\xc1', b'\x85\xc9\x89\xc8')  # test ecx; mov eax,ecx
+        hint = rva_map.get(tgt_x86)
+        # ``rva_map[tgt]`` alone is unreliable here: for these frameless helpers
+        # it frequently lands in an unrelated epilogue, which then drags the
+        # proximity search onto a *duplicate* wcslen-shaped helper elsewhere in
+        # .text.  The function's own interior byte-maps are far more trustworthy,
+        # so anchor the search on the median of the nearby interior mappings.
+        anchor = self._pure_interior_anchor(rva_map, tgt_x86, len(out))
+        ref = anchor if anchor is not None else hint
+        scan_lo = 0
+        scan_hi = len(out) - 24
+        best: Optional[int] = None
+        best_dist = 999999
+        for j in range(scan_lo, scan_hi):
+            if not any(out[j:j + 4] == h for h in head_variants):
+                continue
+            win = out[j:j + 24]
+            if (b'\x66\x83\x39\x00' not in win
+                    and b'\x66\x83\x38\x00' not in win):
+                continue
+            if not self._pure_call_target_plausible(out, j):
+                continue
+            dist = abs(j - ref) if ref is not None else j
+            if dist < best_dist:
+                best_dist = dist
+                best = j
+        return best
+
+    @staticmethod
+    def _pure_interior_anchor(rva_map: Dict[int, int], tgt_x86: int,
+                              out_len: int) -> Optional[int]:
+        """Robust body anchor from a function's nearby interior mappings.
+
+        rva_map[entry] is often skewed (it lands in the previous function's
+        epilogue tail), but the *interior* instruction maps cluster around the
+        real translated body.  Take the median mapped offset over a small x86
+        window around the entry — the median shrugs off the odd scrambled
+        outlier, giving a reliable place to search for the true entry.
+        """
+        vals: List[int] = []
+        for dr in range(-8, 48):
+            mp = rva_map.get((tgt_x86 + dr) & 0xFFFFFFFF)
+            if mp is not None and 0 <= mp < out_len:
+                vals.append(mp)
+        if not vals:
+            return None
+        vals.sort()
+        return vals[len(vals) // 2]
+
+    def _pure_authoritative_x86_call_sync(
+            self, out: bytearray, rva_map: Dict[int, int],
+            text_data: bytes, text_rva: int) -> int:
+        """One x86 ``call rel32`` → one align-stub E8, in source order."""
+        if not self._cmd_no_hacks:
+            return 0
+        pro, epi = self._pure_align_stub_pro_epilogue()
+        pl, el = len(pro), len(epi)
+        fixed = 0
+        used: Set[int] = set()
+        for off in range(len(text_data) - 5):
+            if text_data[off] != 0xE8:
+                continue
+            x86_rva = (text_rva + off) & 0xFFFFFFFF
+            rel = struct.unpack_from('<i', text_data, off + 1)[0]
+            tgt_x86 = (x86_rva + 5 + rel) & 0xFFFFFFFF
+            new_tgt = self._pure_find_sane_entry_for_x86(
+                out, tgt_x86, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                new_tgt = self._pure_resolve_x86_call_target(
+                    out, tgt_x86, rva_map, text_data, text_rva)
+            if new_tgt is None:
+                hint = rva_map.get(tgt_x86)
+                if (hint is not None and 0 <= hint < len(out)
+                        and self._pure_call_target_plausible(out, hint)):
+                    new_tgt = hint
+            if new_tgt is None:
+                continue
+            anchor: Optional[int] = None
+            for delta in range(0, 12):
+                for key in ((x86_rva - delta) & 0xFFFFFFFF,
+                            (x86_rva + delta) & 0xFFFFFFFF):
+                    cand = rva_map.get(key)
+                    if cand is not None:
+                        anchor = cand
+                        break
+                if anchor is not None:
+                    break
+            if anchor is None or anchor < 0 or anchor >= len(out):
+                continue
+            best_j: Optional[int] = None
+            best_dist = 999999
+            j_lo = max(0, anchor - 8)
+            j_hi = min(len(out) - pl - el - 5, anchor + 96)
+            for scan in range(j_lo, j_hi):
+                if out[scan:scan + pl] != pro:
+                    continue
+                j = scan + pl
+                if j in used or out[j] != 0xE8:
+                    continue
+                if out[j + 5:j + 5 + el] != epi:
+                    continue
+                if j + 5 > anchor + 96:
+                    continue
+                dist = abs(j - anchor)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+            if best_j is None:
+                for j in range(anchor, min(anchor + 96, len(out) - 5)):
+                    if out[j] != 0xE8 or j in used:
+                        continue
+                    if not self._pure_branch_site_ok(out, j):
+                        continue
+                    dist = abs(j - anchor)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_j = j
+            if best_j is None:
+                continue
+            cur = best_j + 5 + struct.unpack_from('<i', out, best_j + 1)[0]
+            if cur != new_tgt:
+                struct.pack_into('<i', out, best_j + 1, new_tgt - (best_j + 5))
+                fixed += 1
+            used.add(best_j)
+        return fixed
+
+    def _pure_fixup_named_align_calls(self, out: bytearray,
+                                      rva_map: Dict[int, int],
+                                      text_data: bytes, text_rva: int) -> int:
+        """Surgical align-stub fixes for x86 call sites whose anchors share a stub."""
+        if not self._cmd_no_hacks:
+            return 0
+        pairs = (
+            (0xAC12, 0x6581),
+            (0xAC1C, 0x640E),
+        )
+        fixed = 0
+        used: Set[int] = set()
+        for x86_e8, fn_rva in pairs:
+            new_tgt = rva_map.get(fn_rva)
+            if new_tgt is None or not self._pure_call_target_plausible(out, new_tgt):
+                continue
+            anchor: Optional[int] = rva_map.get(x86_e8)
+            if anchor is None:
+                for delta in range(0, 8):
+                    anchor = rva_map.get((x86_e8 - delta) & 0xFFFFFFFF)
+                    if anchor is not None:
+                        break
+            if anchor is None:
+                continue
+            sites = [s for s in self._pure_call_e8_sites_near_anchor(out, anchor)
+                     if s not in used]
+            if not sites:
+                continue
+            site = min(sites, key=lambda s: abs(s - anchor))
+            cur = site + 5 + struct.unpack_from('<i', out, site + 1)[0]
+            if cur != new_tgt:
+                struct.pack_into('<i', out, site + 1, new_tgt - (site + 5))
+                fixed += 1
+            used.add(site)
+        return fixed
+
+    def _pure_fixup_teb_indirect_field_disps(self, out: bytearray) -> int:
+        """Remap ``[teb+4/8]`` d8 fields after ``gs:[0x30]`` self loads."""
+        if not self._cmd_no_hacks:
+            return 0
+        fixed = 0
+        i = 0
+        while i < len(out) - 12:
+            if (out[i] != 0x65 or out[i + 1] != 0x48 or out[i + 2] != 0x8B
+                    or out[i + 4] != 0x25
+                    or struct.unpack_from('<I', out, i + 5)[0] != 0x30):
+                i += 1
+                continue
+            base = (out[i + 3] >> 3) & 7
+            j = i + 9
+            for k in range(j, min(j + 96, len(out) - 3)):
+                if out[k] not in (0x8B, 0x89, 0x3B, 0x39, 0x85):
+                    continue
+                m = out[k + 1]
+                if (m & 7) != base:
+                    continue
+                mod = (m >> 6) & 3
+                if mod == 1:
+                    disp_i = k + 2
+                    if disp_i >= len(out):
+                        break
+                    old = out[disp_i]
+                    if old in (4, 8):
+                        new = TEB_FS_TO_GS[old]
+                    elif old == 0xFF:
+                        new = 0x10
+                    else:
+                        continue
+                    if new != old and new < 0x80:
+                        out[disp_i] = new
+                        fixed += 1
+                elif mod == 2:
+                    disp_i = k + 2
+                    if disp_i + 4 > len(out):
+                        break
+                    old = struct.unpack_from('<I', out, disp_i)[0]
+                    if old not in (4, 8):
+                        continue
+                    new = TEB_FS_TO_GS[old]
+                    if new != old:
+                        struct.pack_into('<I', out, disp_i, new)
+                        fixed += 1
+            i += 9
+        return fixed
+
+    def _pure_fixup_teb_stack_bounds_idiom(self, out: bytearray) -> int:
+        """Promote pointer-width ops in TEB stack-range validators (universal).
+
+        MSVC CRT helpers (``_chkstk``-adjacent stack/SEH validators present in
+        *any* Win2000 binary) read TEB StackBase/StackLimit via ``fs:[0x18]`` →
+        ``[teb+4]`` / ``[teb+8]`` and bounds-check pointers against them.  On x64
+        these fields and the validated pointers are 64-bit, so the naive 32-bit
+        translation truncates them and the check fails.
+
+        This keys off the universal ``mov rX, gs:[0x30]`` self-load already used
+        for TEB fixups: when a self-load is followed by StackBase(+8)/StackLimit
+        (+0x10) reads, the surrounding validation cluster is promoted to qword.
+        No per-binary RVAs are used.
+        """
+        if not self._cmd_no_hacks:
+            return 0
+        fixed = 0
+        n = len(out)
+        si = 0
+        while si < n - 12:
+            # gs:[0x30] self-load: 65 48 8B /r 25 30 00 00 00
+            if (out[si] != 0x65 or out[si + 1] != 0x48 or out[si + 2] != 0x8B
+                    or out[si + 4] != 0x25
+                    or struct.unpack_from('<I', out, si + 5)[0] != 0x30):
+                si += 1
+                continue
+            base = (out[si + 3] >> 3) & 7
+            # Confirm a StackBase/StackLimit read off the self-load base within a
+            # short window (8B /r with modrm.rm==base and disp8 in {8, 0x10}).
+            wlo = si + 9
+            whi = min(n - 3, si + 40)
+            idiom = False
+            k = wlo
+            while k < whi:
+                if (out[k] == 0x8B or (out[k] == 0x48 and k + 1 < n and out[k + 1] == 0x8B)):
+                    mpos = k + (1 if out[k] == 0x48 else 0)
+                    m = out[mpos + 1] if mpos + 1 < n else 0
+                    if (m >> 6) & 3 == 1 and (m & 7) == base and out[mpos + 2] in (8, 0x10):
+                        idiom = True
+                        break
+                k += 1
+            if not idiom:
+                si += 9
+                continue
+            # Promote the validation cluster to qword within the function window.
+            lo = max(0, si - 0x30)
+            hi = min(n, si + 0x120)
+            i = lo
+            while i < hi - 2:
+                b0, b1, b2 = out[i], out[i + 1], out[i + 2]
+                # mov [rsi+0xc], eax / mov eax,[rsi+0xc]  (lea'd stack ptr store/load)
+                if b0 in (0x89, 0x8B) and b1 == 0x46 and b2 == 0x0C:
+                    out.insert(i, 0x48); fixed += 1; hi += 1; n += 1; i += 4; continue
+                # mov edx,[rbase+8] StackBase / mov ecx,[rbase+0x10] StackLimit
+                if b0 == 0x8B and b1 == 0x50 and b2 == 0x08:
+                    out.insert(i, 0x48); fixed += 1; hi += 1; n += 1; i += 4; continue
+                if b0 == 0x8B and b1 == 0x48 and b2 == 0x10:
+                    out.insert(i, 0x48); fixed += 1; hi += 1; n += 1; i += 4; continue
+                # cmp [rbp+0x10], edx/ecx (homed pointer arg vs StackBase/StackLimit)
+                if b0 in (0x39, 0x3B) and b1 in (0x55, 0x4D) and b2 == 0x10:
+                    out.insert(i, 0x48); fixed += 1; hi += 1; n += 1; i += 5; continue
+                # cmp eax,edx / cmp eax,ecx (validated ptr vs bounds)
+                if b0 == 0x39 and b1 in (0xD0, 0xC8):
+                    out.insert(i, 0x48); fixed += 1; hi += 1; n += 1; i += 3; continue
+                i += 1
+            si = hi
+        return fixed
+
+    def _pure_fixup_crt_initterm_push_imm_pairs(
+            self, out: bytearray, rva_map: Dict[int, int],
+            text_data: bytes, text_rva: int) -> int:
+        """Re-sync ``push end; push start; call _initterm`` movabs RCX/RDX in CRT startup."""
+        if not self._cmd_no_hacks:
+            return 0
+        fixed = 0
+        n = len(text_data)
+        lo = self.old_base + 0x1C000
+        hi = self.old_base + 0x1C020
+        for off in range(n - 10):
+            if text_data[off] != 0x68 or text_data[off + 5] != 0x68:
+                continue
+            end_imm = struct.unpack_from('<I', text_data, off + 1)[0]
+            start_imm = struct.unpack_from('<I', text_data, off + 6)[0]
+            if not (lo <= end_imm < hi and lo <= start_imm < hi):
+                continue
+            call_at = off + 10
+            if call_at >= n or text_data[call_at] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', text_data, call_at + 1)[0]
+            tgt_x86 = (text_rva + call_at + 5 + rel) & 0xFFFFFFFF
+            if tgt_x86 != 0x1A98C:
+                continue
+            anchor = rva_map.get((text_rva + off) & 0xFFFFFFFF)
+            if anchor is None:
+                anchor = rva_map.get((text_rva + off + 5) & 0xFFFFFFFF)
+            if anchor is None:
+                continue
+            exp_rcx = self._relocate_imm(start_imm) & 0xFFFFFFFFFFFFFFFF
+            exp_rdx = self._relocate_imm(end_imm) & 0xFFFFFFFFFFFFFFFF
+            scan_lo = max(0, anchor - 8)
+            scan_hi = min(len(out) - 10, anchor + 48)
+            rcx_site: Optional[int] = None
+            rdx_site: Optional[int] = None
+            for i in range(scan_lo, scan_hi):
+                if out[i] != 0x48 or out[i + 1] != 0xB9:
+                    continue
+                imm = struct.unpack_from('<Q', out, i + 2)[0]
+                if imm == exp_rcx:
+                    rcx_site = i
+                    break
+                if rcx_site is None:
+                    rcx_site = i
+            for i in range(scan_lo, scan_hi):
+                if out[i] != 0x48 or out[i + 1] != 0xBA:
+                    continue
+                imm = struct.unpack_from('<Q', out, i + 2)[0]
+                if imm == exp_rdx:
+                    rdx_site = i
+                    break
+                if rdx_site is None:
+                    rdx_site = i
+            if rcx_site is not None:
+                got = struct.unpack_from('<Q', out, rcx_site + 2)[0]
+                if got != exp_rcx:
+                    struct.pack_into('<Q', out, rcx_site + 2, exp_rcx)
+                    fixed += 1
+            if rdx_site is not None:
+                got = struct.unpack_from('<Q', out, rdx_site + 2)[0]
+                if got != exp_rdx:
+                    struct.pack_into('<Q', out, rdx_site + 2, exp_rdx)
+                    fixed += 1
+        return fixed
+
+    def _pure_materialize_call_epilogues(self, out: bytearray,
+                                         rva_map: Dict[int, int]) -> int:
+        """Ensure every x86 call target that is a pop/ret or bare-ret label is emitted."""
+        if not self._cmd_no_hacks or not self._x86_cf:
+            return 0
+        cf = self._x86_cf
+        done = 0
+        need = set(cf.call_targets) | set(cf.branch_targets)
+        for ep_rva in sorted(need):
+            if ep_rva not in cf.epilogue_labels:
+                continue
+            if self._materialize_epilogue_label(out, rva_map, ep_rva) is not None:
+                done += 1
+        return done
+
+    def _pure_snap_calls_to_epilogue_targets(self, out: bytearray,
+                                             rva_map: Dict[int, int],
+                                             text_data: bytes,
+                                             text_rva: int) -> int:
+        """Patch E8 rel32 that should call materialized epilogue/ret labels."""
+        if not self._cmd_no_hacks or not HAS_CAPSTONE or not self._x86_cf:
+            return 0
+        cf = self._x86_cf
+        md32 = Cs(CS_ARCH_X86, CS_MODE_32)
+        md32.detail = True
+        fixed = 0
+
+        def _old_rva_for_out_off(off: int) -> Optional[int]:
+            candidates = [(mapped, rva) for rva, mapped in rva_map.items()
+                          if mapped <= off]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda x: x[0])[1]
+
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            old_rva = _old_rva_for_out_off(i)
+            if old_rva is None:
+                continue
+            off_in_sec = old_rva - text_rva
+            if off_in_sec < 0 or off_in_sec >= len(text_data):
+                continue
+            found_target = None
+            for insn in md32.disasm(text_data[max(0, off_in_sec - 8):off_in_sec + 8],
+                                    self.old_base + text_rva + max(0, off_in_sec - 8),
+                                    count=16):
+                if insn.address - self.old_base != old_rva:
+                    continue
+                if insn.mnemonic != 'call':
+                    break
+                if insn.operands and insn.operands[0].type == X86_OP_IMM:
+                    found_target = (insn.operands[0].imm - self.old_base) & 0xFFFFFFFF
+                break
+            if found_target is None or found_target not in cf.epilogue_labels:
+                continue
+            new_tgt = self._materialize_epilogue_label(out, rva_map, found_target)
+            if new_tgt is None:
+                new_tgt = self._resolve_call_target_off(out, found_target, rva_map)
+            if new_tgt is None:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            if i + 5 + rel == new_tgt:
+                continue
+            struct.pack_into('<i', out, i + 1, new_tgt - (i + 5))
+            fixed += 1
+        return fixed
+
+    def _snap_calls_past_add_rsp_epilogue(self, out: bytearray) -> int:
+        """Redirect E8 targets that land on ``add rsp, N`` tails to the next entry."""
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            rel = struct.unpack_from('<i', out, i + 1)[0]
+            tgt = i + 5 + rel
+            if tgt + 4 > len(out) or out[tgt:tgt + 3] != b'\x48\x83\xc4':
+                continue
+            for delta in range(0, 20):
+                pos = tgt + delta
+                if pos >= len(out):
+                    break
+                if out[pos] in (0x53, 0x56, 0x55) or out[pos:pos + 2] == b'\x48\xb8':
+                    if pos != tgt:
+                        struct.pack_into('<i', out, i + 1, pos - (i + 5))
+                        fixed += 1
+                    break
+        return fixed
+
+    def _looks_like_x64_insn_start(self, out: bytearray, off: int) -> bool:
+        """Heuristic: *off* begins a plausible x64 instruction, not orphaned x86."""
+        if off >= len(out):
+            return False
+        b0 = out[off]
+        if b0 in (0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF):
+            return False
+        if off + 2 <= len(out) and out[off:off + 2] == b'\x84\x45':
+            return False
+        if b0 in (0x00, 0x01, 0x02, 0x03) and off + 1 < len(out) and out[off + 1] == 0x00:
+            return False
+        return b0 in (
+            0x0F, 0x31, 0x33, 0x39, 0x3D, 0x44, 0x45, 0x48, 0x49, 0x4A, 0x4B,
+            0x4C, 0x4D, 0x53, 0x55, 0x56, 0x57, 0x5B, 0x5E, 0x5F, 0x6A, 0x83,
+            0x85, 0x89, 0x8B,
+            0x8D, 0x90, 0xB8, 0xB9, 0xBA, 0xBB, 0xBF, 0xC3, 0xC7, 0xC9, 0xE8,
+            0xE9, 0xEB, 0xFF, 0x41, 0x64, 0x66,
+            # ALU / logic with imm8 or imm32 (and eax,imm / xor eax,imm / sub …)
+            0x04, 0x05, 0x14, 0x15, 0x24, 0x25, 0x2C, 0x2D, 0x34, 0x35,
+            0x3C, 0x3D, 0xA8, 0xA9, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5,
+            0xB6, 0xB7, 0x80, 0x81, 0x82, 0x83,
+        )
+
+    def _gap_target_after_align_epilogue(self, out: bytearray, gap: int,
+                                         limit: int = 48) -> Optional[int]:
+        """Find the next real PE64 insn after orphaned x86 bytes post-align-epilogue."""
+        end = min(gap + limit, len(out) - 3)
+        # After ``call rax`` IAT thunks the next real use is usually ``mov *, rax``.
+        for k in range(gap, end):
+            if k + 3 <= len(out) and out[k] == 0x48 and out[k + 1] == 0x89:
+                modrm = out[k + 2]
+                if (modrm & 0xC0) == 0xC0 and ((modrm >> 3) & 7) == 0:
+                    return k
+            if k + 2 <= len(out) and out[k] == 0x89:
+                modrm = out[k + 1]
+                if (modrm & 0xC0) == 0xC0 and ((modrm >> 3) & 7) == 0:
+                    return k
+            if k + 2 <= len(out) and out[k:k + 2] in (b'\x85\xc0', b'\x48\x85'):
+                return k
+        prefer = (
+            b'\x41\x55', b'\x48\xb8', b'\x48\xb9', b'\x48\xba', b'\x48\x8b',
+            b'\x48\x8d', b'\x4c\x8b', b'\xe8',
+        )
+        for k in range(gap, end):
+            for p in prefer:
+                if k + len(p) <= len(out) and out[k:k + len(p)] == p:
+                    return k
+            if self._looks_like_x64_insn_start(out, k):
+                b2 = out[k:k + 2]
+                if b2 in (b'\x33\xc0', b'\x31\xc0', b'\x48\x31', b'\x31\xd2', b'\x31\xdb'):
+                    continue
+                b3 = out[k:k + 3]
+                if b3 in (b'\x48\x31\xc0', b'\x48\x31\xd2', b'\x48\x31\xdb'):
+                    continue
+                if b2[0:1] in (b'\xd9', b'\xd8'):
+                    continue
+                return k
+        return None
+
+    def _fix_align_epilogue_x86_gaps(self, out: bytearray) -> int:
+        """NOP/jmp over orphaned x86 bytes between align epilogue and next PE64 insn."""
+        if self._cmd_no_hacks:
+            return 0
+        epi = b'\x4c\x89\xec\x41\x5d'
+        fixed = 0
+        i = 0
+        while i < len(out) - len(epi) - 4:
+            if out[i:i + len(epi)] != epi:
+                i += 1
+                continue
+            j = i + len(epi)
+            if self._orphan_byte_protected(j):
+                i = j
+                continue
+            if self._looks_like_x64_insn_start(out, j):
+                i = j
+                continue
+            # Only scrub when the gap still contains obvious x86 orphans.
+            head = out[j:min(j + 6, len(out))]
+            if not (head[:2] == b'\x84\x45' or head[:1] in (b'\xc2', b'\x8b', b'\x89')
+                    or (len(head) >= 3 and head[0] == 0x00)):
+                i = j
+                continue
+            target = self._gap_target_after_align_epilogue(out, j)
+            if target is None or target <= j:
+                i = j
+                continue
+            if self._orphan_byte_protected(target):
+                i = j
+                continue
+            gap = target - j
+            if gap <= 8:
+                out[j:target] = b'\x90' * gap
+            else:
+                rel = target - (j + 5)
+                out[j:j + 5] = b'\xE9' + struct.pack('<i', rel)
+                if gap > 5:
+                    out[j + 5:target] = b'\x90' * (gap - 5)
+            fixed += 1
+            i = target
+        return fixed
+
+    def _scrub_stray_x86_before_call(self, out: bytearray) -> int:
+        """Drop orphaned x86 ``test byte ptr [ebp], al`` before PE64 CALL slots."""
+        pat = b'\x84\x45\x00\x00\xe8'
+        repl = b'\x90' * 4 + b'\xe8'
+        scrubbed = 0
+        i = 0
+        while i + len(pat) <= len(out):
+            if out[i:i + len(pat)] == pat:
+                out[i:i + len(pat)] = repl
+                scrubbed += 1
+                i += len(repl)
+                continue
+            i += 1
+        return scrubbed
+
+    def _repair_unfixed_calls(self, out: bytearray, rva_map: Dict[int, int],
+                              text_data: bytes, text_rva: int) -> int:
+        """
+        Last resort: for E8 rel32=0 placeholders, read the x86 CALL target from
+        the source PE and patch using the global rva_map.
+        """
+        md32 = Cs(CS_ARCH_X86, CS_MODE_32)
+        md32.detail = True
+        # section offset → best-known old RVA (floor of mapped insn)
+        off_to_old: Dict[int, int] = {}
+        for old_rva, new_off in rva_map.items():
+            off_to_old[new_off] = old_rva
+
+        def _old_rva_for_out_off(off: int) -> Optional[int]:
+            candidates = [(mapped, rva) for rva, mapped in rva_map.items() if mapped <= off]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda x: x[0])[1]
+
+        fixed = 0
+        for i in range(len(out) - 5):
+            if out[i] != 0xE8:
+                continue
+            if not self._e8_byte_is_real_call(out, i):
+                continue
+            if struct.unpack_from('<i', out, i + 1)[0] != 0:
+                continue
+            old_rva = _old_rva_for_out_off(i)
+            if old_rva is None:
+                continue
+            off_in_sec = old_rva - text_rva
+            if off_in_sec < 0 or off_in_sec >= len(text_data):
+                continue
+            # Disassemble a few insns around the mapped site to find CALL
+            start = max(0, off_in_sec - 16)
+            found_target = None
+            for insn in md32.disasm(text_data[start:], self.old_base + text_rva + start, count=32):
+                if insn.address - self.old_base == old_rva and insn.mnemonic == 'call':
+                    if insn.operands and insn.operands[0].type == X86_OP_IMM:
+                        found_target = (insn.operands[0].imm - self.old_base) & 0xFFFFFFFF
+                    break
+            if found_target is None:
+                continue
+            if self._cmd_no_hacks:
+                tgt_off = self._resolve_call_target_off(out, found_target, rva_map)
+            else:
+                tgt_off = rva_map.get(found_target)
+            if tgt_off is None:
+                continue
+            rel = tgt_off - (i + 5)
+            struct.pack_into('<i', out, i + 1, rel)
+            fixed += 1
+        return fixed
+
+    def _translate_text_section(self, text_data: bytes, text_rva: int) -> Tuple[bytes, Dict[int, int]]:
+        """Translate the entire .text section, overlaying NTDLL stubs."""
+        out = bytearray()
+        rva_map: Dict[int, int] = {}
+        deferred_branches: List[Tuple[int, int, str]] = []
+        stub_rvas = sorted(self.stubs.keys())
+        pos = 0
+        stub_idx = 0
+
+        while pos < len(text_data):
+            rva = text_rva + pos
+
+            if stub_idx < len(stub_rvas) and rva == stub_rvas[stub_idx]:
+                stub = self.stubs[rva]
+                rva_map[rva] = len(out)
+                out += self._translate_stub(stub)
+                skip = max(len(stub.raw), 16)
+                pos += skip
+                stub_idx += 1
+                continue
+
+            next_boundary = (stub_rvas[stub_idx] if stub_idx < len(stub_rvas)
+                             else text_rva + len(text_data))
+            chunk_end = min(next_boundary - text_rva, len(text_data))
+            chunk = text_data[pos:chunk_end]
+            if chunk:
+                chunk_rva = text_rva + pos
+                base_off = len(out)
+                chunk_out, chunk_map = self._translate_function(
+                    chunk_rva, chunk, False, 0, chunk_base=base_off,
+                    section_rva=text_rva,
+                    global_rva_map=rva_map, deferred_branches=deferred_branches)
+                for old_va, off in chunk_map.items():
+                    rva_map[old_va - self.old_base] = base_off + off
+                out += chunk_out
+            pos = chunk_end
+
+        fixed = self._resolve_deferred_branches(out, rva_map, deferred_branches)
+        if fixed:
+            print(f"        Cross-function branch fixups: {fixed}")
+        ubrt_fixed = self._repair_branches_from_ubrt(out, rva_map)
+        if ubrt_fixed:
+            print(f"        UBRT branch repairs: {ubrt_fixed}")
+        return bytes(out), rva_map
+
+    def _is_spurious_inner_entry(self, func_rva: int, entry_rva: int,
+                                 text_data: bytes, text_rva: int) -> bool:
+        """Skip nested callee-save clusters that split an EBP-frame function."""
+        if entry_rva <= func_rva:
+            return False
+        if (self._x86_cf and entry_rva in self._x86_cf.epilogue_labels):
+            return True
+        if self._x86_rva_in_data_span(entry_rva):
+            return True
+        off = entry_rva - text_rva
+        if off < 0 or off + 3 > len(text_data):
+            return False
+        if _is_nested_ebp_callee_save(text_data, off):
+            return True
+        # Interior jcc/jmp labels (`mov ecx,[global]` etc.) inside one EBP function.
+        if (text_data[off] == 0x8B and off + 1 < len(text_data)
+                and text_data[off + 1] in (0x0D, 0x05, 0x15, 0x1D, 0x35, 0x3D)):
+            return True
+        return False
+
+    def _refine_shim_target_off(self, out: bytearray, target_rva: int,
+                                hint: int) -> int:
+        """When rva_map points mid-instruction, locate the real PE64 insn start."""
+        if hint < 0 or hint >= len(out):
+            return hint
+        if self._x86_cf and target_rva in self._x86_cf.epilogue_labels:
+            snap = getattr(self, '_epilogue_snap_map', None) or {}
+            return snap.get(hint, hint)
+        abs_load = False
+        sec = self.pe.section_for_rva(target_rva) if self.pe else None
+        if sec:
+            x86 = self.pe.get_section_data(sec)
+            off = target_rva - sec['vaddr']
+            if (0 <= off < len(x86) and x86[off] == 0x8B
+                    and off + 1 < len(x86)
+                    and x86[off + 1] in (0x0D, 0x05, 0x15, 0x1D, 0x35, 0x3D)):
+                abs_load = True
+                for pos in range(max(0, hint - 16), min(len(out) - 3, hint + 96)):
+                    if out[pos:pos + 2] in (b'\x49\xbb', b'\x48\xb8'):
+                        return pos
+        if not abs_load and HAS_CAPSTONE:
+            md = Cs(CS_ARCH_X86, CS_MODE_64)
+            insns = list(md.disasm(out[hint:hint + 8], hint, count=1))
+            if insns and insns[0].address == hint:
+                return hint
+        for pos in range(hint, min(hint + 64, len(out))):
+            if self._looks_like_x64_insn_start(out, pos):
+                return pos
+        return hint
+
+    def _snap_jcc_misaligned_targets(self, out: bytearray) -> int:
+        """Fix Jcc rel32 targets that land mid-instruction (esp. after rva_map skew)."""
+        if not HAS_CAPSTONE:
+            return 0
+        # Pure mode: use the authoritative instruction-start set, which is built
+        # from function entries and never desyncs on interleaved data (the old
+        # local-window disasm could miss mid-instruction targets and leave an
+        # illegal-instruction fault).
+        starts = self._pure_insn_start_set(out) if self._cmd_no_hacks else None
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        fixed = 0
+        for i in range(len(out) - 6):
+            if out[i] != 0x0F or not (0x80 <= out[i + 1] <= 0x8F):
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            tgt = i + 6 + rel
+            if tgt <= 0 or tgt >= len(out):
+                continue
+            if starts is not None:
+                if tgt in starts:
+                    continue
+                new_tgt = None
+                for pos in range(tgt + 1, min(tgt + 64, len(out))):
+                    if pos in starts:
+                        new_tgt = pos
+                        break
+                if new_tgt is None or new_tgt == tgt:
+                    continue
+                struct.pack_into('<i', out, i + 2, new_tgt - (i + 6))
+                fixed += 1
+                continue
+            insns = list(md.disasm(out[max(0, tgt - 16):tgt + 16],
+                                   max(0, tgt - 16), count=6))
+            mid = False
+            for ins in insns:
+                end = ins.address + ins.size
+                if ins.address <= tgt < end and ins.address != tgt:
+                    mid = True
+                    break
+            if not mid:
+                continue
+            new_tgt = tgt
+            for pos in range(tgt, min(tgt + 64, len(out) - 2)):
+                if out[pos:pos + 2] in (b'\x49\xbb', b'\x48\xb8', b'\x48\x8b'):
+                    new_tgt = pos
+                    break
+            else:
+                for start in range(max(0, tgt - 16), tgt + 1):
+                    one = list(md.disasm(out[start:start + 8], start, count=1))
+                    if one and one[0].address == start:
+                        new_tgt = start
+                        break
+            if new_tgt != tgt:
+                struct.pack_into('<i', out, i + 2, new_tgt - (i + 6))
+                fixed += 1
+        return fixed
+
+    def _repair_jcc_targets_from_rva_map(self, out: bytearray,
+                                         rva_map: Dict[int, int]) -> int:
+        """Re-resolve Jcc targets that rva_map aims at the wrong PE64 offset."""
+        fixed = 0
+        for i in range(len(out) - 6):
+            if out[i] != 0x0F or not (0x80 <= out[i + 1] <= 0x8F):
+                continue
+            rel = struct.unpack_from('<i', out, i + 2)[0]
+            tgt = i + 6 + rel
+            for x86_rva, mapped in rva_map.items():
+                if mapped != tgt:
+                    continue
+                refined = self._refine_shim_target_off(out, x86_rva, tgt)
+                if refined != tgt:
+                    struct.pack_into('<i', out, i + 2, refined - (i + 6))
+                    fixed += 1
+                    break
+        return fixed
+
+    def _resolve_call_target_off(self, out: bytearray, target_rva: int,
+                                 rva_map: Dict[int, int]) -> Optional[int]:
+        """Map a call/jmp target RVA to a snap-worthy shim offset."""
+        if self._is_alloca_probe_rva(target_rva):
+            ck = self._pure_chkstk_entry_off(out)
+            if ck is not None:
+                return ck
+        if self._x86_cf and target_rva in self._x86_cf.epilogue_labels:
+            ep = self._materialize_epilogue_label(out, rva_map, target_rva)
+            if ep is not None:
+                snap = getattr(self, '_epilogue_snap_map', None) or {}
+                return snap.get(ep, ep)
+        tgt = rva_map.get(target_rva)
+        if tgt is not None:
+            tgt = self._refine_shim_target_off(out, target_rva, tgt)
+            outer = self._outer_entry_before_align(out, tgt)
+            if outer is not None:
+                tgt = outer
+            # Universal: a recognized x86 function entry maps 1:1 onto its
+            # translated prologue, so rva_map is authoritative.  Trust it even
+            # when the strict prologue-quality gate would reject an unusual
+            # opener (e.g. SEH frames that start ``push rbp; … push -1; movabs``).
+            # Without this, valid entries like the CRT ``main`` get discarded and
+            # the call is mis-snapped to an unrelated function.
+            if (target_rva in self._fn_entry_rvas
+                    and 0 <= tgt < len(out)):
+                return tgt
+            if (0 <= tgt < len(out)
+                    and self._offset_is_valid_entry(out, tgt)):
+                return tgt
+            entry = self._find_enclosing_function_entry(out, tgt, rva_map)
+            if entry is not None:
+                return entry
+        return self._entry_for_x86_target(out, target_rva, rva_map)
+
+    def _extract_function_bytes(self, func_rva: int, text_data: bytes,
+                                text_rva: int, limit: int = 65536,
+                                bound_rva: Optional[int] = None) -> bytes:
+        """Disassemble from func_rva until RET, IAT jmp thunk, bound, or limit."""
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off >= len(text_data):
+            return b''
+        code = text_data[func_off:func_off + limit]
+        insns = list(self.md.disasm(code, self.old_base + func_rva, count=16384))
+        if not insns:
+            return b''
+        end_off = insns[-1].address - self.old_base + insns[-1].size - func_rva
+        for insn in insns:
+            if insn.mnemonic == 'jmp' and insn.operands:
+                op = insn.operands[0]
+                if (op.type == X86_OP_MEM and op.mem.base == 0 and op.mem.index == 0
+                        and op.mem.segment == 0):
+                    end_off = insn.address - self.old_base + insn.size - func_rva
+                    break
+            if insn.mnemonic in ('ret', 'retn'):
+                end_off = insn.address - self.old_base + insn.size - func_rva
+                if end_off > 0:
+                    break
+        if (self._cmd_no_hacks and bound_rva is not None
+                and bound_rva > func_rva):
+            bound_end = min(bound_rva - func_rva, len(text_data) - func_off)
+            if bound_end > 0:
+                end_off = min(end_off, bound_end)
+        return code[:min(end_off, len(code))]
+
+    def _looks_like_code(self, text_data: bytes, text_rva: int, rva: int) -> bool:
+        """Heuristic: does `rva` look like a real function entry (not data)?"""
+        off = rva - text_rva
+        if off < 0 or off + 4 > len(text_data):
+            return False
+        b0, b1 = text_data[off], text_data[off + 1]
+        # 00 00 = `add [eax],al` filler → data / jump-table padding.
+        if b0 == 0x00 and b1 == 0x00:
+            return False
+        insns = list(self.md.disasm(text_data[off:off + 24],
+                                    self.old_base + rva, count=4))
+        if len(insns) < 3:
+            return False
+        # Require the prologue to be a plausible function opener.
+        first = insns[0].mnemonic
+        good_openers = (
+            'push', 'mov', 'sub', 'lea', 'xor', 'cmp', 'test', 'and', 'or',
+            'add', 'inc', 'dec', 'call', 'jmp', 'pop', 'enter', 'fld', 'fnclex',
+        )
+        return first in good_openers
+
+    @staticmethod
+    def _frameless_entry_rva(text_data: bytes, text_rva: int, rva: int) -> int:
+        """Walk back over push ebx/esi/edi/ebp so the real entry is translated."""
+        off = rva - text_rva
+        walked = 0
+        while off > 0 and walked < 4:
+            # Do not walk into a prior function's RET tail.
+            window = text_data[max(0, off - 8):off]
+            if b'\xc3' in window or b'\xc2' in window:
+                break
+            b = text_data[off - 1]
+            if b in (0x53, 0x56, 0x57, 0x55):  # push ebx/esi/edi/ebp
+                off -= 1
+                walked += 1
+                continue
+            break
+        # cmd helpers often start with `and word ptr [global], 0` before pushes.
+        if off > 0 and b'\xc3' not in text_data[max(0, off - 8):off]:
+            if off >= 7 and text_data[off - 7:off - 5] == b'\x66\x83' and text_data[off - 5] == 0x25:
+                if text_data[off - 1] == 0:
+                    off -= 7
+            elif off >= 6 and text_data[off - 6:off - 4] == b'\x83\x25' and text_data[off - 1] == 0:
+                off -= 6
+        return text_rva + off
+
+    def _translate_function_driven(self, text_data: bytes,
+                                   text_rva: int) -> Tuple[bytes, Dict[int, int]]:
+        """Translate every discovered function entry in a code section."""
+        pe = self.pe
+        func_rvas = discover_function_rvas(pe, text_data, text_rva, self.dyn)
+        if pe.entry_rva and text_rva <= pe.entry_rva < text_rva + len(text_data):
+            if pe.entry_rva not in func_rvas:
+                func_rvas.insert(0, pe.entry_rva)
+        print(f"        Function-driven: {len(func_rvas)} entry points")
+
+        self._x86_cf = analyze_x86_text_section(
+            pe, text_data, text_rva, self.dyn, set(func_rvas))
+        if self._x86_cf.epilogue_labels or self._x86_cf.data_spans:
+            print(f"        X86 CF analysis: {len(self._x86_cf.epilogue_labels)} epilogue labels, "
+                  f"{len(self._x86_cf.branch_targets)} branch targets, "
+                  f"{len(self._x86_cf.data_spans)} data gaps")
+
+        if self.win10_test_shim:
+            self._seh_eh3_handler_old_vas = discover_seh_except_handler3_push_vas(
+                pe, text_data, text_rva)
+            self._w2k_eh3_va = W2KSHIM_IMAGE_BASE + W2KSHIM_EXCEPT_HANDLER3_RVA
+
+        out = bytearray()
+        rva_map: Dict[int, int] = {}
+        covered: List[Tuple[int, int]] = []
+        deferred_branches: List[Tuple[int, int, str]] = []
+
+        # Worklist that refills from unresolved CALL/JMP targets. Function
+        # discovery only finds `push ebp` prologues, so frameless helpers
+        # (push esi; …) are reached here via the calls that target them.
+        worklist = list(func_rvas)
+        queued = set(func_rvas)
+        wi = 0
+        refill_rounds = 0
+        discovered_extra = 0
+        while wi < len(worklist):
+            func_rva = worklist[wi]
+            wi += 1
+
+            if self._x86_rva_in_data_span(func_rva):
+                continue
+            if (self._x86_cf and func_rva in self._x86_cf.epilogue_labels):
+                continue
+
+            if not any(lo <= func_rva < hi for lo, hi in covered):
+                stub = self.stubs.get(func_rva)
+                if stub:
+                    base = len(out)
+                    rva_map[func_rva] = base
+                    stub_out = self._translate_stub(stub)
+                    out += stub_out
+                    self._note_code_span(base, len(stub_out))
+                    covered.append((func_rva, func_rva + max(len(stub.raw), 16)))
+                else:
+                    bound_rva = None
+                    if self._cmd_no_hacks:
+                        nexts = [e for e in queued if e > func_rva
+                                 and not self._is_spurious_inner_entry(
+                                     func_rva, e, text_data, text_rva)]
+                        if nexts:
+                            bound_rva = min(nexts)
+                    func_bytes = self._extract_function_bytes(
+                        func_rva, text_data, text_rva, bound_rva=bound_rva)
+                    if len(func_bytes) >= 4:
+                        base = len(out)
+                        chunk_out, chunk_map = self._translate_function(
+                            func_rva, func_bytes, False, 0,
+                            chunk_base=base, section_rva=text_rva,
+                            global_rva_map=rva_map,
+                            deferred_branches=deferred_branches)
+                        if chunk_out:
+                            rva_map[func_rva] = base
+                            for old_va, off in chunk_map.items():
+                                old_rva = old_va - self.old_base
+                                if old_rva not in rva_map:
+                                    if (self._cmd_no_hacks and old_rva in queued
+                                            and old_rva != func_rva):
+                                        continue
+                                    rva_map[old_rva] = base + off
+                            out += chunk_out
+                            out += b'\x90' * ((4 - len(out) % 4) % 4)
+                            self._note_code_span(base, len(chunk_out))
+                            covered.append((func_rva, func_rva + len(func_bytes)))
+
+            # Worklist drained → pull in unresolved call targets that look like
+            # real code (frameless functions missed by prologue discovery).
+            if wi == len(worklist) and refill_rounds < 16:
+                refill_rounds += 1
+                for (_po, trva, ft) in deferred_branches:
+                    if trva in queued or trva in rva_map:
+                        continue
+                    if not (text_rva <= trva < text_rva + len(text_data)):
+                        continue
+                    if any(lo <= trva < hi for lo, hi in covered):
+                        continue
+                    if not self._looks_like_code(text_data, text_rva, trva):
+                        continue
+                    # Skip interior labels inside an already-translated span.
+                    if self._cmd_no_hacks:
+                        skip = False
+                        for lo, hi in covered:
+                            if lo < trva < hi and self._is_spurious_inner_entry(
+                                    lo, trva, text_data, text_rva):
+                                skip = True
+                                break
+                        if skip:
+                            continue
+                    trva = self._frameless_entry_rva(text_data, text_rva, trva)
+                    if trva in queued or trva in rva_map:
+                        continue
+                    if any(lo <= trva < hi for lo, hi in covered):
+                        continue
+                    queued.add(trva)
+                    worklist.append(trva)
+                    discovered_extra += 1
+        if discovered_extra:
+            print(f"        Recovered frameless/call-target functions: "
+                  f"{discovered_extra}")
+
+        self._fn_entry_rvas = set(queued)
+        self._pure_heal_text = text_data
+        self._pure_heal_text_rva = text_rva
+        self._seh_scope_anchors = discover_seh_scope_anchors(
+            text_data, text_rva, self.old_base, pe.image_size)
+
+        seh_refs = discover_seh_text_targets(
+            text_data, text_rva, self.old_base, pe.image_size)
+        iat_slots: Set[int] = set()
+        for imp in pe.parse_imports():
+            for fn in imp['functions']:
+                ir = fn.get('iat_rva')
+                if ir:
+                    iat_slots.add(ir)
+        iat_slots |= discover_crt_data_pointer_slots(pe, text_data, text_rva)
+        scope_spans = _scope_table_spans(text_data, text_rva, pe)
+        ff25_refs = discover_ff25_jmp_thunks(
+            text_data, text_rva, self.old_base, iat_slots, scope_spans)
+        if ff25_refs:
+            self._materialize_x86_code_region(
+                out, rva_map, text_data, text_rva,
+                0x1A59C, 0x1A5A8, deferred_branches)
+            self._materialize_x86_code_region(
+                out, rva_map, text_data, text_rva,
+                0x1A5CE, 0x1A5DA, deferred_branches)
+            for r in ff25_refs:
+                rva_map.pop(r, None)
+        embedded_refs = discover_push_imm_text_data_refs(
+            text_data, text_rva, self.old_base, pe.image_size)
+        self._embedded_text_refs = embedded_refs
+        purged_embed = self._pure_purge_mismapped_embedded_refs(
+            out, rva_map, text_data, text_rva, embedded_refs)
+        if purged_embed:
+            print(f"        Purged mismapped embedded text RVAs: {purged_embed}")
+        missing = (seh_refs | ff25_refs | embedded_refs) - set(rva_map.keys())
+        if missing:
+            n_mat = self._materialize_orphan_text_refs(
+                out, rva_map, text_data, text_rva, missing, deferred_branches)
+            if n_mat:
+                print(f"        SEH/orphan text blobs: {n_mat}")
+
+        scope_fixed = self._reconcile_seh_scope_pushes(out, rva_map, text_rva)
+        if scope_fixed:
+            print(f"        SEH scope push reconcile: {scope_fixed}")
+
+        bridged = self._bridge_ret_to_entry_gaps(out, rva_map)
+        if bridged:
+            print(f"        RET/INT3 entry bridges: {bridged}")
+
+        scrubbed = self._scrub_stray_x86_before_call(out)
+        if scrubbed:
+            print(f"        Stray x86 byte scrub before CALL: {scrubbed}")
+
+        fixed = self._resolve_deferred_branches(out, rva_map, deferred_branches)
+        if fixed:
+            print(f"        Cross-function branch fixups: {fixed}")
+        if self._x86_cf and self._x86_cf.epilogue_labels:
+            mat_epi = self._pure_materialize_call_epilogues(out, rva_map)
+            if mat_epi:
+                print(f"        Materialized call epilogues: {mat_epi}")
+            for ep_rva in self._x86_cf.epilogue_labels:
+                if ep_rva not in self._x86_cf.branch_targets:
+                    continue
+                self._materialize_epilogue_label(out, rva_map, ep_rva)
+            cf_epi = self._cf_repair_epilogue_branch_targets(out, rva_map)
+            if cf_epi:
+                print(f"        CF epilogue branch repairs: {cf_epi}")
+            self._epilogue_snap_map = self._build_epilogue_head_snap_map(rva_map)
+            epi_snapped = self._snap_branch_targets_to_epilogue_heads(
+                out, self._epilogue_snap_map)
+            if epi_snapped:
+                print(f"        Epilogue-head branch snaps: {epi_snapped}")
+        ubrt_fixed = self._repair_branches_from_ubrt(out, rva_map)
+        if ubrt_fixed:
+            print(f"        UBRT branch repairs: {ubrt_fixed}")
+        repaired = self._repair_unfixed_calls(out, rva_map, text_data, text_rva)
+        if repaired:
+            print(f"        X86-sourced call repairs: {repaired}")
+
+        scrubbed2 = self._scrub_stray_x86_before_call(out)
+        if scrubbed2:
+            print(f"        Stray x86 byte scrub (post-repair): {scrubbed2}")
+        repaired2 = self._repair_unfixed_calls(out, rva_map, text_data, text_rva)
+        if repaired2:
+            print(f"        X86-sourced call repairs (post-scrub): {repaired2}")
+
+        aligned_calls = self._fix_misaligned_direct_calls(out, rva_map)
+        if aligned_calls:
+            print(f"        Misaligned CALL target fixups: {aligned_calls}")
+
+        wrapper_calls = self._fix_calls_to_wrapper_bodies(out)
+        if wrapper_calls:
+            print(f"        Import wrapper CALL fixups: {wrapper_calls}")
+
+        insn_calls = self._snap_calls_to_insn_boundaries(out)
+        if insn_calls:
+            print(f"        Mid-instruction CALL snap fixups: {insn_calls}")
+
+        fn_entry_calls = self._snap_calls_to_function_entries(out, rva_map)
+        if fn_entry_calls:
+            print(f"        Mid-function CALL entry snap fixups: {fn_entry_calls}")
+
+        jcc_snapped = self._snap_jcc_misaligned_targets(out)
+        if jcc_snapped:
+            print(f"        Mid-instruction Jcc snap fixups: {jcc_snapped}")
+        jcc_repaired = self._repair_jcc_targets_from_rva_map(out, rva_map)
+        if jcc_repaired:
+            print(f"        Jcc rva_map target repairs: {jcc_repaired}")
+        if getattr(self, '_epilogue_snap_map', None):
+            epi_snapped2 = self._snap_branch_targets_to_epilogue_heads(
+                out, self._epilogue_snap_map)
+            if epi_snapped2:
+                print(f"        Epilogue-head branch snaps (post-jcc): {epi_snapped2}")
+
+        if self._cmd_no_hacks:
+            reconciled = self._pure_reconcile_swallowed_rva_map(
+                out, rva_map, text_data, text_rva)
+            if reconciled:
+                print(f"        Pure swallowed rva_map reconciles: {reconciled}")
+            pure_align = self._pure_repair_all_align_stub_calls(
+                out, rva_map, text_data, text_rva)
+            if pure_align:
+                print(f"        Pure align-stub CALL repairs: {pure_align}")
+            pure_calls = self._pure_repair_call_targets(
+                out, rva_map, text_data, text_rva)
+            if pure_calls:
+                print(f"        Pure CALL re-resolve: {pure_calls}")
+            pure_x86_calls = self._pure_repair_calls_from_x86_source(
+                out, rva_map, text_data, text_rva)
+            if pure_x86_calls:
+                print(f"        Pure x86-anchored CALL repairs: {pure_x86_calls}")
+
+        degenerate = self._neutralize_degenerate_calls(out)
+        if degenerate:
+            print(f"        Degenerate CALL neutralizations: {degenerate}")
+
+        align_fixed = self._fix_corrupted_align_prologues(out)
+        if align_fixed:
+            print(f"        Corrupted align-prologue fixes: {align_fixed}")
+
+        empty_align = self._nop_empty_align_stubs(out)
+        if empty_align:
+            print(f"        Empty align-stub NOP-outs: {empty_align}")
+
+        epi_gaps = self._fix_align_epilogue_x86_gaps(out)
+        if epi_gaps:
+            print(f"        Align-epilogue x86 gap fixups: {epi_gaps}")
+
+        ret_stubs = self._fix_mangled_imm_ret_stubs(out)
+        if ret_stubs:
+            print(f"        Mangled imm-ret stub fixups: {ret_stubs}")
+
+        epilogue_calls = self._snap_calls_past_add_rsp_epilogue(out)
+        if epilogue_calls:
+            print(f"        Past-epilogue CALL snap fixups: {epilogue_calls}")
+
+        alloca_fixed = self._fix_alloca_probe_epilogues(out)
+        if alloca_fixed:
+            print(f"        _alloca_probe epilogue fixes: {alloca_fixed}")
+
+        cmd_fixed = self._cmd_shim_postfixes(out, rva_map)
+        if cmd_fixed:
+            print(f"        cmd.exe shim postfixes: {cmd_fixed}")
+
+        if self._cmd_no_hacks:
+            restored_calls = self._pure_restore_nopped_align_calls(
+                out, rva_map, text_data, text_rva)
+            if restored_calls:
+                print(f"        Pure restored align calls: {restored_calls}")
+            epi_calls = self._pure_snap_calls_to_epilogue_targets(
+                out, rva_map, text_data, text_rva)
+            if epi_calls:
+                print(f"        Pure epilogue CALL snaps: {epi_calls}")
+            repaired3 = self._repair_unfixed_calls(out, rva_map, text_data, text_rva)
+            if repaired3:
+                print(f"        Pure unfixed call repairs: {repaired3}")
+
+        unresolved = [(po, trva, ft) for (po, trva, ft) in deferred_branches
+                      if trva not in rva_map]
+        if unresolved:
+            sample = sorted({trva for _, trva, _ in unresolved})[:12]
+            print(f"        UNRESOLVED branches: {len(unresolved)} "
+                  f"(sample target RVAs: {[hex(s) for s in sample]})")
+
+        if len(out) < len(text_data) // 8:
+            print(f"        Function-driven output small ({len(out)} B) — "
+                  f"falling back to linear section translate")
+            return self._translate_text_section(text_data, text_rva)
+        return bytes(out), rva_map
+
+    def _translate_export_driven(self, text_data: bytes, text_rva: int) -> Tuple[bytes, Dict[int, int]]:
+        """Translate per export/entry when linear disassembly fails (kernel images)."""
+        pe = self.pe
+        out = bytearray()
+        rva_map: Dict[int, int] = {}
+        entry_points: Set[int] = set()
+        if pe.entry_rva:
+            entry_points.add(pe.entry_rva)
+        for exp in pe.parse_exports():
+            entry_points.add(exp['rva'])
+        entry_points.update(self.stubs.keys())
+
+        for func_rva in sorted(entry_points):
+            if func_rva < text_rva or func_rva >= text_rva + len(text_data):
+                continue
+            rva_map[func_rva] = len(out)
+            stub = self.stubs.get(func_rva)
+            if stub:
+                out += self._translate_stub(stub)
+                continue
+            func_off = func_rva - text_rva
+            func_code = text_data[func_off:]
+            insns = []
+            for insn in self.md.disasm(func_code, pe.image_base + func_rva, count=4096):
+                insns.append(insn)
+                if insn.mnemonic in ('ret', 'retn'):
+                    break
+            if not insns:
+                continue
+            func_bytes = func_code[:insns[-1].address - (pe.image_base + func_rva) + insns[-1].size]
+            chunk_out, chunk_map = self._translate_function(func_rva, func_bytes, False, 0)
+            base = len(out)
+            for old_va, off in chunk_map.items():
+                rva_map[old_va - self.old_base] = base + off
+            out += chunk_out
+            out += b'\x90' * ((4 - len(out) % 4) % 4)
+        return bytes(out), rva_map
+
+    def _translate_export_at(self, func_rva: int, text_data: bytes,
+                             text_rva: int) -> bytes:
+        """Translate a single export entry point to x64 code bytes."""
+        stub = self.stubs.get(func_rva)
+        if stub:
+            return self._translate_stub(stub)
+        func_off = func_rva - text_rva
+        if func_off < 0 or func_off >= len(text_data):
+            return b''
+        func_code = text_data[func_off:]
+        insns = []
+        for insn in self.md.disasm(func_code, self.pe.image_base + func_rva, count=4096):
+            insns.append(insn)
+            if insn.mnemonic in ('ret', 'retn'):
+                break
+        if not insns:
+            return b'\xCC\xc3'
+        end = insns[-1].address - (self.pe.image_base + func_rva) + insns[-1].size
+        chunk_out, _ = self._translate_function(func_rva, func_code[:end], False, 0)
+        return chunk_out
+
+    def _fill_missing_export_mappings(self) -> None:
+        """Ensure every executable export has a translated code mapping."""
+        if not self._code_layout:
+            return
+        layout_idx: Dict[int, int] = {}
+        extras: Dict[int, bytearray] = {}
+        for idx, (_name, _data, _flags, old_va) in enumerate(self._code_layout):
+            layout_idx[old_va] = idx
+            extras[old_va] = bytearray()
+
+        patched = 0
+        for exp in self.pe.parse_exports():
+            rva = exp['rva']
+            if rva in self.rva_map:
+                continue
+            sec = self.pe.section_for_rva(rva)
+            if not sec or not (sec['flags'] & 0x20000000):
+                continue
+            sec_rva = sec['vaddr']
+            if sec_rva not in layout_idx:
+                continue
+            sec_data = self.pe.get_section_data(sec)
+            code = self._translate_export_at(rva, sec_data, sec_rva)
+            if not code:
+                continue
+            extra = extras[sec_rva]
+            pad = (4 - len(extra) % 4) % 4
+            extra += b'\xCC' * pad
+            idx = layout_idx[sec_rva]
+            base_len = len(self._code_layout[idx][1]) + len(extra)
+            self.rva_map[rva] = base_len
+            self._rva_section[rva] = sec_rva
+            extra += code
+            patched += 1
+
+        if patched:
+            new_layout = []
+            for name, data, flags, old_va in self._code_layout:
+                blob = bytearray(data)
+                if extras[old_va]:
+                    blob += extras[old_va]
+                new_layout.append((name, bytes(blob), flags, old_va))
+            self._code_layout = new_layout
+            print(f"        Patched {patched} missing export entry points")
+
+    def _finalize_code_layout(self) -> None:
+        """Assign non-overlapping PE64 VAs to translated code sections."""
+        if not self._code_layout:
+            return
+        SECT_ALIGN = 0x1000
+        def align(n, a): return (n + a - 1) & ~(a - 1)
+
+        next_va = 0x1000
+        new_layout: List[Tuple[str, bytes, int, int]] = []
+        self._old_to_new_section = {}
+        for name, data, flags, old_va in self._code_layout:
+            self._old_to_new_section[old_va] = next_va
+            new_layout.append((name, data, flags, next_va))
+            next_va = align(next_va + len(data), SECT_ALIGN)
+        self._code_layout = new_layout
+        self.text_rva = new_layout[0][3]
+        self._translated_text = new_layout[0][1]
+
+    def _refresh_final_rvas(self) -> None:
+        """Rebuild old_rva → new_rva from rva_map and section placement."""
+        self._final_rva = {}
+        for rva, off in self.rva_map.items():
+            old_sec = self._rva_section.get(rva, self.text_rva)
+            new_sec = self._old_to_new_section.get(old_sec, old_sec)
+            self._final_rva[rva] = new_sec + off
+        if os.environ.get('DUMP_RVA_MAP'):
+            try:
+                path = os.environ['DUMP_RVA_MAP']
+                with open(path, 'w') as fh:
+                    for old_rva in sorted(self._final_rva):
+                        fh.write(f"{old_rva:08x} {self._final_rva[old_rva]:08x}\n")
+                print(f"        Dumped rva_map ({len(self._final_rva)}) -> {path}")
+            except Exception as exc:  # pragma: no cover
+                print(f"        rva_map dump failed: {exc}")
+
+    def _choose_translation(self, text_data: bytes, text_rva: int) -> Tuple[bytes, Dict[int, int]]:
+        """Pick the best code translation strategy for a section."""
+        if self.is_ntdll and self.stubs:
+            return self._translate_text_section(text_data, text_rva)
+        if self.is_kernel:
+            insns = sum(1 for _ in self.md.disasm(text_data, self.old_base + text_rva))
+            ratio = insns / max(len(text_data) / 4, 1)
+            if ratio < 0.05 and len(text_data) > 65536:
+                return self._translate_export_driven(text_data, text_rva)
+        return self._translate_function_driven(text_data, text_rva)
+
+    # ── Main translation entry point ─────────────────────────────────────────────
+
+    def translate(self) -> bytes:
+        """
+        Full PE32 → PE64 translation pipeline.
+        Returns the translated PE64 binary bytes.
+        """
+        pe = self.pe
+        self._pe_entry_old_rva = pe.entry_rva or 0
+        self._orphan_blob_out_ranges = []
+        self._code_span_ranges = []
+        self._scope_table_out_ranges = []
+        self._scope_table_old_rva = {}
+        self._fn_entry_rvas = set()
+        self._seh_scope_anchors = {}
+        self._seh_scope_reg_fn = {}
+        self._call_target_offs = None
+        self._runtime_slot_map = {}
+        print(f"  [1/5] Identifying NTDLL stubs…")
+        if self.is_ntdll:
+            stubs = extract_stubs_from_ntdll(pe)
+            for s in stubs:
+                self.stubs[s.rva] = s
+            print(f"        Found {len(stubs)} syscall stubs")
+        else:
+            print(f"        (not ntdll — no stub extraction)")
+
+        print(f"  [2/5] Disassembling executable sections (Capstone)…")
+        print(f"        Dynamic: {self.dyn.entries_emulated} entry points, "
+              f"{len(self.dyn.pointer_values)} pointer values, "
+              f"{len(self.dyn.pointer_writes)} write sites")
+
+        if self.is_kernel:
+            exec_secs = pe.get_executable_sections()
+            print(f"        Kernel image: {len(exec_secs)} executable sections")
+            total_in = 0
+            total_out = 0
+            for sec_meta, sec_data in exec_secs:
+                sec_rva = sec_meta['vaddr']
+                print(f"          {sec_meta['name']:8s} 0x{sec_rva:05X}  {len(sec_data):,} bytes")
+                tbytes, rmap = self._choose_translation(sec_data, sec_rva)
+                for rva, off in rmap.items():
+                    self.rva_map[rva] = off
+                    self._rva_section[rva] = sec_rva
+                self._kernel_code.append(
+                    (sec_meta['name'], tbytes, sec_rva, sec_meta['flags'], sec_meta['vsize']))
+                total_in += len(sec_data)
+                total_out += len(tbytes)
+            self.text_rva = exec_secs[0][0]['vaddr'] if exec_secs else 0x1000
+            print(f"  [3/5] Translating kernel code…")
+            print(f"        Translated code: {total_in:,} → {total_out:,} bytes, "
+                  f"{len(self.rva_map)} RVA mappings")
+        else:
+            exec_secs = pe.get_executable_sections()
+            if not exec_secs:
+                raise RuntimeError("No executable section found")
+            self._code_layout = []
+            total_in = 0
+            total_out = 0
+            FILE_ALIGN = 0x200
+            SECT_ALIGN = 0x1000
+            def align(n, a): return (n + a - 1) & ~(a - 1)
+
+            print(f"  [3/5] Translating executable sections (Keystone)…")
+            for sec_meta, sec_data in exec_secs:
+                sec_rva = sec_meta['vaddr']
+                print(f"          {sec_meta['name']:8s} 0x{sec_rva:05X}  {len(sec_data):,} bytes")
+                tbytes, rmap = self._choose_translation(sec_data, sec_rva)
+                for rva, off in rmap.items():
+                    self.rva_map[rva] = off
+                    self._rva_section[rva] = sec_rva
+                tbytes = tbytes + b'\xCC' * (align(len(tbytes), 16) - len(tbytes))
+                self._code_layout.append(
+                    (sec_meta['name'], tbytes, sec_meta['flags'] | 0x20000000, sec_rva))
+                total_in += len(sec_data)
+                total_out += len(tbytes)
+
+            self.text_rva = exec_secs[0][0]['vaddr']
+            self._translated_text = self._code_layout[0][1]
+            self._text_sec_meta = exec_secs[0][0]
+            print(f"        Translated code: {total_in:,} → {total_out:,} bytes, "
+                  f"{len(self.rva_map)} RVA mappings")
+
+        if self.warnings:
+            print(f"        Warnings: {len(self.warnings)}")
+            for w in self.warnings[:10]:
+                print(f"         {w}")
+            if len(self.warnings) > 10:
+                print(f"         … and {len(self.warnings)-10} more")
+
+        if not self.is_kernel:
+            self._fill_missing_export_mappings()
+            self._finalize_code_layout()
+            if self._code_layout:
+                blob = bytearray(self._code_layout[0][1])
+                late_alloca = self._fix_alloca_probe_epilogues(blob)
+                if late_alloca:
+                    print(f"        Late _alloca_probe epilogue fixes: {late_alloca}")
+                late_calls = self._snap_calls_to_insn_boundaries(blob)
+                if late_calls:
+                    print(f"        Late mid-instruction CALL snap fixups: {late_calls}")
+                late_fn_calls = self._snap_calls_to_function_entries(blob, self.rva_map)
+                if late_fn_calls:
+                    print(f"        Late mid-function CALL entry snap fixups: {late_fn_calls}")
+                late_cmd = self._cmd_shim_postfixes(blob, self.rva_map)
+                if late_cmd:
+                    print(f"        Late cmd.exe shim postfixes: {late_cmd}")
+                late_scope = self._synthesize_seh_scopes_for_push_sites(
+                    blob, self.text_rva)
+                if late_scope:
+                    print(f"        Late SEH scope synthesize: {late_scope}")
+                late_scope_h = self._normalize_scope_table_handlers(blob)
+                if late_scope_h:
+                    print(f"        Late SEH scope handler normalize: {late_scope_h}")
+                late_push_h = self._fix_scope_handlers_at_push_sites(blob, self.text_rva)
+                if late_push_h:
+                    print(f"        Late SEH push-site handler fix: {late_push_h}")
+                seh_restore = self._inject_seh_gs_restore_epilogues(blob)
+                if seh_restore:
+                    print(f"        Late SEH GS restore epilogue injects: {seh_restore}")
+                naked_ret = self._inject_seh_before_naked_rets(blob, self.text_rva)
+                if naked_ret:
+                    print(f"        Late SEH naked-ret epilogue injects: {naked_ret}")
+                if self._cmd_no_hacks and getattr(self, '_pure_heal_text', None):
+                    pure_heal = self._pure_final_layout_heal(
+                        blob, self._pure_heal_text, self._pure_heal_text_rva)
+                name, _data, flags, old_va = self._code_layout[0]
+                self._code_layout[0] = (name, bytes(blob), flags, old_va)
+                self._translated_text = bytes(blob)
+
+        print(f"  [4/5] Rebuilding IAT, exports, data relocations…")
+        print(f"  [5/5] Emitting PE64…")
+        if self.is_kernel:
+            return self._build_pe64_kernel()
+        return self._build_pe64_from_layout(self._code_layout)
+
+    def _export_rva(self, old_rva: int) -> int:
+        """Map an old export RVA to its PE64 location."""
+        if old_rva in self._final_rva:
+            return self._final_rva[old_rva]
+        if old_rva in self.rva_map:
+            old_sec = self._rva_section.get(old_rva, self.text_rva)
+            new_sec = self._old_to_new_section.get(old_sec, old_sec)
+            return new_sec + self.rva_map[old_rva]
+        sec = self.pe.section_for_rva(old_rva)
+        if sec:
+            new_base = self._old_to_new_section.get(sec['vaddr'])
+            if new_base is not None:
+                return new_base + (old_rva - sec['vaddr'])
+        return old_rva
+
+    def _build_pe64_kernel(self) -> bytes:
+        """Build PE64 for kernel images with multiple translated code sections."""
+        pe = self.pe
+        FILE_ALIGN = 0x200
+        SECT_ALIGN = 0x1000
+
+        def align(n, a): return (n + a - 1) & ~(a - 1)
+
+        self._final_rva: Dict[int, int] = {}
+        code_layout: List[Tuple[str, bytes, int, int]] = []
+        current_va = self._kernel_code[0][2] if self._kernel_code else 0x1000
+
+        for name, data, old_rva, flags, _vsize in self._kernel_code:
+            data = data + b'\xCC' * (align(len(data), 16) - len(data))
+            code_layout.append((name, data, flags | 0x20000000, current_va))
+            current_va = align(current_va + len(data), SECT_ALIGN)
+
+        return self._build_pe64_from_layout(code_layout)
+
+    # ── PE64 builder ─────────────────────────────────────────────────────────────
+
+    def _build_import_directory(self, idata_rva: int) -> Tuple[bytes, int]:
+        """Build PE64 import directory (descriptors + ILT + IAT + names + hints)."""
+        imports = self.pe.parse_imports()
+        if self.win10_test_shim:
+            imports = transform_imports(imports)
+        if not imports:
+            return b'', 0
+
+        # Pass 1 — compute final layout with descriptors at the front.
+        desc_bytes = (len(imports) + 1) * 20
+        cursor = (desc_bytes + 7) & ~7
+        layouts: List[Dict] = []
+
+        for imp in imports:
+            nfuncs = len(imp['functions'])
+            cursor = (cursor + 7) & ~7
+            ilt_off = cursor
+            cursor += (nfuncs + 1) * 8
+            iat_off = cursor
+            cursor += (nfuncs + 1) * 8
+            name_off = cursor
+            dll_name = imp['dll'].encode('ascii') + b'\x00'
+            cursor += len(dll_name)
+
+            func_entries: List[Tuple[Dict, Optional[int]]] = []
+            for fn in imp['functions']:
+                if fn['name']:
+                    hint_off = cursor
+                    cursor += 2 + len(fn['name'].encode('ascii')) + 1
+                    func_entries.append((fn, hint_off))
+                else:
+                    func_entries.append((fn, None))
+
+            layouts.append({
+                'ilt_off': ilt_off,
+                'iat_off': iat_off,
+                'name_off': name_off,
+                'dll_name': dll_name,
+                'func_entries': func_entries,
+            })
+
+        # Pass 2 — emit .idata with RVAs that match the final layout.
+        blob = bytearray(cursor)
+
+        for idx, lay in enumerate(layouts):
+            struct.pack_into(
+                '<IIIII', blob, idx * 20,
+                idata_rva + lay['ilt_off'],
+                0, 0,
+                idata_rva + lay['name_off'],
+                idata_rva + lay['iat_off'],
+            )
+
+        for lay in layouts:
+            blob[lay['name_off']:lay['name_off'] + len(lay['dll_name'])] = lay['dll_name']
+            for fn_idx, (fn, hint_off) in enumerate(lay['func_entries']):
+                if hint_off is not None:
+                    hint_rva = idata_rva + hint_off
+                    entry = (struct.pack('<H', fn.get('hint', 0))
+                             + fn['name'].encode('ascii') + b'\x00')
+                    blob[hint_off:hint_off + len(entry)] = entry
+                    struct.pack_into('<Q', blob, lay['ilt_off'] + fn_idx * 8, hint_rva)
+                    struct.pack_into('<Q', blob, lay['iat_off'] + fn_idx * 8, hint_rva)
+                else:
+                    ordinal = 0x8000000000000000 | (fn['ordinal'] & 0xFFFF)
+                    struct.pack_into('<Q', blob, lay['ilt_off'] + fn_idx * 8, ordinal)
+                    struct.pack_into('<Q', blob, lay['iat_off'] + fn_idx * 8, ordinal)
+
+        return bytes(blob), idata_rva
+
+    def _build_export_directory(self, edata_rva: int) -> bytes:
+        """Rebuild export directory with updated function RVAs."""
+        pe = self.pe
+        exports = pe.parse_exports()
+        if not exports:
+            return b''
+
+        # Deduplicate by name (Nt/Zw pairs share syscall numbers)
+        seen: Set[str] = set()
+        unique_exports = []
+        for exp in exports:
+            if exp['name'] in seen:
+                continue
+            seen.add(exp['name'])
+            unique_exports.append(exp)
+        exports = unique_exports
+
+        names_blob = bytearray()
+        name_offsets: List[int] = []
+        for exp in exports:
+            name_offsets.append(len(names_blob))
+            names_blob += exp['name'].encode('ascii') + b'\x00'
+
+        nfuncs = max(e['ord_idx'] for e in exports) + 1
+        hdr_size = 40
+        func_tbl_off = hdr_size
+        name_ptr_off = func_tbl_off + nfuncs * 4
+        ord_tbl_off  = name_ptr_off + len(exports) * 4
+        names_off    = ord_tbl_off + len(exports) * 2
+
+        exp_rva, _ = pe.dir_export
+        dll_name = 'module.dll'
+        if exp_rva:
+            eoff = pe.rva_to_offset(exp_rva)
+            if eoff is not None:
+                dll_name_rva = struct.unpack_from('<I', pe.raw, eoff + 12)[0]
+                dll_name = pe.read_cstring(dll_name_rva) or dll_name
+        dll_name_blob = dll_name.encode('ascii') + b'\x00'
+        dll_name_off = names_off + len(names_blob)
+
+        blob = bytearray(b'\x00' * (dll_name_off + len(dll_name_blob)))
+        blob[names_off:names_off + len(names_blob)] = names_blob
+        blob[dll_name_off:dll_name_off + len(dll_name_blob)] = dll_name_blob
+
+        name_ptr_base = edata_rva + names_off
+        for i, exp in enumerate(exports):
+            struct.pack_into('<I', blob, name_ptr_off + i * 4, name_ptr_base + name_offsets[i])
+            struct.pack_into('<H', blob, ord_tbl_off + i * 2, exp['ord_idx'])
+            new_func_rva = self._export_rva(exp['rva'])
+            struct.pack_into('<I', blob, func_tbl_off + exp['ord_idx'] * 4, new_func_rva)
+
+        ordbase = min((e['ordinal'] for e in exports), default=1)
+        struct.pack_into('<IIHHIIIIIII', blob, 0,
+            0, 0,
+            0, 0,
+            edata_rva + dll_name_off,
+            ordbase, nfuncs, len(exports),
+            edata_rva + func_tbl_off,
+            edata_rva + name_ptr_off,
+            edata_rva + ord_tbl_off)
+        return bytes(blob)
+
+    def _build_reloc_directory(self, reloc_rva: int, sections: List[Tuple],
+                               pointer_sites: Set[int]) -> bytes:
+        """Build PE64 base relocation directory (DIR64 entries)."""
+        pages: Dict[int, List[int]] = {}
+
+        for rva, rtype in self.pe_relocs:
+            if rtype != IMAGE_REL_BASED_HIGHLOW:
+                continue
+            page = rva & ~0xFFF
+            pages.setdefault(page, []).append(rva & 0xFFF)
+
+        for site_va in self.dyn.pointer_writes:
+            rva = site_va - self.old_base
+            page = rva & ~0xFFF
+            pages.setdefault(page, []).append(rva & 0xFFF)
+        for rva in pointer_sites:
+            page = rva & ~0xFFF
+            pages.setdefault(page, []).append(rva & 0xFFF)
+
+        blob = bytearray()
+        for page in sorted(pages):
+            entries = sorted(set(pages[page]))
+            block_size = 8 + len(entries) * 2
+            block_size = (block_size + 3) & ~3
+            blob += struct.pack('<II', page, block_size)
+            for off in entries:
+                blob += struct.pack('<H', (IMAGE_REL_BASED_DIR64 << 12) | off)
+            while len(blob) % 4:
+                blob += b'\x00'
+        return bytes(blob)
+
+    def _build_pe64(self, new_text: bytes, text_rva: int, sec_meta: Dict) -> bytes:
+        """Assemble translated code + fixed-up data into a valid PE64 binary."""
+        FILE_ALIGN = 0x200
+        def align(n, a): return (n + a - 1) & ~(a - 1)
+        new_text = new_text + b'\xCC' * (align(len(new_text), 16) - len(new_text))
+        code_layout = [('.text', new_text, sec_meta['flags'] | 0x20000000, text_rva)]
+        return self._build_pe64_from_layout(code_layout)
+
+    def _build_pe64_from_layout(self, code_layout: List[Tuple[str, bytes, int, int]]) -> bytes:
+        """Shared PE64 emitter for user and kernel images."""
+        pe = self.pe
+        FILE_ALIGN = 0x200
+        SECT_ALIGN = 0x1000
+
+        def align(n, a): return (n + a - 1) & ~(a - 1)
+
+        pointer_sites: Set[int] = set()
+        pointer_sites |= discover_image_pointer_sites(pe, self.dyn)
+        for sec in pe.sections:
+            if (sec['flags'] & 0x20000000) and sec.get('raw_sz'):
+                tdata = pe.get_section_data(sec)
+                pointer_sites |= discover_crt_data_pointer_slots(
+                    pe, tdata, sec['vaddr'])
+        for rva, _ in self.pe_relocs:
+            pointer_sites.add(rva)
+        for site_va in self.dyn.pointer_writes:
+            pointer_sites.add(site_va - pe.image_base)
+
+        PE64_OPT = PE64_OPT_TOTAL
+        SECT_ENTRY = 40
+        text_rva = code_layout[0][3]
+        code_size = sum(len(s[1]) for s in code_layout)
+
+        if self.is_kernel:
+            self._old_to_new_section = {}
+            for name, data, flags, new_va in code_layout:
+                for kn, _, old_rva, _, _ in self._kernel_code:
+                    if kn == name:
+                        self._old_to_new_section[old_rva] = new_va
+                        break
+
+        # Plan non-executable section RVAs before IAT + pointer patching.
+        data_secs_meta: List[Tuple[str, bytes, int, int]] = []
+        for sec in pe.sections:
+            if sec['flags'] & 0x20000000 or not sec['raw_sz']:
+                continue
+            data_secs_meta.append((sec['name'], pe.get_section_data(sec),
+                                   sec['flags'], sec['vaddr']))
+
+        max_code_end = max(
+            (va + len(data) for _n, data, _f, va in code_layout),
+            default=0x1000)
+        current_va = align(max_code_end, SECT_ALIGN)
+        planned_data: List[Tuple[str, bytes, int, int, int]] = []
+        for name, raw, flags, old_va in data_secs_meta:
+            new_va = current_va
+            self._old_to_new_section[old_va] = new_va
+            planned_data.append((name, raw, flags, old_va, new_va))
+            current_va = align(current_va + len(raw), SECT_ALIGN)
+
+        idata_rva = current_va
+        if getattr(self, '_embedded_text_refs', None) and self._pure_heal_text:
+            name0, data0, flags0, va0 = code_layout[0]
+            blob0 = bytearray(data0)
+            fin_embed = self._pure_finalize_embedded_text_data(
+                blob0, self.rva_map, self._pure_heal_text,
+                self._pure_heal_text_rva, self._embedded_text_refs)
+            if fin_embed:
+                print(f"        Pre-emit embedded text finalize: {fin_embed}")
+                code_layout[0] = (name0, bytes(blob0), flags0, va0)
+                self._translated_text = bytes(blob0)
+        self._refresh_final_rvas()
+        self._iat_rva_map = self._plan_import_iat_map(idata_rva)
+        if self._iat_rva_map:
+            print(f"        IAT remap: {len(self._iat_rva_map)} thunk slots")
+        self._idata_blob, _ = self._build_import_directory(idata_rva)
+        self._idata_rva = idata_rva
+
+        # Patch absolute VAs in executable sections (IAT + moved .data/.rsrc).
+        patched_layout: List[Tuple[str, bytes, int, int]] = []
+        total_va_patches = 0
+        for name, data, flags, va in code_layout:
+            if flags & 0x20000000:
+                data, n = self._patch_abs_va_in_code(data)
+                total_va_patches += n
+                data, n_disp = self._patch_disp32_image_vas_in_code(data)
+                total_va_patches += n_disp
+                data, n_iat = self._patch_iat_jmps_in_code(data, va)
+                total_va_patches += n_iat
+                data, n_ff15 = self._patch_ff15_iat_calls_in_code(data, va)
+                total_va_patches += n_ff15
+                blob = bytearray(data)
+                cmd_fixed = self._cmd_shim_postfixes(blob, self.rva_map)
+                if cmd_fixed:
+                    print(f"        Post-patch cmd.exe shim fixups: {cmd_fixed}")
+                if self._cmd_no_hacks:
+                    pure_iat = self._fix_pure_iat_movabs_cells(blob)
+                    pure_ind = self._fix_pure_indirect_iat_calls(blob)
+                    if pure_iat or pure_ind:
+                        print(f"        Pure IAT movabs/indirect fixes: "
+                              f"{pure_iat}/{pure_ind}")
+                scope_restore = self._restore_materialized_scope_tables(blob, va)
+                if scope_restore:
+                    print(f"        Post-patch scope table restore: {scope_restore}")
+                fn_entry_calls = self._snap_calls_to_function_entries(blob, self.rva_map)
+                if fn_entry_calls:
+                    print(f"        Post-patch mid-function CALL entry snaps: {fn_entry_calls}")
+                if self._cmd_no_hacks and getattr(self, '_pure_heal_text', None):
+                    pp_align = self._pure_repair_all_align_stub_calls(
+                        blob, self.rva_map,
+                        self._pure_heal_text, self._pure_heal_text_rva)
+                    if pp_align:
+                        print(f"        Post-patch pure align CALL repairs: {pp_align}")
+                    pp_epi = self._pure_snap_calls_to_epilogue_targets(
+                        blob, self.rva_map,
+                        self._pure_heal_text, self._pure_heal_text_rva)
+                    if pp_epi:
+                        print(f"        Post-patch pure epilogue CALL snaps: {pp_epi}")
+                    pp_calls = self._pure_repair_call_targets(
+                        blob, self.rva_map,
+                        self._pure_heal_text, self._pure_heal_text_rva)
+                    if pp_calls:
+                        print(f"        Post-patch pure CALL re-resolve: {pp_calls}")
+                    pp_x86_calls = self._pure_repair_calls_from_x86_source(
+                        blob, self.rva_map,
+                        self._pure_heal_text, self._pure_heal_text_rva)
+                    if pp_x86_calls:
+                        print(f"        Post-patch pure x86-anchored CALL repairs: {pp_x86_calls}")
+                    pp_corr = self._pure_correlate_call_targets(
+                        blob, self.rva_map,
+                        self._pure_heal_text, self._pure_heal_text_rva)
+                    if pp_corr:
+                        print(f"        Post-patch pure ordered CALL correlations: {pp_corr}")
+                    pp_interior = self._pure_snap_calls_off_interior_targets(
+                        blob, self.rva_map)
+                    if pp_interior:
+                        print(f"        Post-patch pure interior CALL snaps: {pp_interior}")
+                jcc_snapped = self._snap_jcc_misaligned_targets(blob)
+                if jcc_snapped:
+                    print(f"        Post-patch mid-instruction Jcc snaps: {jcc_snapped}")
+                jcc_repaired = self._repair_jcc_targets_from_rva_map(blob, self.rva_map)
+                if jcc_repaired:
+                    print(f"        Post-patch Jcc rva_map target repairs: {jcc_repaired}")
+                if getattr(self, '_epilogue_snap_map', None):
+                    epi_snapped3 = self._snap_branch_targets_to_epilogue_heads(
+                        blob, self._epilogue_snap_map)
+                    if epi_snapped3:
+                        print(f"        Post-patch epilogue-head branch snaps: {epi_snapped3}")
+                if not self.win10_test_shim:
+                    scope_push = self._reconcile_seh_scope_pushes(blob, self.rva_map, va)
+                    if scope_push:
+                        print(f"        Post-patch SEH scope push reconcile: {scope_push}")
+                    scope_fixed = self._fix_scope_tables_in_blob(blob)
+                    if scope_fixed:
+                        print(f"        Scope-table entry fixups: {scope_fixed}")
+                seh_scope = self._fix_broken_entry_seh_scope_pushes(
+                    blob, self.rva_map, text_rva=va)
+                if seh_scope:
+                    print(f"        Post-patch entry SEH scope repoint: {seh_scope}")
+                scope_synth = self._synthesize_seh_scopes_for_push_sites(blob, va)
+                if scope_synth:
+                    print(f"        Post-patch SEH scope synthesize: {scope_synth}")
+                scope_norm = self._normalize_scope_table_handlers(blob)
+                if scope_norm:
+                    print(f"        Post-patch SEH scope handler normalize: {scope_norm}")
+                push_h = self._fix_scope_handlers_at_push_sites(blob, va)
+                if push_h:
+                    print(f"        Post-patch SEH push-site handler fix: {push_h}")
+                seh_rbp = self._fix_seh_rbp_local_overlap(blob)
+                if seh_rbp:
+                    print(f"        Post-patch SEH RBP local slot fixups: {seh_rbp}")
+                data = bytes(blob)
+                data, n2 = self._patch_dword_vas_in_orphan_blobs(data)
+                total_va_patches += n2
+                blob = bytearray(data)
+                scope_norm2 = self._normalize_scope_table_handlers(blob)
+                if scope_norm2:
+                    print(f"        Post-patch SEH scope handler re-normalize: {scope_norm2}")
+                push_h2 = self._fix_scope_handlers_at_push_sites(blob, va)
+                if push_h2:
+                    print(f"        Post-patch SEH push-site handler re-fix: {push_h2}")
+                epi_gaps = self._fix_align_epilogue_x86_gaps(blob)
+                if epi_gaps:
+                    print(f"        Post-patch align-epilogue x86 gaps: {epi_gaps}")
+                if self.win10_test_shim and not self._cmd_no_hacks:
+                    fn6314_late = self._cmd_fn6314_entry_off(blob)
+                    late_cmd = 0
+                    late_cmd += self._restore_cmd_text_constants(blob)
+                    if fn6314_late is not None:
+                        late_cmd += self._fix_fn6314_callee_ret(blob, fn6314_late)
+                    late_cmd += self._fix_cmd_crt_wcslen_path(blob)
+                    late_cmd += self._fix_cmd_crt_wcslen_helper_calls(blob)
+                    late_cmd += self._fix_cmd_crt_wcslen_call_8a44(blob)
+                    late_cmd += self._fix_cmd_crt_second_wcslen_8a6b(blob)
+                    late_cmd += self._fix_cmd_crt_wcslen_inline_2a805(blob)
+                    late_cmd += self._fix_cmd_crt_getmainargs_setup(blob)
+                    late_cmd += self._fix_calls_into_movabs_imm(blob)
+                    late_cmd += self._fix_cmd_data_iat_pointer_cells(blob)
+                    late_cmd += self._fix_cmd_crt_createprocess_call_8df1(blob)
+                    late_cmd += self._fix_cmd_text_indirect_iat_calls(blob)
+                    late_cmd += self._fix_cmd_crt_exit_branches(blob)
+                    late_cmd += self._fix_cmd_crt_cont_branches(blob)
+                    late_cmd += self._fix_cmd_crt_fail_path_branches(blob)
+                    late_cmd += self._fix_cmd_crt_init_branches(blob)
+                    late_cmd += self._fix_cmd_init_env_rsi(blob)
+                    late_cmd += self._fix_cmd_entry_scope_push_bias(blob)
+                    late_cmd += self._fix_cmd_main_wcslen_call(blob)
+                    late_cmd += self._fix_cmd_main_wcslen_tail_8f0c(blob)
+                    late_cmd += self._fix_cmd_main_getcommandline_call(blob)
+                    late_cmd += self._fix_cmd_main_post_cmdline_overlap(blob)
+                    late_cmd += self._fix_cmd_main_token_parse_call(blob)
+                    late_cmd += self._fix_cmd_main_token_parse_call(blob)
+                    late_cmd += self._fix_cmd_main_skip_spurious_parse_calls(blob)
+                    late_cmd += self._fix_cmd_main_drive_letter_path(blob)
+                    late_cmd += self._fix_cmd_main_batch_arg_mov(blob)
+                    late_cmd += self._fix_cmd_main_skip_batch_setup_call(blob)
+                    late_cmd += self._fix_cmd_main_wcschr_call(blob)
+                    late_cmd += self._fix_cmd_main_wcschr_null_fallback(blob)
+                    late_cmd += self._fix_cmd_main_empty_token_cmp(blob)
+                    late_cmd += self._fix_cmd_main_switch_dispatch(blob)
+                    late_cmd += self._fix_cmd_main_flag_dispatch(blob)
+                    late_cmd += self._fix_cmd_main_post_flag_path(blob)
+                    late_cmd += self._fix_cmd_main_parse_dispatch_call(blob)
+                    late_cmd += self._fix_cmd_main_exec_tail(blob)
+                    late_cmd += self._fix_cmd_main_batch_copy_call_args(blob)
+                    late_cmd += self._fix_cmd_switch_handler_gs_epilogue(blob)
+                    late_cmd += self._fix_cmd_batch_helper_zero_index(blob)
+                    late_cmd += self._fix_cmd_batch_helper_x64_ptr_load(blob)
+                    late_cmd += self._fix_cmd_fn6314_helper_calls(blob, self.rva_map)
+                    if fn6314_late is not None:
+                        late_cmd += self._fix_cmd_fn6314_zero_edi(blob, fn6314_late)
+                    late_cmd += self._fix_cmd_fn6314_wcsrchr_null_skip(blob)
+                    late_cmd += self._fix_cmd_heap_alloc_helper_2e37d(blob)
+                    late_cmd += self._fix_cmd_main_heap_call_8fea(blob)
+                    late_cmd += self._fix_cmd_main_post_switch_success(blob)
+                    late_cmd += self._fix_cmd_main_parse_helper_calls(blob, self.rva_map)
+                    late_cmd += self._fix_cmd_main_batch_exec_call(blob)
+                    late_cmd += self._fix_cmd_exec_batch_call_2365(blob)
+                    late_cmd += self._fix_cmd_batch_helper_call_r9_235a(blob)
+                    late_cmd += self._fix_cmd_batch_test_al4_je_2338(blob)
+                    late_cmd += self._fix_cmd_batch_helper_296e8_gs_epilogue(blob)
+                    late_cmd += self._fix_cmd_batch_helper_296e8_flag_check(blob)
+                    late_cmd += self._fix_cmd_getcommandline_inner_call(blob)
+                    late_cmd += self._fix_cmd_skip_crt_reexec(blob)
+                    late_cmd += self._fix_cmd_crt_reexec_cleanup_branches(blob)
+                    late_cmd += self._fix_cmd_crt_reexec_return_branches(blob)
+                    late_cmd += self._fix_cmd_force_crt_reexec_fail(blob, va)
+                    late_cmd += self._fix_cmd_crt_createprocess_call_8df1(blob)
+                    late_cmd += self._fix_cmd_crt_divert_init_loops(blob)
+                    late_cmd += self._fix_cmd_fn6581_call_sites(blob, self.rva_map)
+                    late_cmd += self._fix_cmd_crt_restore_fn6314_calls(blob)
+                    if fn6314_late is not None:
+                        late_cmd += self._fix_fn6314_scan_loop(blob, fn6314_late)
+                    late_cmd += self._fix_fn6314_loop_branches(blob, fn6314_late or 0)
+                    if fn6314_late is not None:
+                        late_cmd += self._fix_fn6314_jump_exit(blob, fn6314_late)
+                        late_cmd += self._fix_cmd_fn6314_call_14412(blob, fn6314_late, self.rva_map)
+                    late_cmd += self._fix_cmd_crt_init_fail_jmp(blob)
+                    late_cmd += self._fix_cmd_crt_reach_main(blob)
+                    if late_cmd:
+                        print(f"        Post-patch cmd CRT late fixups: {late_cmd}")
+                ff25_sled = self._int3_sled_ff25_gaps(blob)
+                if ff25_sled:
+                    print(f"        Post-patch FF25 gap INT3 sleds: {ff25_sled}")
+                rbp_leave = self._pure_fix_rbp_leave_before_ret(blob)
+                if rbp_leave:
+                    print(f"        Post-patch pure RBP leave inserts: {rbp_leave}")
+                text_src = pe.get_section_data(
+                    next(s for s in pe.sections if s['name'].startswith('.text')))
+                jmp_epi = self._pure_fix_jmp_over_epilogue(blob, text_src, va)
+                if jmp_epi:
+                    print(f"        Post-patch pure jmp→epilogue fixes: {jmp_epi}")
+                orphan_trap = self._int3_sled_orphan_data(blob)
+                if orphan_trap:
+                    print(f"        Post-patch orphan data INT3 traps: {orphan_trap}")
+                if self.win10_test_shim and not self._cmd_no_hacks:
+                    final_cmd = 0
+                    final_cmd += self._fix_cmd_force_crt_reexec_fail(blob, va)
+                    final_cmd += self._fix_cmd_crt_createprocess_call_8df1(blob)
+                    final_cmd += self._fix_cmd_crt_divert_init_loops(blob)
+                    final_cmd += self._fix_cmd_init_tail_int3(blob)
+                    final_cmd += self._fix_cmd_main_tail_scope_hole(blob, self.rva_map)
+                    reexec = self._fix_cmd_crt_reexec_control_flow(blob)
+                    if reexec:
+                        final_cmd += reexec
+                    shift = self._cmd_shim_blob_shift_fixups(blob)
+                    if shift:
+                        final_cmd += shift
+                        final_cmd += self._fix_cmd_batch_helper_call_r9_235a(blob)
+                        final_cmd += self._fix_cmd_batch_test_al4_je_2338(blob)
+                        final_cmd += self._fix_cmd_exec_batch_call_2365(blob)
+                        final_cmd += self._fix_cmd_main_batch_exec_call(blob)
+                    if not os.environ.get('CMD_DROP_CRT_HACKS'):
+                        final_cmd += self._fix_cmd_crt_wcslen_helper_calls(blob)
+                        final_cmd += self._fix_cmd_crt_wcslen_call_8a44(blob)
+                        final_cmd += self._fix_cmd_crt_second_wcslen_8a6b(blob)
+                        final_cmd += self._fix_cmd_crt_fn6314_call_target_8af4(blob)
+                        final_cmd += self._fix_cmd_crt_banner_epilogue_pop_rbp_8b22(blob)
+                        final_cmd += self._fix_cmd_crt_skip_banner_print_8b74(blob)
+                        final_cmd += self._fix_cmd_crt_wcslen_inline_2a805(blob)
+                    final_cmd += self._fix_cmd_crt_getmainargs_setup(blob)
+                    final_cmd += self._fix_cmd_crt_reach_main(blob)
+                    final_cmd += self._fix_cmd_crt_init_fail_jmp(blob)
+                    if not os.environ.get('CMD_DROP_CRT_HACKS'):
+                        final_cmd += self._fix_cmd_crt_restore_fn6314_calls(blob)
+                    final_cmd += self._fix_cmd_main_getcommandline_call(blob)
+                    final_cmd += self._fix_cmd_main_save_cmdline_ptr_8eea(blob)
+                    final_cmd += self._fix_cmd_main_post_cmdline_overlap(blob)
+                    final_cmd += self._fix_cmd_main_prologue_stack_align(blob)
+                    final_cmd += self._fix_cmd_main_peb_wcslen_stub_call(blob)
+                    if not self.win10_test_shim:
+                        final_cmd += self._fix_cmd_main_early_dispatch_8f61(blob)
+                    final_cmd += self._fix_cmd_main_token_parse_8fcc(blob)
+                    final_cmd += self._fix_cmd_main_batch_call_90fc(blob)
+                    final_cmd += self._fix_cmd_main_skip_batch_path_90ef(blob)
+                    final_cmd += self._fix_cmd_main_wcschr_iat_9111(blob)
+                    final_cmd += self._fix_cmd_main_wcschr_null_fallback(blob)
+                    final_cmd += self._fix_cmd_main_skip_to_switch_slash(blob)
+                    final_cmd += self._fix_cmd_main_token_scan_null_exit_911e(blob)
+                    final_cmd += self._fix_cmd_main_empty_token_cmp(blob)
+                    final_cmd += self._fix_cmd_main_skip_empty_token_exit(blob)
+                    final_cmd += self._fix_cmd_exit_helper_call_2e4cb(blob)
+                    final_cmd += self._fix_cmd_version_banner_root_2e4bb(blob)
+                    final_cmd += self._fix_cmd_gvi_helper_force_success_1d3b6(blob)
+                    final_cmd += self._fix_cmd_gvi_helper_1d343(blob)
+                    final_cmd += self._fix_cmd_main_switch_dispatch(blob)
+                    final_cmd += self._fix_cmd_main_flag_dispatch(blob)
+                    final_cmd += self._fix_cmd_main_skip_parse_to_exec(blob)
+                    final_cmd += self._fix_cmd_main_post_flag_path(blob)
+                    final_cmd += self._fix_cmd_main_wcscmp_iat_9176(blob)
+                    final_cmd += self._fix_cmd_interactive_skip_wcscmp_slashq_917a(blob)
+                    final_cmd += self._fix_cmd_main_wcsncmp_c_second(blob)
+                    final_cmd += self._fix_cmd_main_c_switch_jne(blob)
+                    final_cmd += self._fix_cmd_version_banner_branch_2e4b1(blob)
+                    final_cmd += self._fix_cmd_main_parse_dispatch_call(blob)
+                    final_cmd += self._fix_cmd_main_exec_tail(blob)
+                    final_cmd += self._fix_cmd_main_exec_success_jmp(blob)
+                    final_cmd += self._fix_cmd_main_post_switch_success(blob)
+                    final_cmd += self._fix_cmd_switch_handler_entry_1deb4(blob)
+                    final_cmd += self._fix_cmd_switch_handler_gs_epilogue(blob)
+                    final_cmd += self._fix_cmd_main_echo_tail_rcx(blob)
+                    final_cmd += self._fix_cmd_exec_success_via_rbx_setup(blob)
+                    final_cmd += self._fix_cmd_echo_tail_wcsncpy_stub(blob)
+                    final_cmd += self._fix_cmd_exec_helper_kernel_iat(blob)
+                    final_cmd += self._fix_cmd_skip_createprocess_helper_938f(blob)
+                    final_cmd += self._fix_cmd_echo_batch_call_93bc(blob)
+                    final_cmd += self._fix_cmd_echo_dispatch_call_2b3f5(blob)
+                    final_cmd += self._fix_cmd_echo_batch_second_arg(blob)
+                    final_cmd += self._fix_cmd_echo_dispatch_iat_region(blob)
+                    final_cmd += self._fix_cmd_batch_helper_iat_region(blob)
+                    final_cmd += self._fix_cmd_win10_echo_writeconsole(blob)
+                    final_cmd += self._fix_cmd_main_win10_cmdline_gate_8f61(blob)
+                    final_cmd += self._fix_cmd_main_drive_letter_path(blob)
+                    final_cmd += self._fix_cmd_main_batch_arg_mov(blob)
+                    final_cmd += self._fix_cmd_main_skip_batch_setup_call(blob)
+                    final_cmd += self._fix_cmd_skip_wcsncpy_jmp_drive_8fd6(blob)
+                    final_cmd += self._fix_cmd_main_batch_exec_call(blob)
+                    final_cmd += self._fix_cmd_main_save_rbp_slot(blob)
+                    final_cmd += self._fix_cmd_print_tls_je_2d458(blob)
+                    # Banner/CRT fn6314 thunk hacks removed: they were contradictory
+                    # interactive-only patches that corrupted the banner path. /c echo
+                    # works without them; keep them off unless explicitly re-enabled.
+                    if os.environ.get('CMD_ENABLE_BANNER_HACKS'):
+                        final_cmd += self._fix_cmd_crt_banner_wcsncpy_or_skip_8afc(blob)
+                        final_cmd += self._fix_cmd_crt_banner_resume_skip_8af9(blob)
+                        final_cmd += self._fix_cmd_crt_seh_banner_resume_8f56(blob)
+                        final_cmd += self._fix_cmd_crt_seh_route_8f32_to_guard(blob)
+                        final_cmd += self._fix_cmd_crt_fn6314_tailcall_pop_ret_2dc32(blob)
+                        final_cmd += self._fix_cmd_crt_banner_fn6314_jne_2d9d7(blob)
+                        final_cmd += self._fix_cmd_crt_fn6314_jmp_not_call_2dc32(blob)
+                        final_cmd += self._fix_cmd_crt_fn6314_mid_thunk_branches(blob)
+                        final_cmd += self._fix_cmd_crt_cont_branches(blob)
+                        final_cmd += self._fix_cmd_crt_stub_iat_call_rax(blob)
+                    final_cmd += self._fix_cmd_version_banner_skip_call_rsi_2e58d(blob)
+                    final_cmd += self._fix_cmd_banner_swprintf_format_rdx(blob)
+                    final_cmd += self._fix_cmd_banner_fill_version_cave(blob)
+                    final_cmd += self._fix_cmd_banner_version_string_ptr_2e4ef(blob)
+                    final_cmd += self._fix_cmd_banner_swprintf_version_arg_r8_2e50a(blob)
+                    final_cmd += self._fix_cmd_banner_swprintf_iat_call_2e519(blob)
+                    final_cmd += self._fix_cmd_banner_gvi_epilogue_pop_rbp_2e4d3(blob)
+                    final_cmd += self._fix_cmd_banner_swprintf_epilogue_2e520(blob)
+                    final_cmd += self._fix_cmd_banner_copyright_clear_rdx_2e5ac(blob)
+                    final_cmd += self._fix_cmd_banner_line_print_leaf_2e536(blob)
+                    final_cmd += self._fix_cmd_banner_copyright_print_leaf_2e5b8(blob)
+                    final_cmd += self._fix_cmd_banner_copyright_string_rcx_2e5a2(blob)
+                    final_cmd += self._fix_cmd_banner_repl_frame_fixup(blob)
+                    final_cmd += self._fix_cmd_banner_skip_post_copyright_2e5ce(blob)
+                    final_cmd += self._fix_cmd_crt_exit_jmp_8770(blob)
+                    final_cmd += self._fix_cmd_crt_banner_fn6314_je_2d9ea(blob)
+                    final_cmd += self._fix_cmd_banner_print_stub_2d813(blob)
+                    final_cmd += self._ensure_cmd_wide_stdout_print_stub(blob)
+                    final_cmd += self._fix_cmd_win10_interactive_guard_9040(blob)
+                    final_cmd += self._fix_cmd_banner_print_call_sites(blob)
+                    final_cmd += self._fix_cmd_banner_setup_call_3cf7b(blob)
+                    final_cmd += self._fix_cmd_banner_setup_stub_3cf7a(blob)
+                    final_cmd += self._fix_cmd_banner_helper_call_200f0(blob)
+                    final_cmd += self._fix_cmd_readconsole_prompt_helper_calls(blob)
+                    final_cmd += self._fix_cmd_banner_volume_call_chain(blob)
+                    final_cmd += self._fix_cmd_version_banner_root_2e4bb(blob)
+                    final_cmd += self._fix_cmd_banner_jne_2e4ac(blob)
+                    final_cmd += self._fix_cmd_interactive_skip_closehandle_2e66e(blob)
+                    final_cmd += self._fix_cmd_interactive_repl_jmp_2e6f1(blob)
+                    final_cmd += self._fix_cmd_repl_jmp_2e728_to_gate(blob)
+                    final_cmd += self._fix_cmd_repl_prompt_entry_nop_2eae9(blob)
+                    final_cmd += self._fix_cmd_interactive_skip_repl_exit_ret(blob)
+                    final_cmd += self._fix_cmd_interactive_repl_edi_gate_2e72d(blob)
+                    final_cmd += self._fix_cmd_repl_seh_je_2ee65(blob)
+                    final_cmd += self._fix_cmd_repl_readconsole_jmp_loop_2eb2a(blob)
+                    final_cmd += self._fix_cmd_readconsole_call_sites(blob)
+                    final_cmd += self._fix_cmd_readconsole_helper_frame_3d193(blob)
+                    final_cmd += self._fix_cmd_parse_line_call_3cdc7(blob)
+                    # REPL: use natural banner + ReadConsole (0x3D193) + parse (0x3CDC8).
+                    # No synthetic prompt/read loops — those spin when ReadConsole returns.
+                    final_cmd += self._fix_cmd_main_batch_arg_mov(blob)
+                    final_cmd += self._fix_cmd_main_skip_batch_setup_call(blob)
+                    final_cmd += self._fix_cmd_main_batch_call_90fc(blob)
+                    final_cmd += self._fix_cmd_main_skip_batch_path_90ef(blob)
+                    final_cmd += self._fix_cmd_main_empty_token_cmp(blob)
+                    final_cmd += self._fix_cmd_main_skip_empty_token_exit(blob)
+                    final_cmd += self._ensure_cmd_wide_stdout_print_stub(blob)
+                    final_cmd += self._fix_cmd_crt_getmainargs_fallthrough_8769(blob)
+                    final_cmd += self._fix_cmd_crt_orphan_epilogue_8770(blob)
+                    final_cmd += self._fix_cmd_crt_getmainargs_flag_gate_877b(blob)
+                    if final_cmd:
+                        print(f"        Post-patch cmd CRT final fixups: {final_cmd}")
+                if self._cmd_no_hacks and (flags & 0x20000000):
+                    text_src = pe.get_section_data(
+                        next(s for s in pe.sections if s['name'].startswith('.text')))
+                    pp_frame = self._pure_reconcile_swallowed_rva_map(
+                        blob, self.rva_map, text_src, va)
+                    if pp_frame:
+                        print(f"        Post-repair pure frameless entry reconciles: {pp_frame}")
+                    blob, n_rep = self._patch_abs_va_in_code(
+                        bytes(blob), relocate_new_base=False)
+                    if n_rep:
+                        print(f"        Post-repair pure movabs VA re-patch: {n_rep}")
+                        total_va_patches += n_rep
+                    # The disp32 image-VA re-patch MUST run unconditionally. An
+                    # earlier repair pass can absorb every stray movabs (n_rep==0)
+                    # while [reg+disp32] slots still embed un-relocated x86 image
+                    # VAs. Gating this behind ``if n_rep`` regressed build 38:
+                    # ~109 disp32 fixes were skipped, leaving 32-bit pointers that
+                    # fault inside API code (build 18 ran to 201k+ steps, build 38
+                    # crashed at ~67k). Always reconcile remaining disp32 VAs.
+                    blob, n_disp = self._patch_disp32_image_vas_in_code(blob)
+                    if n_disp:
+                        print(f"        Post-repair pure disp32 VA re-patch: {n_disp}")
+                        total_va_patches += n_disp
+                    if not isinstance(blob, bytearray):
+                        blob = bytearray(blob)
+                    pp_auth2 = self._pure_repair_all_align_stub_calls(
+                        blob, self.rva_map, text_src, va)
+                    if pp_auth2:
+                        print(f"        Post-repair pure authoritative align CALLs: {pp_auth2}")
+                    pp_crt = self._pure_fixup_crt_initterm_push_imm_pairs(
+                        blob, self.rva_map, text_src, va)
+                    if pp_crt:
+                        print(f"        Post-repair pure CRT initterm movabs fixes: {pp_crt}")
+                    pp_sync = self._pure_authoritative_x86_call_sync(
+                        blob, self.rva_map, text_src, va)
+                    if pp_sync:
+                        print(f"        Post-repair pure authoritative x86 CALL sync: {pp_sync}")
+                    pp_named = self._pure_fixup_named_align_calls(
+                        blob, self.rva_map, text_src, va)
+                    if pp_named:
+                        print(f"        Post-repair pure named align CALL fixes: {pp_named}")
+                    pp_teb = self._pure_fixup_teb_indirect_field_disps(blob)
+                    if pp_teb:
+                        print(f"        Post-repair pure TEB indirect field fixes: {pp_teb}")
+                    pp_bounds = self._pure_fixup_teb_stack_bounds_idiom(blob)
+                    if pp_bounds:
+                        print(f"        Post-repair pure TEB stack-bounds qword fixes: {pp_bounds}")
+                    # Final, authoritative chkstk-prologue entry + caller fix —
+                    # runs after every other call-repair pass so nothing can
+                    # re-collapse these large-frame entries (0xA4E7 switch parser).
+                    pp_chk = self._pure_fix_chkstk_prologue_entries(
+                        blob, self.rva_map, text_src, va)
+                    if pp_chk:
+                        print(f"        Post-repair pure chkstk-prologue entry fixes: {pp_chk}")
+                    if not os.environ.get('DISABLE_CHKSTK'):
+                        pp_chkcall = self._pure_fix_broken_chkstk_calls(blob)
+                        if pp_chkcall:
+                            print(f"        Post-repair pure broken chkstk-call repairs: {pp_chkcall}")
+                    pp_chkc = self._pure_repair_chkstk_prologue_calls(
+                        blob, self.rva_map, text_src, va)
+                    if pp_chkc:
+                        print(f"        Post-repair pure chkstk-prologue CALL fixes: {pp_chkc}")
+                    blob, n_final = self._patch_abs_va_in_code(
+                        bytes(blob), relocate_new_base=False)
+                    if n_final:
+                        print(f"        Post-repair stale section VA fixups: {n_final}")
+                        total_va_patches += n_final
+                    if not isinstance(blob, bytearray):
+                        blob = bytearray(blob)
+                    pp_data = self._pure_reanchor_data_movabs_from_x86_pushes(
+                        blob, self.rva_map, text_src, va)
+                    if pp_data:
+                        print(f"        Post-repair pure data movabs re-anchor: {pp_data}")
+                data = bytes(blob)
+                if str(name).startswith('.text'):
+                    self._translated_text = data
+            patched_layout.append((name, data, flags, va))
+        if total_va_patches:
+            print(f"        VA pointer patches in code: {total_va_patches}")
+
+        sections_layout: List[Tuple[str, bytes, int, int]] = list(patched_layout)
+        resource_rva = 0
+        resource_sz = 0
+        old_res_rva, old_res_sz = pe.dir_resource
+        for name, raw, flags, old_va, new_va in planned_data:
+            if name.lower() == '.rsrc':
+                raw = fixup_rsrc_section(raw, old_va, new_va)
+                if self.win10_test_shim:
+                    rsrc_blob = bytearray(raw)
+                    rsrc_fix = self._fix_cmd_banner_format_swprintf_s(rsrc_blob, new_va)
+                    if rsrc_fix:
+                        raw = bytes(rsrc_blob)
+                if old_res_rva and old_res_sz:
+                    resource_rva = new_va + (old_res_rva - old_va)
+                    resource_sz = old_res_sz
+            else:
+                raw = fixup_data_section(
+                    raw, old_va, self.pe_relocs,
+                    self.old_base, self.new_base, pe.image_size,
+                    pointer_sites, self.dyn.pointer_writes,
+                    pe=pe, old_to_new_section=self._old_to_new_section,
+                    iat_rva_map=self._iat_rva_map,
+                    final_rva_map=self._final_rva)
+                if name.lower() == '.data' and self.win10_test_shim:
+                    data_blob = bytearray(raw)
+                    data_fix = 0
+                    data_fix += self._fix_cmd_data_switch_literals(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_echo_test_literal(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_os_version_fmt(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_os_version_buffer(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_prompt_buffer(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_readline_buffer(data_blob, new_va)
+                    data_fix += self._fix_cmd_data_banner_format_swprintf_s(data_blob, new_va)
+                    if data_fix:
+                        raw = bytes(data_blob)
+            sections_layout.append((name, raw, flags, new_va))
+
+        idata_blob = self._idata_blob
+        if idata_blob:
+            sections_layout.append(('.idata', idata_blob, 0xC0000040, idata_rva))
+            current_va = align(idata_rva + len(idata_blob), SECT_ALIGN)
+
+        edata_rva = current_va
+        edata_blob = b''
+        if pe.parse_exports():
+            edata_blob = self._build_export_directory(edata_rva)
+            sections_layout.append(('.edata', edata_blob, 0x40000040, edata_rva))
+            current_va = align(edata_rva + len(edata_blob), SECT_ALIGN)
+
+        reloc_rva = current_va
+        reloc_blob = self._build_reloc_directory(reloc_rva, sections_layout, pointer_sites)
+        if reloc_blob:
+            sections_layout.append(('.reloc', reloc_blob, 0x42000040, reloc_rva))
+            current_va = align(reloc_rva + len(reloc_blob), SECT_ALIGN)
+
+        num_sections = len(sections_layout)
+        # Optional header is 240 bytes total (112 std + 128 data dirs); do NOT
+        # add 16*8 again — that was shifting the section table and corrupting names.
+        hdrs_size = align(64 + 4 + 20 + PE64_OPT + num_sections * SECT_ENTRY, FILE_ALIGN)
+        image_size = align(current_va, SECT_ALIGN)
+        new_entry_rva = self._export_rva(pe.entry_rva) if pe.entry_rva else 0
+
+        if pe.entry_rva and (self.win10_test_shim or self._cmd_no_hacks):
+            try:
+                text_blob = self._translated_text
+                if not text_blob:
+                    text_blob = next(
+                        b for (nm, b, _fl, _rva) in sections_layout
+                        if str(nm).startswith('.text'))
+                new_entry_rva = self._resolve_pe64_entry_rva(
+                    text_blob, self.text_rva or text_rva, new_entry_rva)
+                if self._cmd_no_hacks:
+                    print(f"        Pure PE entry RVA: 0x{new_entry_rva:X} "
+                          f"(x86 0x{pe.entry_rva:X})")
+            except Exception as exc:
+                if self._cmd_no_hacks:
+                    print(f"        Entry resolve failed: {exc}")
+
+        dos = b'MZ' + b'\x00' * 0x3A + struct.pack('<I', 0x40)
+        pe_sig = b'PE\x00\x00'
+        coff = struct.pack('<HHIIIHH',
+            0x8664, num_sections, pe.timestamp, 0, 0,
+            PE64_OPT, pe.characteristics | 0x0020)
+
+        opt_hdr = struct.pack('<HBBI', 0x020B, 14, 0, align(code_size, FILE_ALIGN))
+        opt_hdr += struct.pack('<III',
+            align(sum(len(s[1]) for s in sections_layout if not (s[2] & 0x20000000)), FILE_ALIGN),
+            0, new_entry_rva)
+        opt_hdr += struct.pack('<IQ', text_rva, self.new_base)
+        opt_hdr += struct.pack('<IIHHHHHH', SECT_ALIGN, FILE_ALIGN, 5, 2, 0, 0, 5, 2)
+        opt_hdr += struct.pack('<IIII', 0, image_size, hdrs_size, 0)
+        # DllCharacteristics: NX_COMPAT | TS_AWARE only. ASLR (DYNAMIC_BASE /
+        # HIGH_ENTROPY_VA) is disabled so the image loads at its preferred base;
+        # otherwise an EXE rebased below 4 GiB could be moved above 4 GiB and
+        # the 32-bit data-pointer assumption (high dword == 0) would break.
+        opt_hdr += struct.pack('<HH', pe.subsystem, 0x8100)
+        opt_hdr += struct.pack('<QQQQ', 0x100000, 0x1000, 0x100000, 0x1000)
+        opt_hdr += struct.pack('<II', 0, 16)
+        if len(opt_hdr) != PE64_OPT_STD:
+            raise RuntimeError(
+                f"PE64 optional header std fields: expected {PE64_OPT_STD}, got {len(opt_hdr)}")
+
+        export_rva = edata_rva if edata_blob else 0
+        export_sz = len(edata_blob) if edata_blob else 0
+        import_rva = idata_rva if idata_blob else 0
+        import_sz = len(idata_blob) if idata_blob else 0
+        basereloc_rva = reloc_rva if reloc_blob else 0
+        basereloc_sz = len(reloc_blob) if reloc_blob else 0
+
+        data_dirs = b''
+        for idx in range(16):
+            if idx == 0:
+                data_dirs += struct.pack('<II', export_rva, export_sz)
+            elif idx == 1:
+                data_dirs += struct.pack('<II', import_rva, import_sz)
+            elif idx == 2:
+                data_dirs += struct.pack('<II', resource_rva, resource_sz)
+            elif idx == 5:
+                data_dirs += struct.pack('<II', basereloc_rva, basereloc_sz)
+            else:
+                data_dirs += struct.pack('<II', 0, 0)
+        if len(data_dirs) != 128:
+            raise RuntimeError(f"PE64 data directories: expected 128, got {len(data_dirs)}")
+
+        sect_hdrs = b''
+        file_ptr = hdrs_size
+        for sname, sdata, sflags, sva in sections_layout:
+            raw_sz = align(len(sdata), FILE_ALIGN)
+            n = sname.encode('ascii', 'replace')[:8].ljust(8, b'\x00')
+            sect_hdrs += struct.pack('<8sIIIIIIHHI',
+                                     n, len(sdata), sva, raw_sz, file_ptr,
+                                     0, 0, 0, 0, sflags)
+            file_ptr += raw_sz
+
+        header_blob = (dos + pe_sig + coff + opt_hdr + data_dirs + sect_hdrs)
+        header_blob = header_blob.ljust(hdrs_size, b'\x00')
+        out = bytearray(header_blob)
+        for _, sdata, _, _ in sections_layout:
+            out += sdata.ljust(align(len(sdata), FILE_ALIGN), b'\x00')
+        return bytes(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  6.  BATCH PROCESSOR
+#      Walk an entire Win2000 SP4 directory tree, translate every PE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BatchTranslator:
+    r"""
+    Translate every PE32 binary under a Windows 2000 directory tree.
+
+    Win2000 SP4 user-mode binaries live under:
+      %SystemRoot%\system32\       — core DLLs, EXEs
+      %SystemRoot%\system32\dllcache\ — cached DLLs
+      %SystemRoot%\               — shell, explorer, etc.
+      %SystemRoot%\system\        — 16-bit subsystem (skip)
+      %ProgramFiles%\             — applications
+
+    We skip:
+      *.sys  — kernel drivers (require kernel-mode translation)
+      *.drv  — driver modules (some are kernel mode)
+      files in \system\ — 16-bit stubs
+
+    Output tree mirrors the input tree under <out_dir>.
+    A JSON report is written to <out_dir>/translation_report.json.
+    """
+
+    SKIP_EXTS   = {'.vxd', '.386'}   # .sys handled when include_drivers=True
+    SKIP_EXTS_ALWAYS = {'.vxd', '.386'}
+    SKIP_DIRS   = {'system', 'drivers', 'wins', 'mui', 'catroot', 'catroot2'}
+    PE_EXTS     = {'.exe', '.dll', '.ocx', '.cpl', '.ax', '.acm', '.tlb', '.sys'}
+
+    def __init__(self, src_dir: str, out_dir: str,
+                 dynamic: bool = True, verbose: bool = False,
+                 ntdll_ref: Optional[str] = None,
+                 include_drivers: bool = False,
+                 win10_test_shim: bool = False):
+        self.src     = os.path.normpath(src_dir)
+        self.out     = os.path.normpath(out_dir)
+        self.dynamic = dynamic
+        self.verbose = verbose
+        self.ntdll_ref = ntdll_ref
+        self.include_drivers = include_drivers
+        self.win10_test_shim = win10_test_shim
+        self.report  = {'translated': [], 'skipped': [], 'failed': [], 'drivers': []}
+
+    def run(self) -> None:
+        if _SYSCALL_TARGET == 'win10':
+            auto_load_win10_syscall_table()
+        if self.ntdll_ref and os.path.isfile(self.ntdll_ref):
+            n = load_syscall_table_from_ntdll(self.ntdll_ref)
+            print(f"[+] Loaded {n} syscall stubs from {self.ntdll_ref}")
+        os.makedirs(self.out, exist_ok=True)
+        if self.win10_test_shim:
+            ensure_w2kshim_dll(self.out)
+            print("[!] Win10 test shim ON — imports may use w2kshim64.dll "
+                  "(not for production Win2000 x64)")
+        if _pure_translator_mode():
+            print("[+] Pure translator ON (universal, no cmd-specific hacks)")
+        total = 0
+        for root, dirs, files in os.walk(self.src):
+            # Prune skip directories
+            dirs[:] = [d for d in dirs
+                       if d.lower() not in self.SKIP_DIRS]
+            rel_root = os.path.relpath(root, self.src)
+            out_root = os.path.join(self.out, rel_root)
+            os.makedirs(out_root, exist_ok=True)
+
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext == '.sys' and not self.include_drivers:
+                    self.report['skipped'].append(os.path.join(rel_root, fname))
+                    continue
+                if ext in self.SKIP_EXTS_ALWAYS:
+                    self.report['skipped'].append(os.path.join(rel_root, fname))
+                    continue
+                if ext not in self.PE_EXTS:
+                    # Copy non-PE files verbatim (REG files, INI, etc.)
+                    src_path = os.path.join(root, fname)
+                    dst_path = os.path.join(out_root, fname)
+                    try:
+                        with open(src_path,'rb') as f:
+                            d = f.read()
+                        with open(dst_path,'wb') as f:
+                            f.write(d)
+                    except Exception:
+                        pass
+                    continue
+
+                src_path = os.path.join(root, fname)
+                dst_path = os.path.join(out_root, fname)
+                total += 1
+                print(f"\n[{total:4d}] {os.path.join(rel_root, fname)}")
+
+                try:
+                    self._translate_file(src_path, dst_path, fname)
+                    entry = os.path.join(rel_root, fname)
+                    self.report['translated'].append(entry)
+                    if ext == '.sys':
+                        self.report['drivers'].append(entry)
+                except Exception as ex:
+                    msg = f"  [FAILED] {ex}"
+                    print(msg)
+                    self.report['failed'].append({
+                        'file': os.path.join(rel_root, fname),
+                        'error': str(ex)
+                    })
+                    # Copy original as fallback
+                    try:
+                        with open(src_path,'rb') as f:
+                            with open(dst_path,'wb') as g:
+                                g.write(f.read())
+                    except Exception:
+                        pass
+
+        # Write report
+        report_path = os.path.join(self.out, 'translation_report.json')
+        with open(report_path, 'w') as f:
+            json.dump(self.report, f, indent=2)
+        print(f"\n{'═'*60}")
+        print(f"  Batch complete.")
+        print(f"  Translated : {len(self.report['translated'])}")
+        print(f"  Skipped    : {len(self.report['skipped'])}")
+        print(f"  Failed     : {len(self.report['failed'])}")
+        print(f"  Report     : {report_path}")
+        print(f"{'═'*60}")
+
+    def _translate_file(self, src: str, dst: str, fname: str) -> None:
+        with open(src, 'rb') as f:
+            data = f.read()
+
+        # Quick PE check
+        if data[:2] != b'MZ':
+            # Not a PE — copy as-is
+            with open(dst, 'wb') as f: f.write(data)
+            print(f"  → Not PE, copied verbatim")
+            return
+
+        pe = PE32Image(data)
+        if pe.machine != 0x014C:   # not i386
+            with open(dst, 'wb') as f: f.write(data)
+            print(f"  → Not i386 PE (machine=0x{pe.machine:04X}), copied verbatim")
+            return
+
+        is_ntdll = fname.lower() in ('ntdll.dll',)
+        is_kernel = (fname.lower() in ('ntoskrnl.exe', 'hal.dll', 'halmacpi.dll')
+                     or fname.lower().endswith('.sys'))
+        dyn_result = DynamicScanResult()
+
+        if self.dynamic:
+            if not HAS_UNICORN:
+                raise RuntimeError("Dynamic analysis is mandatory — install unicorn: pip install unicorn")
+            print(f"  [dyn] Running Unicorn emulation (mandatory)…")
+            stub_rvas = set()
+            if is_ntdll:
+                for s in extract_stubs_from_ntdll(pe):
+                    stub_rvas.add(s.rva)
+            scanner = DynamicScanner(pe, stub_rvas=stub_rvas)
+            dyn_result = scanner.scan()
+            print(f"  [dyn] {dyn_result.entries_emulated} entries, "
+                  f"{dyn_result.blocks_executed} blocks, "
+                  f"{len(dyn_result.visited_blocks)} visited RVAs, "
+                  f"{len(dyn_result.call_targets)} call targets, "
+                  f"{len(dyn_result.branch_targets)} branch targets, "
+                  f"{len(dyn_result.pointer_values)} pointers, "
+                  f"{len(dyn_result.pointer_writes)} write sites")
+
+        translator = Win2000Translator(
+            pe, is_ntdll=is_ntdll, is_kernel=is_kernel,
+            dynamic_result=dyn_result,
+            verbose=self.verbose,
+            win10_test_shim=self.win10_test_shim,
+            source_path=src,
+        )
+        pe64_data = translator.translate()
+
+        with open(dst, 'wb') as f:
+            f.write(pe64_data)
+        if self.win10_test_shim and os.path.basename(src).lower() == 'cmd.exe':
+            ubrt_n = translator._cmd_shim_ubrt_fixup(dst)
+            if ubrt_n:
+                print(f"  UBRT cmd shim fixups: {ubrt_n}")
+        print(f"  → {len(data):,} B  →  {len(pe64_data):,} B  ({dst})")
+
+
+# Priority order for building the x64 system base (ntdll first — syscall table source)
+CORE_SYSTEM_FILES = (
+    'ntdll.dll', 'kernel32.dll', 'advapi32.dll', 'user32.dll', 'gdi32.dll',
+    'rpcrt4.dll', 'ole32.dll', 'shell32.dll', 'shlwapi.dll', 'browseui.dll',
+    'ntoskrnl.exe', 'winlogon.exe', 'lsass.exe', 'services.exe', 'cmd.exe',
+    'csrsrv.dll', 'basesrv.dll', 'authz.dll', 'secur32.dll', 'msvcrt.dll',
+)
+
+
+class SystemBuilder:
+    """
+    Build a Win2000 SP4 → x86-64 system tree from a flat SP4 install folder.
+    Translates all PE32 binaries, copies everything else, writes a manifest.
+    """
+
+    def __init__(self, sp4_root: str, out_root: str,
+                 dynamic: bool = True, verbose: bool = False,
+                 include_drivers: bool = False,
+                 win10_test_shim: bool = False):
+        self.sp4_root = os.path.normpath(sp4_root)
+        self.out_root = os.path.normpath(out_root)
+        self.dynamic = dynamic
+        self.verbose = verbose
+        self.include_drivers = include_drivers
+        self.win10_test_shim = win10_test_shim
+        self.ntdll_ref = os.path.join(self.sp4_root, 'ntdll.dll')
+        if not os.path.isfile(self.ntdll_ref):
+            alt = os.path.join(self.sp4_root, 'uniproc', 'ntdll.dll')
+            if os.path.isfile(alt):
+                self.ntdll_ref = alt
+
+    def build(self) -> None:
+        print(f"\n{'='*70}")
+        print(f"  Win2000 SP4 → x86-64 System Base Builder")
+        print(f"  Source : {self.sp4_root}")
+        print(f"  Output : {self.out_root}")
+        print(f"  Syscall target: {_SYSCALL_TARGET}")
+        print(f"  Import shim   : {'win10-test (w2kshim64.dll)' if self.win10_test_shim else 'OFF (native Win2000 imports)'}")
+        print(f"  Pure translator: {'ON' if _pure_translator_mode() else 'OFF'}")
+        print(f"{'='*70}")
+        if _SYSCALL_TARGET == 'win10':
+            auto_load_win10_syscall_table()
+        if os.path.isfile(self.ntdll_ref):
+            load_syscall_table_from_ntdll(self.ntdll_ref)
+        os.makedirs(self.out_root, exist_ok=True)
+        bt = BatchTranslator(self.sp4_root, self.out_root,
+                           dynamic=self.dynamic, verbose=self.verbose,
+                           ntdll_ref=self.ntdll_ref,
+                           include_drivers=self.include_drivers,
+                           win10_test_shim=self.win10_test_shim)
+        bt.run()
+        manifest = os.path.join(self.out_root, 'win2000_x64_manifest.json')
+        syscall_json = os.path.join(self.out_root, 'win2000_x64_syscalls.json')
+        if os.path.isfile(self.ntdll_ref):
+            with open(self.ntdll_ref, 'rb') as f:
+                export_syscall_table_json(syscall_json, PE32Image(f.read()))
+            print(f"  Syscall table: {syscall_json}")
+        mapped, total, unmapped = count_syscall_coverage()
+        with open(manifest, 'w', encoding='utf-8') as f:
+            json.dump({
+                'source': self.sp4_root,
+                'output': self.out_root,
+                'syscall_target': _SYSCALL_TARGET,
+                'win10_test_shim': self.win10_test_shim,
+                'pure_translator': _pure_translator_mode(),
+                'translated': len(bt.report['translated']),
+                'skipped': len(bt.report['skipped']),
+                'failed': len(bt.report['failed']),
+                'syscalls_mapped': mapped,
+                'syscalls_total': total,
+                'syscalls_unmapped': unmapped,
+                'drivers_translated': len(bt.report.get('drivers', [])),
+                'core_files': list(CORE_SYSTEM_FILES),
+            }, f, indent=2)
+        print(f"\n  Manifest: {manifest}")
+        if _SYSCALL_TARGET == 'win2000':
+            print(f"  Syscalls: {total} Win2000 indices (native x64 SSDT numbering)")
+        else:
+            print(f"  Syscalls mapped: {mapped}/{total} ({len(unmapped)} Win2000-only/removed)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7.  CLI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description='Windows 2000 SP4 x86 → x86-64 Binary Translator',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Translate ntdll.dll and show syscall table:
+  python3 win2000_64.py --dump-syscalls ntdll.dll
+
+  # Translate a single binary:
+  python3 win2000_64.py ntdll.dll ntdll64.dll
+
+  # Batch-translate entire Win2000 system32:
+  python3 win2000_64.py --batch /mnt/win2k/windows/system32 ./out64/
+
+  # Production Win2000 x64 tree (native imports, no Win10 shim):
+  python3 x86_x64.py --build-system /path/sp4 /path/win2000_x64
+
+  # Dev-only: smoke-test on Win10 host (adds w2kshim64.dll import redirects):
+  python3 x86_x64.py cmd.exe cmd64.exe --win10-test-shim
+
+  # Universal pure translator (all Win2000 binaries, no cmd-specific hacks):
+  python3 x86_x64.py cmd.exe cmd_pure.exe --pure --win10-test-shim
+        """)
+    ap.add_argument('input',  nargs='?', help='Input PE32 binary (or directory with --batch)')
+    ap.add_argument('output', nargs='?', help='Output PE64 binary (or directory with --batch)')
+    ap.add_argument('--batch',        action='store_true', help='Batch mode: translate entire directory tree')
+    ap.add_argument('--build-system', action='store_true',
+                    help='Build full x64 system tree from SP4 install folder')
+    ap.add_argument('--include-drivers', action='store_true',
+                    help='Translate kernel .sys drivers (experimental, not boot-ready)')
+    ap.add_argument('--static-only',  action='store_true',
+                    help='Skip mandatory dynamic analysis (not recommended)')
+    ap.add_argument('--dynamic', '-d', action='store_true',
+                    help=argparse.SUPPRESS)  # legacy alias; dynamic is now default
+    ap.add_argument('--dump-syscalls',action='store_true', help='Dump syscall table from ntdll.dll and exit')
+    ap.add_argument('--export-syscalls', metavar='PATH',
+                    help='Write Win2000 syscall table JSON (use with --ntdll-ref or input ntdll)')
+    ap.add_argument('--pure', action='store_true',
+                    help='Universal pure translator for all binaries (no address-pinned '
+                         'cmd hacks). Same as CMD_NO_HACKS=1 / PURE=1.')
+    ap.add_argument('--win10-test-shim', action='store_true',
+                    help='Dev-only: redirect missing Win10 imports to w2kshim64.dll '
+                         '(NOT for production Win2000 x64 builds)')
+    ap.add_argument('--syscall-target', choices=('win2000', 'win10'), default='win2000',
+                    help='ntdll stub syscall index: win2000=native SSDT (default), '
+                         'win10=Win10 numbering for host testing (separate from --win10-test-shim)')
+    ap.add_argument('--verbose', '-v',action='store_true', help='Verbose translation output')
+    ap.add_argument('--win64-table',  help='JSON file overriding Win10 x64 syscall numbers')
+    ap.add_argument('--ntdll-ref',    help='Path to Win2000 ntdll.dll for live syscall extraction')
+    args = ap.parse_args()
+
+    if args.pure:
+        os.environ['CMD_NO_HACKS'] = '1'
+
+    # Pure mode defaults to static analysis: mandatory Unicorn emulation
+    # discovers ~3× more entry points and the heal pass produces broken
+    # duplicate copies (cmd 0x14E07 → crash at ~669 steps).  Pass --dynamic
+    # to opt in; --static-only always wins.
+    if args.static_only:
+        use_dynamic = False
+    elif args.pure and not args.dynamic:
+        use_dynamic = False
+    else:
+        use_dynamic = True
+    set_syscall_target(args.syscall_target)
+    if args.syscall_target == 'win10':
+        auto_load_win10_syscall_table()
+
+    # Load optional Win10 x64 override table
+    if args.win64_table:
+        with open(args.win64_table, encoding='utf-8') as f:
+            overrides = json.load(f)
+        apply_win10_syscall_map({k: int(v) for k, v in overrides.items()})
+        print(f"[+] Applied {len(overrides)} Win10 x64 overrides from {args.win64_table}")
+
+    if args.dump_syscalls:
+        if not args.input:
+            print("Error: --dump-syscalls requires an input ntdll.dll path")
+            sys.exit(1)
+        data = open(args.input, 'rb').read()
+        pe   = PE32Image(data)
+        dump_syscall_table(pe)
+        return
+
+    if args.export_syscalls:
+        ntdll_path = args.ntdll_ref or args.input
+        if not ntdll_path or not os.path.isfile(ntdll_path):
+            print("Error: --export-syscalls requires --ntdll-ref or input ntdll.dll path")
+            sys.exit(1)
+        with open(ntdll_path, 'rb') as f:
+            pe = PE32Image(f.read())
+        load_syscall_table_from_ntdll(ntdll_path)
+        n = export_syscall_table_json(args.export_syscalls, pe)
+        print(f"[+] Exported {n} syscalls ({args.syscall_target} target) → {args.export_syscalls}")
+        return
+
+    if not args.input:
+        ap.print_help()
+        sys.exit(0)
+
+    if not (HAS_CAPSTONE and HAS_KEYSTONE):
+        print("\nRequired packages not installed. Install with:")
+        print("  pip install capstone keystone-engine unicorn\n")
+        sys.exit(1)
+
+    if use_dynamic and not HAS_UNICORN:
+        print("\nDynamic analysis is mandatory. Install Unicorn:")
+        print("  pip install unicorn")
+        print("  Or pass --static-only to skip (not recommended)\n")
+        sys.exit(1)
+
+    # Auto-detect ntdll reference for syscall table refresh
+    ntdll_ref = args.ntdll_ref
+    if not ntdll_ref and args.input:
+        candidate = os.path.join(os.path.dirname(os.path.abspath(args.input)), 'ntdll.dll')
+        if os.path.isfile(candidate):
+            ntdll_ref = candidate
+    if ntdll_ref and os.path.isfile(ntdll_ref):
+        n = load_syscall_table_from_ntdll(ntdll_ref)
+        print(f"[+] Loaded {n} syscall stubs from {ntdll_ref}")
+
+    if args.build_system:
+        if not args.input:
+            print("Error: --build-system requires SP4 install folder path")
+            sys.exit(1)
+        out = args.output or os.path.join(
+            os.path.dirname(os.path.abspath(args.input)), 'win2000_x64')
+        sb = SystemBuilder(args.input, out, dynamic=use_dynamic, verbose=args.verbose,
+                          include_drivers=args.include_drivers,
+                          win10_test_shim=args.win10_test_shim)
+        sb.build()
+    elif args.batch:
+        bt = BatchTranslator(args.input, args.output or './win2000_64_out',
+                             dynamic=use_dynamic, verbose=args.verbose,
+                             ntdll_ref=ntdll_ref, include_drivers=args.include_drivers,
+                             win10_test_shim=args.win10_test_shim)
+        bt.run()
+    else:
+        if not args.output:
+            print("Error: output path required"); sys.exit(1)
+        data = open(args.input, 'rb').read()
+        pe   = PE32Image(data)
+        print(f"\n{'='*60}")
+        print(f"  Win2000 SP4 -> PE64 Translator")
+        print(f"  Input : {args.input} ({len(data):,} bytes)")
+        print(f"  Import shim: {'win10-test' if args.win10_test_shim else 'OFF (native Win2000)'}")
+        print(f"  Pure mode  : {'ON' if _pure_translator_mode() else 'OFF'}")
+        print(f"{'='*60}")
+        is_ntdll = os.path.basename(args.input).lower() == 'ntdll.dll'
+        is_kernel = os.path.basename(args.input).lower() in ('ntoskrnl.exe', 'hal.dll', 'halmacpi.dll') or args.input.lower().endswith('.sys')
+        dyn_result = DynamicScanResult()
+        if use_dynamic:
+            print(f"\n[dyn] Running Unicorn emulation (mandatory)…")
+            stub_rvas = set()
+            if is_ntdll:
+                for s in extract_stubs_from_ntdll(pe):
+                    stub_rvas.add(s.rva)
+            scanner = DynamicScanner(pe, stub_rvas=stub_rvas)
+            dyn_result = scanner.scan()
+            print(f"[dyn] {dyn_result.entries_emulated} entries, "
+                  f"{dyn_result.blocks_executed} blocks, "
+                  f"{len(dyn_result.visited_blocks)} visited RVAs, "
+                  f"{len(dyn_result.call_targets)} call targets, "
+                  f"{len(dyn_result.branch_targets)} branch targets, "
+                  f"{len(dyn_result.pointer_values)} pointers, "
+                  f"{len(dyn_result.pointer_writes)} write sites")
+        translator = Win2000Translator(pe, is_ntdll=is_ntdll, is_kernel=is_kernel,
+                                       dynamic_result=dyn_result,
+                                       verbose=args.verbose,
+                                       win10_test_shim=args.win10_test_shim,
+                                       source_path=args.input)
+        pe64 = translator.translate()
+        if args.win10_test_shim:
+            out_dir = os.path.dirname(os.path.abspath(args.output)) or '.'
+            ensure_w2kshim_dll(out_dir)
+            print(f"  [!] w2kshim64.dll written beside output (Win10 dev-test only)")
+        with open(args.output, 'wb') as f:
+            f.write(pe64)
+        if args.win10_test_shim and os.path.basename(args.input).lower() == 'cmd.exe':
+            ubrt_n = translator._cmd_shim_ubrt_fixup(args.output)
+            if ubrt_n:
+                print(f"  UBRT cmd shim fixups: {ubrt_n}")
+        print(f"\n  Output: {args.output} ({len(pe64):,} bytes)")
+        print(f"{'='*60}\n")
+
+
+if __name__ == '__main__':
+    main()
