@@ -46,6 +46,37 @@ A diagnostic emulator using Unicorn Engine to mock Win2000 ring-0 (ntoskrnl, KPC
 
 ---
 
+## Usage & Build Commands
+
+### Building in Pure (Universal) Mode
+
+```powershell
+# Create output directory and build cmd.exe in pure translation mode
+New-Item -ItemType Directory -Force -Path "build_out81" | Out-Null
+$env:PURE="1"
+$env:DUMP_RVA_MAP="build_out81\rva.txt"
+python x86_x64.py `
+  "C:\Users\win2000\Downloads\(ROLL-UP1)Windows2000-KB891861-v2-x86-ENU\cmd.exe" `
+  build_out81\cmd_pure.exe `
+  --pure --win10-test-shim `
+  2>&1 | Tee-Object -FilePath build_out81\build.log
+```
+
+### Tracing with `dbg_trace.py`
+
+```powershell
+# Trace cmd_pure.exe running "echo hello" with watchpoints on key RVAs
+python dbg_trace.py build_out80\cmd_pure.exe /c echo hello `
+  --seconds=90 `
+  --watch=0x168D3,0x168DD,0x168C1 `
+  --rva-map=build_out80\rva.txt `
+  2>&1 | Select-String -Pattern "watch main|\[exit\]|FAULT|steps=" `
+       | ForEach-Object { $_.Line } `
+       | Select-Object -First 20
+```
+
+---
+
 ## Recent Issues & Critical Fixes
 
 ### 1. 16-Bit / 8-Bit Load Width Widening
@@ -56,7 +87,7 @@ A diagnostic emulator using Unicorn Engine to mock Win2000 ring-0 (ntoskrnl, KPC
 * **Problem**: The reanchor pass, which resolves relocated absolute addresses (such as `movabs`), was over-scanning and clobbering the `movabs` instruction belonging to the next adjacent instruction. 
   * *Example*: A `push`/`store` instruction reanchor clobbered a neighboring `cmp [0x1cf64]` (at RVA `0xC67E` in `cmd.exe`), corrupting it into `cmp [0x1fb00]`. Since `0x1fb00` is the `jmp_buf` address, the value read was always non-zero, forcing `cmd` to immediately exit via a false `exit(1)` error path before ever running subcommands.
 * **Fix**: Implemented a block-boundary guard in `_scan_hi`. The scan is capped at the start of the next translated block.
-  * A true `movabs` instruction block spans $\ge 12$ bytes (with a 10-byte instruction payload). 
+  * A true `movabs` instruction block spans ≥12 bytes (with a 10-byte instruction payload). 
   * The boundary is only applied if the next block start lies at least 12 bytes past the anchor:
     ```python
     def _scan_hi(anchor: int, default_hi: int) -> int:
@@ -78,7 +109,67 @@ The behavior differs between the translation modes in build `build_out81`:
 * **With Patch Mode Enabled (`cmd_shim.exe`)**:
   * Tracing `cmd /c echo hello` confirms that the absolute load address `[0x1cf64]` is now read correctly, the false error exit path is gone, and **`hello` successfully prints** to standard output.
 
-* **Universal `--pure` Mode (`cmd_pure.exe`)**:
-  * This mode is currently under the active reversing/reverse-engineering stage.
-  * In `build_out80`, the tracer successfully executed **204,440 instructions** (steps) in pure mode before hitting exceptions (such as stack/register state issues like RBP corruption).
-  * In `build_out81`, despite the latest fixes, **`cmd_pure.exe` still does not print `echo`** in pure mode, and active investigation is ongoing to resolve remaining blockages.
+* **Universal `--pure` Mode (`cmd_pure.exe`)** — Under Active Reversing:
+  * In `build_out80`, the tracer successfully executed **204,440 instructions** (steps) in pure mode before faulting.
+  * In `build_out81`, despite the latest fixes, **`cmd_pure.exe` still does not print `echo`** in pure mode. Active investigation is ongoing.
+
+---
+
+## Pure Mode Trace Diagnostic (build_out80)
+
+### Watchpoint Output
+The tracer was run with watchpoints at the locale/codepage setup area (`0x168C1`, `0x168D3`, `0x168DD`):
+
+```
+[watch main+0x168C1] RAX=0xFFFFFFFFFFFFFF9C RBX=0x1 RCX=0x411 RDX=0x1E001A RSI=0x0 RDI=0x0 R8=0x0 RBP=0x14FE90 RSP=0x14FDE0
+[watch main+0x168D3] RAX=0xFFFFFFFFFFFFFFFF RBX=0x1 RCX=0xBD1144175A470000 RDX=0x0 RSI=0x0 RDI=0x0 R8=0x3 RBP=0x14FE90 RSP=0x14FE10
+[watch main+0x168DD] RAX=0xFFFFFFFFFFFFFFFF RBX=0x1 RCX=0xBD1144175A470000 RDX=0x0 RSI=0x0 RDI=0x0 R8=0x3 RBP=0x14FE90 RSP=0x14FE10
+===== FAULT =====
+--- last 48 main-image instructions (steps=204440) ---
+```
+
+### API Call Chain (before fault)
+The full trace log reveals the API calls the translated binary successfully makes before crashing:
+
+| API Call Site | Function | Key Arguments |
+|---|---|---|
+| `main+0x75F8` | `msvcrt!wcscpy` | Copy OEM locale string |
+| `main+0x762B` | `msvcrt!setlocale` | LC_ALL = 0 |
+| `main+0x11979` | `kernel32!GetProcessHeap` | — |
+| `main+0x1199D` | `ntdll!RtlAllocateHeap` | Heap=0x4F0000 |
+| `main+0x11A2C` | `kernel32!GetConsoleTitleW` | Buffer=0x504BE0, len=0x104 |
+| `main+0x11A81` | `msvcrt!wcscpy` | Console title → buffer |
+| `main+0x11CA7` | `kernel32!GetModuleHandleW` | — |
+| `main+0x11CD6` | `kernel32!GetProcAddress` | Dynamic import resolve |
+| `main+0x166DB` | `w2kshim64!_setjmp3` | SEH jmp_buf at `0x80048B00` |
+| `main+0x27282` | `msvcrt!_get_osfhandle` | fd=1 (stdout) |
+| `main+0x272AD` | `kernel32!SetConsoleMode` | Handle=0x68 |
+| `main+0x1680E` | `kernel32!GetConsoleOutputCP` | — |
+| `main+0x16848` | `kernel32!GetCPInfo` | CodePage=0x352 (850) |
+| `main+0x168C1` | `msvcrt!_get_osfhandle` | **fd=0x411 ← invalid** |
+| `main+0x13809` | `msvcrt!exit` | **exit(1) — premature** |
+
+### Fault Analysis
+```
+===== FAULT =====
+code=0xC0000005 RIP=sys+0x7FFEB92C9F59
+access-violation: read @ 0xFFFFFFFFFFFFFFFF
+last main insn: main+0x13809 (x86 0xAC9D+0x3D) → msvcrt!exit(1)
+```
+
+**Root cause under investigation**: After the codepage setup (`GetConsoleOutputCP` → `GetCPInfo` → `_get_osfhandle(0x411)`), the `_get_osfhandle` call receives `0x411` (which is the codepage value, not a file descriptor). This returns `0xFFFFFFFFFFFFFFFF` (invalid handle), triggering the `cmp dword ptr [r11], 0` check at `main+0x168D3`. The comparison is non-zero → the error path fires → `exit(1)` is called at `main+0x13809`.
+
+### RBP Corruption Events
+The tracer also detected multiple RBP corruption events where the frame pointer was overwritten with data addresses instead of stack addresses:
+
+```
+main+0x9BD8    RBP 0x14FE90 -> 0x800456A8   push rsi
+main+0x9BD8    RBP 0x14FE90 -> 0x80045700   push rsi
+main+0x9BD8    RBP 0x14FE90 -> 0x80045608   push rsi
+main+0x9BD8    RBP 0x14FE90 -> 0x800454A8   push rsi
+main+0x126B8   RBP 0x14FE90 -> 0x8004D3E2   mov ecx, eax
+main+0x7639    RBP 0x14FD30 -> 0x90          ret
+```
+
+These suggest translated `push rsi` sequences at `main+0x9BD8` are writing data-section addresses into RBP, likely due to register allocation differences between the 32-bit and 64-bit calling conventions that have not yet been fully reconciled for pure mode.
+
