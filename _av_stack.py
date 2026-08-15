@@ -1,49 +1,41 @@
-#!/usr/bin/env python3
-"""At first-chance AV, dump stack slots pointing into cmd_shim .text."""
-import os
-import struct
-import ctypes as C
+import ctypes as C, struct, sys, os
+sys.path.insert(0,".")
 import dbg_fault as df
-
-EXE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "win2000_x64", "cmd_shim.exe"))
-TEXT_LO = 0x1000
-TEXT_HI = 0x42000
-
-
-def main():
-    df.suppress_fault_ui()
-    cmdline = f'"{EXE}" /c echo test'
-    si = df.STARTUPINFO()
-    si.cb = C.sizeof(si)
-    pi = df.PROCESS_INFORMATION()
-    df.k32.CreateProcessW(
-        EXE, C.create_unicode_buffer(cmdline), None, None, False,
-        df.DEBUG_ONLY_THIS_PROCESS, None, os.path.dirname(EXE), C.byref(si), C.byref(pi))
-    base = None
-    de = df.DEBUG_EVENT()
-    while df.k32.WaitForDebugEvent(C.byref(de), df.INFINITE):
-        if de.dwDebugEventCode == df.CREATE_PROCESS_DEBUG_EVENT:
-            base = de.u.CreateProcessInfo.lpBaseOfImage
-        elif de.dwDebugEventCode == df.EXCEPTION_DEBUG_EVENT:
-            er = de.u.Exception.ExceptionRecord
-            ec = er.ExceptionCode & 0xFFFFFFFF
-            ea = er.ExceptionAddress or 0
-            if ec == 0xC0000005 and base:
-                ctx = df.get_thread_context(pi.hThread)
-                print(f"AV RIP={ctx.Rip:#x} (main+0x{ctx.Rip - base:x}) RSP={ctx.Rsp:#x}")
-                raw = df.read_process_mem(pi.hProcess, ctx.Rsp, 0x80)
-                print("Stack return candidates in .text:")
-                for i in range(0, len(raw) - 8, 8):
-                    val = struct.unpack_from("<Q", raw, i)[0]
-                    rva = val - base
-                    if TEXT_LO <= rva < TEXT_HI:
-                        print(f"  [rsp+0x{i:x}] -> main+0x{rva:x}")
-                break
-        elif de.dwDebugEventCode == df.EXIT_PROCESS_DEBUG_EVENT:
-            print(f"exit=0x{de.u.ExitProcess.dwExitCode & 0xFFFFFFFF:08x}")
-            break
-        df.k32.ContinueDebugEvent(de.dwProcessId, de.dwThreadId, df.DBG_CONTINUE)
-
-
-if __name__ == "__main__":
-    main()
+k32=C.WinDLL("kernel32", use_last_error=True)
+df.suppress_fault_ui()
+os.chdir("build_univ230")
+exe=os.path.abspath("cmd_fix20.exe")
+LO,HI=0x80000000,0x80080000
+si=df.STARTUPINFO(); si.cb=C.sizeof(si); pi=df.PROCESS_INFORMATION()
+cmd=C.create_unicode_buffer(f'"{exe}" /c echo w2ktest')
+assert k32.CreateProcessW(exe,cmd,None,None,False,df.DEBUG_ONLY_THIS_PROCESS,None,os.getcwd(),C.byref(si),C.byref(pi))
+de=df.DEBUG_EVENT()
+while k32.WaitForDebugEvent(C.byref(de),25000):
+    cont=df.DBG_CONTINUE
+    if de.dwDebugEventCode==df.CREATE_PROCESS_DEBUG_EVENT:
+        if de.u.CreateProcessInfo.hFile: k32.CloseHandle(de.u.CreateProcessInfo.hFile)
+    elif de.dwDebugEventCode==df.LOAD_DLL_DEBUG_EVENT:
+        if de.u.LoadDll.hFile: k32.CloseHandle(de.u.LoadDll.hFile)
+    elif de.dwDebugEventCode==df.EXCEPTION_DEBUG_EVENT:
+        er=de.u.Exception.ExceptionRecord; code=er.ExceptionCode&0xffffffff
+        if code in (0xC0000005,0xC0000374,0x80000003):
+            ctx=df.get_thread_context(pi.hThread)
+            if code==0x80000003 and not (LO<=ctx.Rip<HI):
+                pass
+            print(f"EXC {code:#x} rip={ctx.Rip:#x} rcx={ctx.Rcx:#x} rdx={ctx.Rdx:#x} r8={ctx.R8:#x} rsp={ctx.Rsp:#x}")
+            st=df.read_process_mem(pi.hProcess, ctx.Rsp, 0x200)
+            if st:
+                seen=[]
+                for i in range(0, 0x200-8, 8):
+                    v=struct.unpack_from("<Q",st,i)[0]
+                    if LO<=v<HI:
+                        seen.append((i,v))
+                print("  image return addrs on stack:")
+                for i,v in seen[:8]:
+                    print(f"    [rsp+{i:#x}] = {v:#x}")
+            k32.TerminateProcess(pi.hProcess,1); break
+        elif code!=0x80000004:
+            cont=df.DBG_EXCEPTION_NOT_HANDLED
+    elif de.dwDebugEventCode==df.EXIT_PROCESS_DEBUG_EVENT:
+        print("exit",hex(de.u.ExitProcess.dwExitCode&0xffffffff)); break
+    k32.ContinueDebugEvent(de.dwProcessId,de.dwThreadId,cont)

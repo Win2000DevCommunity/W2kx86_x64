@@ -1,0 +1,76 @@
+"""Byte-exact x86-64 instruction encoders and register tables.
+
+Emitters use these rather than an assembler so that instruction length is known
+before the bytes are written, which is what lets a relocation be recorded at a
+precise offset in the same breath as the instruction that needs it.
+"""
+
+from .emit import (
+    INT3,
+    LEAVE,
+    MOVABS_IMM_OFFSET,
+    MOVABS_SIZE,
+    NOP,
+    RET,
+    RIP_DISP_OFFSET,
+    add_rsp,
+    and_rsp,
+    call_mem_rip,
+    call_reg,
+    call_rel32,
+    jcc_rel32,
+    jmp_mem_rip,
+    jmp_reg,
+    jmp_rel32,
+    lea_reg_base_disp,
+    lea_reg_mem_rip,
+    load_qword_at,
+    modrm,
+    mov_gs_reg,
+    mov_mem_rip_reg,
+    mov_reg_gs,
+    mov_reg_imm64,
+    mov_reg_imm64_reloc,
+    mov_reg_mem_rip,
+    mov_reg_reg,
+    mov_reg32_imm32,
+    nops,
+    pop_reg,
+    push_reg,
+    ret,
+    ret_imm16,
+    rex,
+    sib,
+    sub_rsp,
+    xor_reg_reg,
+    zero_reg,
+)
+from .regs import (
+    ARG_REGS32,
+    ARG_REGS64,
+    NONVOLATILE,
+    REG32,
+    REG64,
+    SHADOW_SPACE,
+    STACK_ALIGN,
+    VOLATILE,
+    arg_reg,
+    is_extended,
+    is_volatile,
+    narrow,
+    reg_num,
+    widen,
+)
+
+__all__ = [
+    'ARG_REGS32', 'ARG_REGS64', 'INT3', 'LEAVE', 'MOVABS_IMM_OFFSET',
+    'MOVABS_SIZE', 'NONVOLATILE', 'NOP', 'REG32', 'REG64', 'RET',
+    'RIP_DISP_OFFSET', 'SHADOW_SPACE', 'STACK_ALIGN', 'VOLATILE', 'add_rsp',
+    'and_rsp', 'arg_reg', 'call_mem_rip', 'call_reg', 'call_rel32',
+    'is_extended', 'is_volatile', 'jcc_rel32', 'jmp_mem_rip', 'jmp_reg',
+    'jmp_rel32', 'lea_reg_base_disp', 'lea_reg_mem_rip', 'load_qword_at',
+    'modrm', 'mov_gs_reg', 'mov_mem_rip_reg', 'mov_reg32_imm32',
+    'mov_reg_gs', 'mov_reg_imm64', 'mov_reg_imm64_reloc', 'mov_reg_mem_rip',
+    'mov_reg_reg', 'narrow', 'nops', 'pop_reg', 'push_reg', 'reg_num', 'ret',
+    'ret_imm16', 'rex', 'sib', 'sub_rsp', 'widen', 'xor_reg_reg', 'zero_reg',
+]

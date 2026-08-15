@@ -717,6 +717,19 @@ def main():
                     print("bytes@RIP:", code_bytes.hex())
                     stack = read_mem(pi.hProcess, ctx.Rsp, 64)
                     print("stack@RSP:", stack.hex())
+                    # IAT / runtime table slots of interest (cmd pure).
+                    for slot, label in (
+                            (0x800A63E0, "GetProcessHeap"),
+                            (0x800A63D8, "HeapAlloc?"),
+                            (0x800A6590, "FormatMessageW"),
+                            (0x800A6490, "GetEnvStringsW"),
+                            (0x8007AFB8, "bump-table@afb8"),
+                            (0x8007AFBC, "bump-table@afbc"),
+                            (0x8007AFC0, "bump-table@afc0")):
+                        q = read_mem(pi.hProcess, slot, 8)
+                        v = int.from_bytes(q, "little") if len(q) == 8 else None
+                        print(f"mem[{slot:#x}] ({label}) = "
+                              f"{('0x%016X' % v) if v is not None else '?'}")
                     # Walk the stack for return addresses inside the main image.
                     img_lo = base or 0
                     img_hi = img_lo + 0x200000

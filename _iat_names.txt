@@ -1,0 +1,1 @@
+0x1030 b'KERNEL32.dll' b'GetLastError'\n0x119c b'KERNEL32.dll' b'SetFilePointer'\n0x11d4 b'MSVCRT.dll' b'longjmp'

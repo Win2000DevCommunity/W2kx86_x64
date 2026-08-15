@@ -21,3 +21,22 @@ apilog*.txt
 trace*.txt
 guard_out.txt
 ftrans.txt
+
+# Build output folders (univNNN builds)
+build_univ*/
+
+# Compressed archives
+*.7z
+*.rar
+*.gz
+*.xz
+*.bz2
+*.tar
+
+# Debug symbol / link artifacts
+*.pdb
+*.ilk
+*.obj
+
+# Generated reference dumps
+X86_X64_30_06.txt

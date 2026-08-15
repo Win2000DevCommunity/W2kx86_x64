@@ -234,6 +234,8 @@ def _x86_hint(rev: dict[int, int], tr_rva: int) -> str:
 
 def main() -> int:
     df.suppress_fault_ui()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     argv = sys.argv[1:]
     ring_max = 160
     seconds = 25.0
@@ -448,6 +450,20 @@ def main() -> int:
                   f"process still running")
             ctx = df.get_thread_context(pi.hThread)
             print(f"  RIP=0x{ctx.Rip:016X} ({df.fmt_module_addr(ctx.Rip, base)})")
+            print(f"  RAX=0x{ctx.Rax:X} RBX=0x{ctx.Rbx:X} RCX=0x{ctx.Rcx:X} "
+                  f"RDX=0x{ctx.Rdx:X}")
+            print(f"  RSI=0x{ctx.Rsi:X} RDI=0x{ctx.Rdi:X} RSP=0x{ctx.Rsp:X} "
+                  f"RBP=0x{ctx.Rbp:X} R8=0x{ctx.R8:X} R9=0x{ctx.R9:X}")
+            for lbl, addr in (("RAX", ctx.Rax), ("RBP", ctx.Rbp),
+                              ("RCX", ctx.Rcx)):
+                mem = df.read_process_mem(pi.hProcess, addr, 0x40)
+                if mem:
+                    print(f"  mem@{lbl}: {mem[:0x40].hex()}")
+            for slot in (0x800A6490, 0x800A6590, 0x800A63E0):
+                q = df.read_process_mem(pi.hProcess, slot, 8)
+                if q:
+                    print(f"  slot[{slot:#x}] = "
+                          f"{int.from_bytes(q, 'little'):#x}")
             print(f"\n--- last {min(len(ring), show)} main-image instructions ---")
             for rva, sp, bp in ring[-show:]:
                 di = _disasm_one(pi.hProcess, base + rva)
@@ -551,6 +567,65 @@ def main() -> int:
                             and not (0x10000 <= cur < 0x10000000)):
                         rbp_corrupt_at.append((rip - base, pr, cur))
                     prev_rbp[0] = cur
+                    # --- Universal JCC / epilogue integrity diagnostics ---
+                    # Detect Jcc taken to a short pop-ret island (the class of
+                    # bug fixed by _pure_fix_jcc_short_pop_ret_to_local_leave_epi).
+                    # If the previous insn was a taken conditional jump, check
+                    # whether rip lands on a bare pop*; ret sequence.
+                    if len(ring) >= 2:
+                        prev_rva, prev_rsp, prev_rbp2 = ring[-2]
+                        prev_raw = df.read_process_mem(pi.hProcess, base + prev_rva, 8) or b""
+                        if prev_raw:
+                            is_jcc = (
+                                (prev_raw[0] == 0x0F and prev_raw[1] in range(0x80, 0x90))
+                                or prev_raw[0] in (0x70, 0x71, 0x72, 0x73, 0x74, 0x75,
+                                                   0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B,
+                                                   0x7C, 0x7D, 0x7E, 0x7F)
+                                or prev_raw[0] == 0xE3
+                            )
+                            if is_jcc:
+                                jcc_rva = rip - base
+                                jcc_raw = df.read_process_mem(
+                                    pi.hProcess, rip, 12) or b""
+                                # Check if landing on a short pop*; ret island:
+                                # pop(s) then ret, with no mov eax,* or leave.
+                                if jcc_raw:
+                                    pops = 0
+                                    scan = 0
+                                    while scan < min(len(jcc_raw), 6):
+                                        b = jcc_raw[scan]
+                                        if 0x58 <= b <= 0x5F:
+                                            pops += 1; scan += 1; continue
+                                        if b == 0x41 and scan + 1 < len(jcc_raw) and 0x58 <= jcc_raw[scan + 1] <= 0x5F:
+                                            pops += 1; scan += 2; continue
+                                        if b in (0xC3, 0xC2) and pops >= 1:
+                                            hint = _x86_hint(rva_rev, jcc_rva)
+                                            print(f"[SHORT-EPI-JCC] main+0x{prev_rva:X} "
+                                                  f"jcc->main+0x{jcc_rva:X} {hint} "
+                                                  f"lands on pop*{pops};ret "
+                                                  f"(rbp=0x{ctx.Rbp:X} rsp=0x{ctx.Rsp:X})")
+                                            break
+                                        break
+                    # Detect ret with broken RBP / RSP alignment
+                    cur_raw = df.read_process_mem(pi.hProcess, rip, 2) or b""
+                    if cur_raw and cur_raw[0] in (0xC3, 0xC2, 0xCA, 0xCB):
+                        if ctx.Rsp & 0xF:
+                            hint = _x86_hint(rva_rev, rip - base)
+                            print(f"[RET-MISALIGN] main+0x{rip-base:X} {hint} "
+                                  f"ret with RSP=0x{ctx.Rsp:X} (misaligned)")
+                        if ctx.Rbp and not (0x10000 <= ctx.Rbp < 0x10000000):
+                            hint = _x86_hint(rva_rev, rip - base)
+                            print(f"[RET-BAD-RBP] main+0x{rip-base:X} {hint} "
+                                  f"ret with RBP=0x{ctx.Rbp:X} (non-stack)")
+                    # Detect suspicious register values common in translation bugs
+                    # 0x4000 is the Win2K image base sentinel; -11/-1 are common
+                    # error returns used as pointers.
+                    for reg_name, reg_val in [("RBX", ctx.Rbx), ("RBP", ctx.Rbp),
+                                              ("R8", ctx.R8), ("R9", ctx.R9)]:
+                        if reg_val in (0x4000, 0xFFFFFFFFFFFFFFF5, 0xFFFFFFFFFFFFFFFF):
+                            hint = _x86_hint(rva_rev, rip - base)
+                            print(f"[SUSPICIOUS-REG] main+0x{rip-base:X} {hint} "
+                                  f"{reg_name}=0x{reg_val:X}")
                     if heapguard:
                         # Capture the pointer returned by a just-completed alloc
                         # (rax holds it on the first main insn after return).
@@ -716,8 +791,28 @@ def main() -> int:
                                           f"overflows alloc 0x{p:X} size 0x{sz:X} "
                                           f"(end 0x{p+sz:X})")
                                 break
-                # Left the main image: step OVER by breakpointing the return
-                # address ([RSP]) and running free.
+                # Left the main image: if RIP is in NO loaded module this is a
+                # wild indirect branch (translation bug) — dump the ring and
+                # stop BEFORE the execute-fault so the culprit call is visible.
+                if not any(b <= rip < b + sz for b, sz, _n, _e in modules):
+                    print(f"\n[WILD-BRANCH] RIP=0x{rip:X} not in any module "
+                          f"after {steps} steps")
+                    print(f"  RAX=0x{ctx.Rax:X} RBX=0x{ctx.Rbx:X} "
+                          f"RCX=0x{ctx.Rcx:X} RDX=0x{ctx.Rdx:X}")
+                    print(f"  RSI=0x{ctx.Rsi:X} RDI=0x{ctx.Rdi:X} "
+                          f"RSP=0x{ctx.Rsp:X} RBP=0x{ctx.Rbp:X} "
+                          f"R8=0x{ctx.R8:X} R9=0x{ctx.R9:X}")
+                    print(f"--- last {min(len(ring), show)} main-image "
+                          f"instructions ---")
+                    for rva, sp, bp in ring[-show:]:
+                        di = _disasm_one(pi.hProcess, base + rva)
+                        txt = f"{di.mnemonic} {di.op_str}" if di else "?"
+                        print(f"  main+0x{rva:<6X} rsp=0x{sp:X} rbp=0x{bp:X}  "
+                              f"{txt}")
+                    k32.TerminateProcess(pi.hProcess, 1)
+                    break
+                # Left the main image into a module: step OVER by breakpointing
+                # the return address ([RSP]) and running free.
                 retq = df.read_process_mem(pi.hProcess, ctx.Rsp, 8)
                 ret = int.from_bytes(retq, "little") if len(retq) == 8 else 0
                 if in_main(ret):

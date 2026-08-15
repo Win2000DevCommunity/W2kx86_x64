@@ -1,0 +1,3 @@
+DONE rc=0
+Microsoft Windows 2000 [Version %Microsoft Windows 2000 [Version $G][base] main image @ 0x0000000080000000
+[exit] code=0x00000001
