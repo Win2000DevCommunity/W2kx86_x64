@@ -1,5 +1,0 @@
-TIMEOUT
-Microsoft Windows 2000 [Version %Microsoft Windows 2000 [Version $G]
-(C) Copyright 1985-2000 Microsoft Corp.
-w2ktest
- w2ktest
