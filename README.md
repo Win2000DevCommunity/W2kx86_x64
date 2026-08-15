@@ -4,6 +4,19 @@ An advanced, multi-stage static and dynamic binary translation system designed t
 
 ---
 
+## Repository Layout
+
+| Path | Contents |
+| --- | --- |
+| `x86_x64.py` | Main translation driver (Capstone → Keystone, PE64 emit) |
+| `dbg_fault.py` / `dbg_trace.py` / `dbg_root.py` | Crash monitor / smart step-over tracer / exception daemon |
+| `x86x64/` | The translator package (analysis, translation, PE writing, shim) |
+| `w2kseh64.py`, `ring0_emu.py` | SEH runtime layer and ring-0 diagnostic emulator |
+| `debug_scripts/` | ~1,100 one-off diagnostic scripts accumulated per crash site (disassembly, IAT checks, probes, patchers) |
+| `debug_scripts/dumps/` | Diagnostic text dumps |
+
+---
+
 ## Project Architecture
 
 The translator maps 32-bit execution context to native 64-bit equivalents:
